@@ -1,0 +1,60 @@
+{% extends "layout.html" %}
+
+{% block title %}
+  {% if mode == "register" %}Create Account{% else %}Sign In{% endif %} - Image Encryption System
+{% endblock %}
+
+{% block content %}
+  <section class="auth-grid" aria-label="Authentication">
+    <div class="auth-panel">
+      <h1>{% if mode == "register" %}Create a secure vault{% else %}Sign in to your vault{% endif %}</h1>
+      <p>
+        Encrypt private photos with AES-GCM or RSA hybrid encryption, then decrypt
+        them only after authorization.
+      </p>
+
+      <form
+        class="form-stack"
+        method="post"
+        action="{% if mode == 'register' %}{{ url_for('register') }}{% else %}{{ url_for('login') }}{% endif %}"
+      >
+        <label>
+          Username
+          <input name="username" type="text" autocomplete="username" required>
+        </label>
+        <label>
+          Password
+          <input
+            name="password"
+            type="password"
+            autocomplete="{% if mode == 'register' %}new-password{% else %}current-password{% endif %}"
+            minlength="10"
+            required
+          >
+        </label>
+        <button class="button button-primary" type="submit">
+          {% if mode == "register" %}Create account{% else %}Sign in{% endif %}
+        </button>
+      </form>
+
+      <p class="auth-switch">
+        {% if mode == "register" %}
+          Already have an account? <a href="{{ url_for('index') }}">Sign in</a>
+        {% else %}
+          New here? <a href="{{ url_for('register_form') }}">Create an account</a>
+        {% endif %}
+      </p>
+    </div>
+
+    <div class="security-panel" aria-label="Security summary">
+      <h2>Protection model</h2>
+      <ul>
+        <li>Per-image AES-256-GCM data keys</li>
+        <li>Passphrase or RSA-OAEP key wrapping</li>
+        <li>Encrypted private keys</li>
+        <li>Owner-only image access</li>
+      </ul>
+    </div>
+  </section>
+{% endblock %}
+

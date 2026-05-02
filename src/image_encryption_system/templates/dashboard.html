@@ -1,0 +1,101 @@
+{% extends "layout.html" %}
+
+{% block title %}Dashboard - Image Encryption System{% endblock %}
+
+{% block content %}
+  <section class="dashboard-header">
+    <div>
+      <h1>Encrypted image vault</h1>
+      <p>Upload an image, choose a key protection mode, and store only ciphertext.</p>
+    </div>
+    <div class="metric">
+      <span>{{ assets|length }}</span>
+      <small>encrypted images</small>
+    </div>
+  </section>
+
+  <section class="workspace-grid">
+    <form class="upload-panel" method="post" action="{{ url_for('upload_image') }}" enctype="multipart/form-data">
+      <h2>Encrypt image</h2>
+      <label>
+        Image file
+        <input name="image" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp,image/tiff" required>
+      </label>
+      <label>
+        Algorithm
+        <select name="algorithm" id="algorithm-select">
+          {% for value, label in algorithms %}
+            <option value="{{ value }}">{{ label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label id="passphrase-field">
+        AES passphrase
+        <input name="passphrase" type="password" autocomplete="off" placeholder="Required for AES-GCM mode">
+      </label>
+      <p class="field-note" id="algorithm-note">
+        AES-GCM passphrase mode derives a key with Scrypt and wraps the image data key.
+      </p>
+      <button class="button button-primary" type="submit">Encrypt and store</button>
+    </form>
+
+    <section class="vault-list" aria-label="Encrypted images">
+      <h2>Vault</h2>
+      {% if assets %}
+        <div class="asset-list">
+          {% for asset in assets %}
+            <article class="asset-card">
+              <div>
+                <h3>{{ asset.original_filename }}</h3>
+                <p>{{ asset.algorithm }} · {{ asset.image_format }} · {{ asset.width }}x{{ asset.height }}</p>
+                <small>{{ asset.created_at }}</small>
+              </div>
+              <form method="post" action="{{ url_for('decrypt_image', asset_id=asset.id) }}" target="_blank">
+                {% if asset.algorithm == "AES-GCM" %}
+                  <label>
+                    Passphrase
+                    <input name="passphrase" type="password" autocomplete="off" required>
+                  </label>
+                {% else %}
+                  <label>
+                    Private key password
+                    <input name="private_key_passphrase" type="password" autocomplete="current-password" required>
+                  </label>
+                {% endif %}
+                <button class="button button-secondary" type="submit">Decrypt preview</button>
+              </form>
+            </article>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="empty-state">
+          <h3>No encrypted images yet</h3>
+          <p>Your uploaded photos will appear here after encryption.</p>
+        </div>
+      {% endif %}
+    </section>
+  </section>
+
+  <script>
+    const select = document.querySelector("#algorithm-select");
+    const passphrase = document.querySelector("#passphrase-field input");
+    const note = document.querySelector("#algorithm-note");
+
+    function syncAlgorithmFields() {
+      if (select.value === "RSA-HYBRID") {
+        passphrase.required = false;
+        passphrase.disabled = true;
+        passphrase.value = "";
+        note.textContent = "RSA hybrid mode wraps the image data key with your account public key.";
+      } else {
+        passphrase.required = true;
+        passphrase.disabled = false;
+        note.textContent = "AES-GCM passphrase mode derives a key with Scrypt and wraps the image data key.";
+      }
+    }
+
+    select.addEventListener("change", syncAlgorithmFields);
+    syncAlgorithmFields();
+  </script>
+{% endblock %}
+

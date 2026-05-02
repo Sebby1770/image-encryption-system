@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "image-encryption-system"
+version = "0.1.0"
+description = "A Flask cybersecurity project for authenticated image encryption and decryption."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Sebastian Forbes" }]
+dependencies = [
+  "cryptography>=42.0.0",
+  "Flask>=3.0.0",
+  "Pillow>=10.0.0",
+  "PyJWT>=2.8.0"
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+image_encryption_system = ["templates/*.html", "static/css/*.css"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
