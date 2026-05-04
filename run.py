@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import sys
 
 
@@ -13,5 +14,9 @@ from image_encryption_system.web import create_app
 app = create_app()
 
 
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=_env_flag("FLASK_DEBUG"))

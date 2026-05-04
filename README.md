@@ -59,6 +59,17 @@ shared or public deployment, set strong values for:
 - `JWT_SECRET`
 - `IES_INSTANCE_DIR`
 
+Debug mode is disabled by default. To run with Flask's debugger on your own
+machine only:
+
+```bash
+FLASK_DEBUG=1 python run.py
+```
+
+Repeated bad login and API token attempts are throttled by default. Tune the
+`AUTH_RATE_LIMIT_*` environment variables if you need a stricter or looser local
+policy.
+
 ## How Encryption Works
 
 Every uploaded image is encrypted with a random 256-bit data key using

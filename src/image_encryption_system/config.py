@@ -15,3 +15,6 @@ class Config:
     KEY_DIR = INSTANCE_DIR / "keys"
     MAX_CONTENT_LENGTH = 16 * 1024 * 1024
     ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"}
+    AUTH_RATE_LIMIT_ATTEMPTS = int(os.getenv("AUTH_RATE_LIMIT_ATTEMPTS", "5"))
+    AUTH_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("AUTH_RATE_LIMIT_WINDOW_SECONDS", "300"))
+    AUTH_RATE_LIMIT_LOCKOUT_SECONDS = int(os.getenv("AUTH_RATE_LIMIT_LOCKOUT_SECONDS", "300"))
