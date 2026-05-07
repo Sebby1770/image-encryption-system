@@ -43,14 +43,19 @@ The web dashboard requires login. Each encrypted image record is tied to a
 `user_id`. Decryption routes check ownership before reading encrypted bytes.
 API routes require a valid signed JWT.
 
+## Local File Permissions
+
+On POSIX hosts, generated key and vault directories are restricted to the owning
+user. Per-user PEM files and encrypted vault blobs are written with owner-only
+read/write permissions.
+
 ## Recommended Production Hardening
 
 - Use HTTPS everywhere.
 - Store secrets in a managed secret store.
-- Add rate limiting to login, registration, and decrypt endpoints.
+- Extend rate limiting to registration and decrypt endpoints.
 - Add audit logs for encryption, decryption, and failed access attempts.
 - Move encrypted objects to S3 with SSE-KMS or a similar managed storage layer.
 - Add malware and file-type scanning for uploads.
 - Consider envelope encryption with a managed KMS instead of local key files.
 - Add OAuth using a trusted identity provider if the app will be multi-user.
-

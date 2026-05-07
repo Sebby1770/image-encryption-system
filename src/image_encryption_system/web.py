@@ -3,8 +3,11 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from io import BytesIO
+from math import ceil
 from pathlib import Path
 from sqlite3 import IntegrityError
+from threading import Lock
+import time
 from typing import Callable, TypeVar
 
 import jwt
@@ -38,6 +41,47 @@ from .storage import EncryptedAsset, User, VaultStore
 F = TypeVar("F", bound=Callable)
 
 
+class CredentialThrottle:
+    def __init__(self, *, max_attempts: int, window_seconds: int, lockout_seconds: int):
+        self.max_attempts = max_attempts
+        self.window_seconds = window_seconds
+        self.lockout_seconds = lockout_seconds
+        self.failures: dict[str, list[float]] = {}
+        self.locked_until: dict[str, float] = {}
+        self._lock = Lock()
+
+    def is_limited(self, key: str) -> bool:
+        return self.retry_after(key) is not None
+
+    def retry_after(self, key: str) -> int | None:
+        with self._lock:
+            now = time.monotonic()
+            until = self.locked_until.get(key)
+            if until is None:
+                return None
+            if until <= now:
+                self.locked_until.pop(key, None)
+                return None
+            return max(1, ceil(until - now))
+
+    def record_failure(self, key: str) -> None:
+        with self._lock:
+            now = time.monotonic()
+            window_start = now - self.window_seconds
+            attempts = [stamp for stamp in self.failures.get(key, []) if stamp >= window_start]
+            attempts.append(now)
+            if len(attempts) >= self.max_attempts:
+                self.locked_until[key] = now + self.lockout_seconds
+                self.failures[key] = []
+            else:
+                self.failures[key] = attempts
+
+    def reset(self, key: str) -> None:
+        with self._lock:
+            self.failures.pop(key, None)
+            self.locked_until.pop(key, None)
+
+
 def create_app(test_config: dict | None = None) -> Flask:
     app = Flask(__name__)
     app.config.from_object(Config)
@@ -56,6 +100,11 @@ def create_app(test_config: dict | None = None) -> Flask:
     )
     store.init()
     app.extensions["vault_store"] = store
+    app.extensions["credential_throttle"] = CredentialThrottle(
+        max_attempts=app.config["AUTH_RATE_LIMIT_ATTEMPTS"],
+        window_seconds=app.config["AUTH_RATE_LIMIT_WINDOW_SECONDS"],
+        lockout_seconds=app.config["AUTH_RATE_LIMIT_LOCKOUT_SECONDS"],
+    )
 
     @app.context_processor
     def inject_globals() -> dict:
@@ -99,11 +148,23 @@ def create_app(test_config: dict | None = None) -> Flask:
     def login() -> Response:
         username = request.form.get("username", "")
         password = request.form.get("password", "")
+        throttle = app.extensions["credential_throttle"]
+        throttle_key = _credential_throttle_key(username)
+        retry_after = throttle.retry_after(throttle_key)
+        if retry_after is not None:
+            flash(
+                f"Too many failed sign-in attempts. Please wait {retry_after} seconds.",
+                "error",
+            )
+            return redirect(url_for("index"))
+
         user = store.authenticate_user(username, password)
         if not user:
+            throttle.record_failure(throttle_key)
             flash("Invalid username or password.", "error")
             return redirect(url_for("index"))
 
+        throttle.reset(throttle_key)
         session.clear()
         session["user_id"] = user.id
         flash("Signed in.", "success")
@@ -210,10 +271,25 @@ def create_app(test_config: dict | None = None) -> Flask:
         payload = request.get_json(silent=True) or {}
         username = str(payload.get("username", ""))
         password = str(payload.get("password", ""))
+        throttle = app.extensions["credential_throttle"]
+        throttle_key = _credential_throttle_key(username)
+        retry_after = throttle.retry_after(throttle_key)
+        if retry_after is not None:
+            response = jsonify(
+                {
+                    "error": "too many failed attempts",
+                    "retry_after_seconds": retry_after,
+                }
+            )
+            response.headers["Retry-After"] = str(retry_after)
+            return response, 429
+
         user = store.authenticate_user(username, password)
         if not user:
+            throttle.record_failure(throttle_key)
             return jsonify({"error": "invalid credentials"}), 401
 
+        throttle.reset(throttle_key)
         now = datetime.now(timezone.utc)
         token = jwt.encode(
             {
@@ -309,6 +385,11 @@ def _owned_asset(store: VaultStore, asset_id: int, user: User) -> EncryptedAsset
 
 def _allowed_extension(filename: str, allowed_extensions: set[str]) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in allowed_extensions
+
+
+def _credential_throttle_key(username: str) -> str:
+    remote = request.remote_addr or "unknown"
+    return f"{remote}:{username.strip().lower() or 'anonymous'}"
 
 
 def _inspect_image(image_bytes: bytes) -> dict[str, int | str]:
