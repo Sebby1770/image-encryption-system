@@ -80,7 +80,7 @@ def test_register_encrypt_decrypt_and_jwt(tmp_path) -> None:
     assert response.get_json()["images"][0]["filename"] == "secret.png"
 
 
-def test_generated_keys_are_owner_only(tmp_path) -> None:
+def test_generated_files_are_owner_only(tmp_path) -> None:
     if os.name == "nt":
         pytest.skip("POSIX file modes are not portable to Windows")
 
@@ -100,6 +100,23 @@ def test_generated_keys_are_owner_only(tmp_path) -> None:
     assert stat.S_IMODE(store.key_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE(store.private_key_path(user.id).stat().st_mode) == 0o600
     assert stat.S_IMODE(store.public_key_path(user.id).stat().st_mode) == 0o600
+
+    response = client.post(
+        "/images",
+        data={
+            "algorithm": AES_GCM_PASSPHRASE,
+            "passphrase": "image passphrase",
+            "image": (BytesIO(sample_png()), "secret.png"),
+        },
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+
+    asset = store.list_assets(user.id)[0]
+    encrypted_path = store.vault_dir / asset.stored_filename
+    assert stat.S_IMODE(store.vault_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(encrypted_path.stat().st_mode) == 0o600
 
 
 def test_login_throttles_repeated_bad_passwords(tmp_path) -> None:
@@ -160,4 +177,7 @@ def test_api_token_throttles_repeated_bad_passwords(tmp_path) -> None:
         json={"username": "alice", "password": "correct horse battery"},
     )
     assert response.status_code == 429
-    assert response.get_json()["error"] == "too many failed attempts"
+    payload = response.get_json()
+    assert payload["error"] == "too many failed attempts"
+    assert payload["retry_after_seconds"] > 0
+    assert response.headers["Retry-After"] == str(payload["retry_after_seconds"])

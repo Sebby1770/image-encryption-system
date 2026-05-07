@@ -17,6 +17,7 @@ real-time decryption for authorized users.
 - Supports common image formats handled by Pillow: PNG, JPEG, WEBP, GIF, BMP,
   and TIFF.
 - Encrypted local vault using SQLite metadata and binary encrypted files.
+- Owner-only file permissions for generated key and vault files on POSIX hosts.
 - Tests for AES and RSA encryption/decryption flows.
 
 ## Tech Stack
@@ -66,7 +67,8 @@ machine only:
 FLASK_DEBUG=1 python run.py
 ```
 
-Repeated bad login and API token attempts are throttled by default. Tune the
+Repeated bad login and API token attempts are throttled by default. API clients
+receive a `429` response with `Retry-After` guidance while locked out. Tune the
 `AUTH_RATE_LIMIT_*` environment variables if you need a stricter or looser local
 policy.
 

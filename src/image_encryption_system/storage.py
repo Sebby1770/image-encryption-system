@@ -14,8 +14,8 @@ from werkzeug.utils import secure_filename
 
 from .crypto import generate_rsa_key_pair
 
-PRIVATE_DIR_MODE = 0o700
-PRIVATE_FILE_MODE = 0o600
+OWNER_ONLY_DIR_MODE = 0o700
+OWNER_ONLY_FILE_MODE = 0o600
 
 
 @dataclass(frozen=True)
@@ -51,6 +51,7 @@ class VaultStore:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.vault_dir.mkdir(parents=True, exist_ok=True)
         self.key_dir.mkdir(parents=True, exist_ok=True)
+        _restrict_owner_access(self.vault_dir)
         _restrict_owner_access(self.key_dir)
         with self._connect() as db:
             db.executescript(
@@ -97,8 +98,8 @@ class VaultStore:
             user_id = int(cursor.lastrowid)
 
         private_pem, public_pem = generate_rsa_key_pair(password)
-        _write_private_file(self.private_key_path(user_id), private_pem)
-        _write_private_file(self.public_key_path(user_id), public_pem)
+        _write_owner_only_file(self.private_key_path(user_id), private_pem)
+        _write_owner_only_file(self.public_key_path(user_id), public_pem)
         return self.get_user(user_id)
 
     def authenticate_user(self, username: str, password: str) -> User | None:
@@ -146,7 +147,7 @@ class VaultStore:
     ) -> EncryptedAsset:
         safe_name = secure_filename(original_filename) or "image"
         stored_filename = f"{uuid4().hex}.enc"
-        (self.vault_dir / stored_filename).write_bytes(ciphertext)
+        _write_owner_only_file(self.vault_dir / stored_filename, ciphertext)
         now = _utc_now()
 
         with self._connect() as db:
@@ -204,19 +205,19 @@ def _utc_now() -> str:
 
 def _restrict_owner_access(path: Path) -> None:
     if os.name != "nt":
-        os.chmod(path, PRIVATE_DIR_MODE)
+        os.chmod(path, OWNER_ONLY_DIR_MODE)
 
 
-def _write_private_file(path: Path, content: bytes) -> None:
+def _write_owner_only_file(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if os.name == "nt":
         path.write_bytes(content)
         return
 
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, OWNER_ONLY_FILE_MODE)
     with os.fdopen(fd, "wb") as handle:
         handle.write(content)
-    os.chmod(path, PRIVATE_FILE_MODE)
+    os.chmod(path, OWNER_ONLY_FILE_MODE)
 
 
 def _user_from_row(row: sqlite3.Row) -> User:
