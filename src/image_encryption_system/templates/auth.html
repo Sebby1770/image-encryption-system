@@ -18,6 +18,7 @@
         method="post"
         action="{% if mode == 'register' %}{{ url_for('register') }}{% else %}{{ url_for('login') }}{% endif %}"
       >
+        <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
         <label>
           Username
           <input name="username" type="text" autocomplete="username" required>
@@ -57,4 +58,3 @@
     </div>
   </section>
 {% endblock %}
-

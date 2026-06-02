@@ -16,6 +16,7 @@
 
   <section class="workspace-grid">
     <form class="upload-panel" method="post" action="{{ url_for('upload_image') }}" enctype="multipart/form-data">
+      <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
       <h2>Encrypt image</h2>
       <label>
         Image file
@@ -51,6 +52,7 @@
                 <small>{{ asset.created_at }}</small>
               </div>
               <form method="post" action="{{ url_for('decrypt_image', asset_id=asset.id) }}" target="_blank">
+                <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
                 {% if asset.algorithm == "AES-GCM" %}
                   <label>
                     Passphrase
@@ -98,4 +100,3 @@
     syncAlgorithmFields();
   </script>
 {% endblock %}
-

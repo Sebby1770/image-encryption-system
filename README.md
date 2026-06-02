@@ -14,6 +14,7 @@ real-time decryption for authorized users.
 - AES mode passphrase-based key wrapping with Scrypt.
 - Login-protected dashboard and ownership checks.
 - JWT API token endpoint for integrations.
+- CSRF protection for session-cookie form actions.
 - Supports common image formats handled by Pillow: PNG, JPEG, WEBP, GIF, BMP,
   and TIFF.
 - Encrypted local vault using SQLite metadata and binary encrypted files.
@@ -59,6 +60,10 @@ shared or public deployment, set strong values for:
 - `SECRET_KEY`
 - `JWT_SECRET`
 - `IES_INSTANCE_DIR`
+
+Set `IES_REQUIRE_STRONG_SECRETS=true` in any hosted environment. The app will
+refuse to start if `SECRET_KEY` or `JWT_SECRET` are missing, too short, or still
+using the documented development placeholders.
 
 Debug mode is disabled by default. To run with Flask's debugger on your own
 machine only:

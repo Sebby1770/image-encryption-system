@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from functools import wraps
+import hmac
 from io import BytesIO
 from math import ceil
 from pathlib import Path
+import secrets
 from sqlite3 import IntegrityError
 from threading import Lock
 import time
@@ -87,6 +89,8 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.config.from_object(Config)
     if test_config:
         app.config.update(test_config)
+    _validate_runtime_secrets(app)
+    Image.MAX_IMAGE_PIXELS = app.config["MAX_IMAGE_PIXELS"]
 
     app.config["INSTANCE_DIR"] = Path(app.config["INSTANCE_DIR"])
     app.config["DATABASE_PATH"] = Path(app.config["DATABASE_PATH"])
@@ -110,11 +114,21 @@ def create_app(test_config: dict | None = None) -> Flask:
     def inject_globals() -> dict:
         return {
             "current_user": _current_user(store),
+            "csrf_token": _csrf_token,
             "algorithms": [
                 (AES_GCM_PASSPHRASE, "AES-GCM passphrase"),
                 (RSA_HYBRID, "RSA hybrid"),
             ],
         }
+
+    @app.before_request
+    def protect_form_posts() -> Response | None:
+        if request.method != "POST" or request.path.startswith("/api/"):
+            return None
+        if _valid_csrf_token(request.form.get("_csrf_token", "")):
+            return None
+        flash("Your form session expired. Please try again.", "error")
+        return redirect(url_for("index"))
 
     @app.get("/")
     def index() -> str | Response:
@@ -374,6 +388,34 @@ def _current_user(store: VaultStore) -> User | None:
     except LookupError:
         session.clear()
         return None
+
+
+def _csrf_token() -> str:
+    token = session.get("_csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["_csrf_token"] = token
+    return str(token)
+
+
+def _valid_csrf_token(token: str) -> bool:
+    expected = session.get("_csrf_token")
+    return bool(expected and token and hmac.compare_digest(str(expected), str(token)))
+
+
+def _validate_runtime_secrets(app: Flask) -> None:
+    if not app.config.get("REQUIRE_STRONG_SECRETS"):
+        return
+
+    weak_values = {
+        "dev-secret-change-me-dev-secret-change-me",
+        "change-me-before-deploying-use-at-least-32-bytes",
+        "change-me-too-use-at-least-32-bytes",
+    }
+    for key in ("SECRET_KEY", "JWT_SECRET"):
+        value = str(app.config.get(key, ""))
+        if value in weak_values or len(value.encode("utf-8")) < 32:
+            raise RuntimeError(f"{key} must be set to a strong value before deployment.")
 
 
 def _owned_asset(store: VaultStore, asset_id: int, user: User) -> EncryptedAsset:
