@@ -129,7 +129,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             {
                 "status": "ok",
                 "service": "image-encryption-system",
-                "version": "0.5.0",
+                "version": "0.6.0",
             }
         )
 
@@ -286,7 +286,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         return jsonify(
             {
                 "service": "image-encryption-system",
-                "version": "0.5.0",
+                "version": "0.6.0",
                 "authentication": "Bearer JWT from POST /api/token",
                 "endpoints": [
                     {"method": "GET", "path": "/health", "description": "Service health"},
@@ -299,6 +299,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                     {"method": "POST", "path": "/api/images/<id>/decrypt", "description": "Decrypt asset"},
                     {"method": "DELETE", "path": "/api/images/<id>", "description": "Delete asset"},
                     {"method": "GET", "path": "/api/audit", "description": "Recent audit events"},
+                    {"method": "GET", "path": "/api/audit/verify", "description": "Verify tamper-evident audit chain"},
                 ],
             }
         )
@@ -392,6 +393,23 @@ def create_app(test_config: dict | None = None) -> Flask:
             flash(f"Invalid vault archive: {exc}", "error")
         return redirect(url_for("dashboard"))
 
+    @app.get("/api/audit/verify")
+    @jwt_required(store)
+    def api_verify_audit_chain() -> Response:
+        user = g.api_user
+        return jsonify(store.verify_audit_chain(user.id))
+
+    @app.post("/audit/verify")
+    @login_required(store)
+    def verify_audit_chain() -> Response:
+        user = _current_user(store)
+        result = store.verify_audit_chain(user.id)
+        if result["valid"]:
+            flash(f"Audit chain valid ({result['checked']} events). Tip: {result['tip'][:12]}…", "success")
+        else:
+            flash(f"Audit chain broken at event #{result.get('broken_at')}.", "error")
+        return redirect(url_for("dashboard"))
+
     @app.get("/api/stats")
     @jwt_required(store)
     def api_stats() -> Response:
@@ -466,6 +484,9 @@ def create_app(test_config: dict | None = None) -> Flask:
                 passphrase=passphrase if algorithm == AES_GCM_PASSPHRASE else None,
                 public_key_pem=public_key,
             )
+            unlock_after = request.form.get("unlock_after", "").strip()
+            if unlock_after:
+                metadata["unlock_after"] = unlock_after
             asset = store.save_asset(
                 user_id=user.id,
                 original_filename=upload.filename,
@@ -497,6 +518,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         user = _current_user(store)
         try:
             asset = _owned_asset(store, asset_id, user)
+            _assert_unlocked(asset)
             ciphertext = store.read_ciphertext(asset)
             plaintext = decrypt_image_bytes(
                 ciphertext,
@@ -509,7 +531,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                 aad=_aad_from_metadata(asset),
             )
             store.record_audit(user.id, "decrypt", f"In-page preview for {asset.original_filename}")
-        except (LookupError, PermissionError, CryptoError) as exc:
+        except (LookupError, PermissionError, CryptoError, ValueError) as exc:
             return jsonify({"error": str(exc)}), 400
 
         return send_file(
@@ -525,6 +547,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         user = _current_user(store)
         try:
             asset = _owned_asset(store, asset_id, user)
+            _assert_unlocked(asset)
             ciphertext = store.read_ciphertext(asset)
             aad = _aad_from_metadata(asset)
             plaintext = decrypt_image_bytes(
@@ -542,7 +565,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                 "decrypt",
                 f"Decrypted preview for {asset.original_filename}",
             )
-        except (LookupError, PermissionError, CryptoError) as exc:
+        except (LookupError, PermissionError, CryptoError, ValueError) as exc:
             flash(str(exc), "error")
             return redirect(url_for("dashboard"))
 
@@ -688,6 +711,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         payload = request.get_json(silent=True) or {}
         try:
             asset = _owned_asset(store, asset_id, user)
+            _assert_unlocked(asset)
             ciphertext = store.read_ciphertext(asset)
             plaintext = decrypt_image_bytes(
                 ciphertext,
@@ -700,6 +724,8 @@ def create_app(test_config: dict | None = None) -> Flask:
                 aad=_aad_from_metadata(asset),
             )
             store.record_audit(user.id, "decrypt", f"API decrypted {asset.original_filename}")
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 423
         except (LookupError, PermissionError, CryptoError) as exc:
             status = 404 if isinstance(exc, LookupError) else 403 if isinstance(exc, PermissionError) else 400
             return jsonify({"error": str(exc)}), status
@@ -848,6 +874,20 @@ def _aad_from_metadata(asset: EncryptedAsset) -> bytes:
     )
 
 
+def _assert_unlocked(asset: EncryptedAsset) -> None:
+    unlock_after = asset.metadata.get("unlock_after")
+    if not unlock_after:
+        return
+    try:
+        unlock_at = datetime.fromisoformat(str(unlock_after))
+        if unlock_at.tzinfo is None:
+            unlock_at = unlock_at.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return
+    if datetime.now(timezone.utc) < unlock_at:
+        raise ValueError(f"Time-locked until {unlock_at.isoformat(timespec='seconds')}")
+
+
 def _asset_payload(asset: EncryptedAsset) -> dict:
     return {
         "id": asset.id,
@@ -858,6 +898,8 @@ def _asset_payload(asset: EncryptedAsset) -> dict:
         "tags": [tag for tag in asset.tags.split(",") if tag],
         "notes": asset.notes,
         "content_hash": asset.metadata.get("content_hash"),
+        "entropy_bits": asset.metadata.get("entropy_bits"),
+        "unlock_after": asset.metadata.get("unlock_after"),
         "created_at": asset.created_at,
     }
 

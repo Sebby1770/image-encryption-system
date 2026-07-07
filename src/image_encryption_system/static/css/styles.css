@@ -597,6 +597,16 @@ input:disabled {
   margin: 6px 0 0;
 }
 
+.timelock-chip,
+.verify-chain-form {
+  margin-top: 8px;
+}
+
+.timelock-chip {
+  color: #f5c84b;
+  font-size: 0.84rem;
+}
+
 @media (max-width: 860px) {
   .auth-grid,
   .workspace-grid,

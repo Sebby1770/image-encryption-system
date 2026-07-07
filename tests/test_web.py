@@ -513,8 +513,63 @@ def test_v050_notes_bulk_tags_password_docs_and_duplicate(tmp_path) -> None:
     assert store.authenticate_user("alice", "new horse battery")
 
     docs = client.get("/api/docs").get_json()
-    assert docs["version"] == "0.5.0"
+    assert docs["version"] == "0.6.0"
     assert any(item["path"] == "/api/stats" for item in docs["endpoints"])
+
+
+def test_v060_audit_chain_entropy_and_timelock(tmp_path) -> None:
+    app = make_app(tmp_path)
+    client = app.test_client()
+
+    token = csrf_token(client, "/register")
+    client.post(
+        "/register",
+        data={"username": "alice", "password": "correct horse battery", "_csrf_token": token},
+        follow_redirects=True,
+    )
+
+    store = app.extensions["vault_store"]
+    user = store.get_user_by_username("alice")
+    future = "2099-12-31T23:59"
+    token = csrf_token(client, "/dashboard")
+    client.post(
+        "/images",
+        data={
+            "algorithm": AES_GCM_PASSPHRASE,
+            "passphrase": "image passphrase",
+            "unlock_after": future,
+            "image": (BytesIO(sample_png()), "locked.png"),
+            "_csrf_token": token,
+        },
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    asset = store.list_assets(user.id)[0]
+    assert asset.metadata.get("entropy_bits", 0) > 0
+    assert asset.metadata.get("unlock_after") == future
+
+    token = csrf_token(client, "/dashboard")
+    locked = client.post(
+        f"/images/{asset.id}/preview",
+        data={"passphrase": "image passphrase", "_csrf_token": token},
+    )
+    assert locked.status_code == 400
+    assert b"Time-locked" in locked.data
+
+    chain = store.verify_audit_chain(user.id)
+    assert chain["valid"] is True
+    assert chain["checked"] >= 2
+
+    token = csrf_token(client, "/dashboard")
+    client.post("/audit/verify", data={"_csrf_token": token}, follow_redirects=True)
+
+    response = client.post(
+        "/api/token",
+        json={"username": "alice", "password": "correct horse battery"},
+    )
+    headers = {"Authorization": f"Bearer {response.get_json()['token']}"}
+    verify = client.get("/api/audit/verify", headers=headers).get_json()
+    assert verify["valid"] is True
 
 
 def test_production_requires_strong_secrets(tmp_path) -> None:

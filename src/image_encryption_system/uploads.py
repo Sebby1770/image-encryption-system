@@ -2,11 +2,27 @@ from __future__ import annotations
 
 from hashlib import sha256
 from io import BytesIO
+import math
 from typing import Any
 
 from PIL import Image, UnidentifiedImageError
 
 from .crypto import AES_GCM_PASSPHRASE, RSA_HYBRID, CryptoError, encrypt_image_bytes
+
+
+def image_entropy(image_bytes: bytes) -> float:
+    if not image_bytes:
+        return 0.0
+    counts = [0] * 256
+    for byte in image_bytes:
+        counts[byte] += 1
+    length = len(image_bytes)
+    entropy = 0.0
+    for count in counts:
+        if count:
+            probability = count / length
+            entropy -= probability * math.log2(probability)
+    return round(entropy, 4)
 
 
 def asset_aad(user_id: int, original_filename: str, mime_type: str) -> bytes:
@@ -53,6 +69,7 @@ def encrypt_upload(
     metadata = {
         **result.metadata,
         "content_hash": sha256(image_bytes).hexdigest(),
+        "entropy_bits": image_entropy(image_bytes),
         "aad": {
             "user_id": user_id,
             "original_filename": filename,

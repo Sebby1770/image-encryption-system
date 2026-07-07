@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.0 — 2026-07-07
+
+### Added
+- **Tamper-evident audit chain** — each audit event links to the previous via SHA-256 (`GET /api/audit/verify`)
+- **Image entropy meter** stored per asset and shown on vault cards
+- **Time-lock decrypt** — optional `unlock_after` datetime blocks preview/decrypt until then
+- **Burn-after-read preview** — decrypted modal auto-clears after 30 seconds
+
+### Improved
+- API asset payloads include `entropy_bits` and `unlock_after`
+- Existing audit logs backfilled into the hash chain on startup
+
 ## 0.5.0 — 2026-07-07
 
 ### Added

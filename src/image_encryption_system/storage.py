@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -50,6 +51,8 @@ class AuditEvent:
     action: str
     detail: str
     created_at: str
+    prev_hash: str
+    chain_hash: str
 
 
 @dataclass(frozen=True)
@@ -108,6 +111,36 @@ class VaultStore:
             )
             self._ensure_tags_column(db)
             self._ensure_notes_column(db)
+            self._ensure_audit_chain_columns(db)
+
+    def _ensure_audit_chain_columns(self, db: sqlite3.Connection) -> None:
+        columns = {
+            str(row[1])
+            for row in db.execute("PRAGMA table_info(audit_events)").fetchall()
+        }
+        if "prev_hash" not in columns:
+            db.execute(
+                "ALTER TABLE audit_events ADD COLUMN prev_hash TEXT NOT NULL DEFAULT 'GENESIS'"
+            )
+        if "chain_hash" not in columns:
+            db.execute(
+                "ALTER TABLE audit_events ADD COLUMN chain_hash TEXT NOT NULL DEFAULT ''"
+            )
+        rows = db.execute(
+            "SELECT id, user_id, action, detail, created_at FROM audit_events WHERE chain_hash = '' ORDER BY id"
+        ).fetchall()
+        for row in rows:
+            prev = db.execute(
+                "SELECT chain_hash FROM audit_events WHERE user_id = ? AND id < ? AND chain_hash != '' ORDER BY id DESC LIMIT 1",
+                (int(row["user_id"]), int(row["id"])),
+            ).fetchone()
+            prev_hash = str(prev[0]) if prev and prev[0] else "GENESIS"
+            payload = f"{prev_hash}|{row['user_id']}|{row['action']}|{row['detail']}|{row['created_at']}"
+            chain_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+            db.execute(
+                "UPDATE audit_events SET prev_hash = ?, chain_hash = ? WHERE id = ?",
+                (prev_hash, chain_hash, int(row["id"])),
+            )
 
     def _ensure_notes_column(self, db: sqlite3.Connection) -> None:
         columns = {
@@ -364,11 +397,49 @@ class VaultStore:
         return asset
 
     def record_audit(self, user_id: int, action: str, detail: str) -> None:
+        now = _utc_now()
         with self._connect() as db:
+            prev = db.execute(
+                """
+                SELECT chain_hash FROM audit_events
+                WHERE user_id = ? AND chain_hash != ''
+                ORDER BY id DESC LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+            prev_hash = str(prev[0]) if prev and prev[0] else "GENESIS"
+            payload = f"{prev_hash}|{user_id}|{action}|{detail}|{now}"
+            chain_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
             db.execute(
-                "INSERT INTO audit_events (user_id, action, detail, created_at) VALUES (?, ?, ?, ?)",
-                (user_id, action, detail, _utc_now()),
+                """
+                INSERT INTO audit_events (
+                    user_id, action, detail, created_at, prev_hash, chain_hash
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, action, detail, now, prev_hash, chain_hash),
             )
+
+    def verify_audit_chain(self, user_id: int) -> dict[str, int | bool | str]:
+        events = self.list_audit_events(user_id, limit=500)
+        ordered = list(reversed(events))
+        previous = "GENESIS"
+        for event in ordered:
+            payload = f"{previous}|{event.user_id}|{event.action}|{event.detail}|{event.created_at}"
+            expected = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+            if event.prev_hash != previous or event.chain_hash != expected:
+                return {
+                    "valid": False,
+                    "checked": len(ordered),
+                    "broken_at": event.id,
+                    "tip": event.chain_hash,
+                }
+            previous = event.chain_hash
+        return {
+            "valid": True,
+            "checked": len(ordered),
+            "tip": previous,
+        }
 
     def list_audit_events(self, user_id: int, *, limit: int = 25) -> list[AuditEvent]:
         with self._connect() as db:
@@ -474,10 +545,13 @@ def _normalize_tags(tags: str) -> str:
 
 
 def _audit_from_row(row: sqlite3.Row) -> AuditEvent:
+    keys = row.keys()
     return AuditEvent(
         id=int(row["id"]),
         user_id=int(row["user_id"]),
         action=str(row["action"]),
         detail=str(row["detail"]),
         created_at=str(row["created_at"]),
+        prev_hash=str(row["prev_hash"]) if "prev_hash" in keys else "GENESIS",
+        chain_hash=str(row["chain_hash"]) if "chain_hash" in keys else "",
     )
