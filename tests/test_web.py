@@ -383,6 +383,62 @@ def test_tags_search_and_vault_export(tmp_path) -> None:
     assert response.mimetype == "application/zip"
 
 
+def test_update_tags_rename_and_api_stats(tmp_path) -> None:
+    app = make_app(tmp_path)
+    client = app.test_client()
+
+    token = csrf_token(client, "/register")
+    client.post(
+        "/register",
+        data={"username": "alice", "password": "correct horse battery", "_csrf_token": token},
+    )
+
+    token = csrf_token(client, "/dashboard")
+    client.post(
+        "/images",
+        data={
+            "algorithm": AES_GCM_PASSPHRASE,
+            "passphrase": "image passphrase",
+            "tags": "draft",
+            "image": (BytesIO(sample_png()), "photo.png"),
+            "_csrf_token": token,
+        },
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+
+    store = app.extensions["vault_store"]
+    user = store.get_user_by_username("alice")
+    asset = store.list_assets(user.id)[0]
+
+    token = csrf_token(client, "/dashboard")
+    client.post(
+        f"/images/{asset.id}/tags",
+        data={"tags": "final,archive", "_csrf_token": token},
+        follow_redirects=True,
+    )
+    updated = store.get_asset(asset.id)
+    assert updated.tags == "final,archive"
+
+    token = csrf_token(client, "/dashboard")
+    client.post(
+        f"/images/{asset.id}/rename",
+        data={"filename": "renamed.png", "_csrf_token": token},
+        follow_redirects=True,
+    )
+    renamed = store.get_asset(asset.id)
+    assert renamed.original_filename == "renamed.png"
+
+    response = client.post(
+        "/api/token",
+        json={"username": "alice", "password": "correct horse battery"},
+    )
+    headers = {"Authorization": f"Bearer {response.get_json()['token']}"}
+    stats = client.get("/api/stats", headers=headers).get_json()
+    assert stats["assets"] == 1
+    assert "final" in stats["tags"]
+
+
 def test_production_requires_strong_secrets(tmp_path) -> None:
     with pytest.raises(RuntimeError, match="SECRET_KEY"):
         make_app(

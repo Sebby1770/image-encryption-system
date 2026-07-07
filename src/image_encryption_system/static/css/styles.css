@@ -518,6 +518,42 @@ input:disabled {
   width: 100%;
 }
 
+.vault-io {
+  display: grid;
+  gap: 10px;
+}
+
+.import-form {
+  display: grid;
+  gap: 8px;
+}
+
+.inline-edit {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  margin-top: 8px;
+}
+
+.password-meter {
+  display: grid;
+  gap: 6px;
+  margin-top: -6px;
+}
+
+.password-meter-bar {
+  background: linear-gradient(90deg, #f4a261, #0f766e);
+  border-radius: 999px;
+  height: 6px;
+  width: 0%;
+  transition: width 120ms ease;
+}
+
+.password-meter span {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
 .asset-card h3 {
   font-size: 1rem;
   margin: 0 0 8px;

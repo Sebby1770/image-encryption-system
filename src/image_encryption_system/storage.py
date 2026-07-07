@@ -255,6 +255,30 @@ class VaultStore:
             rows = db.execute(sql, params).fetchall()
         return [_asset_from_row(row) for row in rows]
 
+    def update_asset_tags(self, asset_id: int, user_id: int, tags: str) -> EncryptedAsset:
+        asset = self.get_asset(asset_id)
+        if asset.user_id != user_id:
+            raise PermissionError("You do not have access to this encrypted image.")
+        normalized = _normalize_tags(tags)
+        with self._connect() as db:
+            db.execute(
+                "UPDATE encrypted_assets SET tags = ? WHERE id = ?",
+                (normalized, asset_id),
+            )
+        return self.get_asset(asset_id)
+
+    def update_asset_filename(self, asset_id: int, user_id: int, filename: str) -> EncryptedAsset:
+        asset = self.get_asset(asset_id)
+        if asset.user_id != user_id:
+            raise PermissionError("You do not have access to this encrypted image.")
+        safe_name = secure_filename(filename.strip()) or asset.original_filename
+        with self._connect() as db:
+            db.execute(
+                "UPDATE encrypted_assets SET original_filename = ? WHERE id = ?",
+                (safe_name, asset_id),
+            )
+        return self.get_asset(asset_id)
+
     def delete_assets(self, asset_ids: list[int], user_id: int) -> list[EncryptedAsset]:
         deleted: list[EncryptedAsset] = []
         for asset_id in asset_ids:

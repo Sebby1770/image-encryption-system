@@ -72,7 +72,14 @@
             <p class="field-note">Audit events will appear after your first vault action.</p>
           {% endfor %}
         </div>
-        <a class="button button-ghost" href="{{ url_for('export_vault') }}">Export vault ZIP</a>
+        <div class="vault-io">
+          <a class="button button-ghost" href="{{ url_for('export_vault') }}">Export vault ZIP</a>
+          <form method="post" action="{{ url_for('import_vault_manifest') }}" enctype="multipart/form-data" class="import-form">
+            <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+            <input name="archive" type="file" accept=".zip,application/zip">
+            <button class="button button-secondary" type="submit">Validate import</button>
+          </form>
+        </div>
       </section>
 
       <section class="audit-panel" aria-label="Recent activity">
@@ -146,6 +153,16 @@
                   <p class="asset-tags">{% for tag in asset.tags.split(',') %}<span class="tag-chip">{{ tag }}</span>{% endfor %}</p>
                 {% endif %}
                 <small>{{ asset.created_at }}</small>
+                <form class="inline-edit" method="post" action="{{ url_for('update_tags', asset_id=asset.id) }}">
+                  <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+                  <input name="tags" type="text" value="{{ asset.tags }}" placeholder="tags">
+                  <button class="button button-ghost" type="submit">Save tags</button>
+                </form>
+                <form class="inline-edit" method="post" action="{{ url_for('rename_asset', asset_id=asset.id) }}">
+                  <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+                  <input name="filename" type="text" value="{{ asset.original_filename }}">
+                  <button class="button button-ghost" type="submit">Rename</button>
+                </form>
               </div>
               <div class="asset-actions">
                 <form class="preview-form" data-asset-id="{{ asset.id }}" data-algorithm="{{ asset.algorithm }}">

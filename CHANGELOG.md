@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0 — 2026-07-07
+
+### Added
+- **Inline tag editing** and **asset rename** on vault cards
+- **Vault import validation** for exported ZIP manifests
+- **`GET /api/stats`** with assets, algorithms, tags, and audit summary
+- **Password strength meter** on registration form
+
+### Improved
+- Export/import workflow with audit logging for import validation
+
 ## 0.3.0 — 2026-07-07
 
 ### Added

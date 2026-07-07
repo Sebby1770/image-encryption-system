@@ -128,7 +128,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             {
                 "status": "ok",
                 "service": "image-encryption-system",
-                "version": "0.3.0",
+                "version": "0.4.0",
             }
         )
 
@@ -278,6 +278,63 @@ def create_app(test_config: dict | None = None) -> Flask:
             mimetype="application/zip",
             download_name="encrypted-vault-export.zip",
             as_attachment=True,
+        )
+
+    @app.post("/images/<int:asset_id>/tags")
+    @login_required(store)
+    def update_tags(asset_id: int) -> Response:
+        user = _current_user(store)
+        try:
+            asset = store.update_asset_tags(asset_id, user.id, request.form.get("tags", ""))
+            store.record_audit(user.id, "update", f"Updated tags for {asset.original_filename}")
+            flash("Tags updated.", "success")
+        except (LookupError, PermissionError) as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("dashboard"))
+
+    @app.post("/images/<int:asset_id>/rename")
+    @login_required(store)
+    def rename_asset(asset_id: int) -> Response:
+        user = _current_user(store)
+        try:
+            asset = store.update_asset_filename(asset_id, user.id, request.form.get("filename", ""))
+            store.record_audit(user.id, "update", f"Renamed asset to {asset.original_filename}")
+            flash("Filename updated.", "success")
+        except (LookupError, PermissionError, ValueError) as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("dashboard"))
+
+    @app.post("/vault/import")
+    @login_required(store)
+    def import_vault_manifest() -> Response:
+        user = _current_user(store)
+        upload = request.files.get("archive")
+        if upload is None or not upload.filename:
+            flash("Choose a vault export ZIP to inspect.", "error")
+            return redirect(url_for("dashboard"))
+        try:
+            with zipfile.ZipFile(BytesIO(upload.read())) as bundle:
+                manifest = json_module.loads(bundle.read("manifest.json"))
+            imported = len(manifest) if isinstance(manifest, list) else 0
+            store.record_audit(user.id, "import", f"Validated vault manifest with {imported} assets")
+            flash(f"Manifest validated ({imported} assets). Ciphertext remains encrypted.", "success")
+        except (KeyError, json_module.JSONDecodeError, zipfile.BadZipFile) as exc:
+            flash(f"Invalid vault archive: {exc}", "error")
+        return redirect(url_for("dashboard"))
+
+    @app.get("/api/stats")
+    @jwt_required(store)
+    def api_stats() -> Response:
+        user = g.api_user
+        stats = store.vault_stats(user.id)
+        return jsonify(
+            {
+                "assets": stats.asset_count,
+                "ciphertext_bytes": stats.ciphertext_bytes,
+                "algorithms": stats.algorithms,
+                "tags": store.list_tags(user.id),
+                "audit": store.audit_summary(user.id),
+            }
         )
 
     @app.post("/images/bulk-delete")
