@@ -219,6 +219,125 @@ def test_form_posts_require_csrf_token(tmp_path) -> None:
     assert b"Your form session expired" in response.data
 
 
+def test_delete_asset_and_audit_log(tmp_path) -> None:
+    app = make_app(tmp_path)
+    client = app.test_client()
+
+    token = csrf_token(client, "/register")
+    client.post(
+        "/register",
+        data={"username": "alice", "password": "correct horse battery", "_csrf_token": token},
+    )
+
+    token = csrf_token(client, "/dashboard")
+    client.post(
+        "/images",
+        data={
+            "algorithm": AES_GCM_PASSPHRASE,
+            "passphrase": "image passphrase",
+            "image": (BytesIO(sample_png()), "secret.png"),
+            "_csrf_token": token,
+        },
+        content_type="multipart/form-data",
+    )
+
+    store = app.extensions["vault_store"]
+    user = store.get_user_by_username("alice")
+    asset = store.list_assets(user.id)[0]
+
+    token = csrf_token(client, "/dashboard")
+    response = client.post(
+        f"/images/{asset.id}/delete",
+        data={"_csrf_token": token},
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    assert store.list_assets(user.id) == []
+
+    events = store.list_audit_events(user.id)
+    assert any(event.action == "delete" for event in events)
+
+
+def test_api_upload_and_delete(tmp_path) -> None:
+    app = make_app(tmp_path)
+    client = app.test_client()
+
+    token = csrf_token(client, "/register")
+    client.post(
+        "/register",
+        data={"username": "alice", "password": "correct horse battery", "_csrf_token": token},
+    )
+
+    response = client.post(
+        "/api/token",
+        json={"username": "alice", "password": "correct horse battery"},
+    )
+    jwt_token = response.get_json()["token"]
+    headers = {"Authorization": f"Bearer {jwt_token}"}
+
+    response = client.post(
+        "/api/images",
+        data={
+            "algorithm": AES_GCM_PASSPHRASE,
+            "passphrase": "image passphrase",
+            "image": (BytesIO(sample_png()), "secret.png"),
+        },
+        headers=headers,
+        content_type="multipart/form-data",
+    )
+    assert response.status_code == 201
+    asset_id = response.get_json()["image"]["id"]
+
+    response = client.delete(f"/api/images/{asset_id}", headers=headers)
+    assert response.status_code == 200
+    assert response.get_json()["deleted"] is True
+
+
+def test_vault_search_sort_and_bulk_delete(tmp_path) -> None:
+    app = make_app(tmp_path)
+    client = app.test_client()
+
+    token = csrf_token(client, "/register")
+    client.post(
+        "/register",
+        data={"username": "alice", "password": "correct horse battery", "_csrf_token": token},
+    )
+
+    store = app.extensions["vault_store"]
+    user = store.get_user_by_username("alice")
+
+    for name in ("alpha.png", "beta.png", "gamma.png"):
+        token = csrf_token(client, "/dashboard")
+        client.post(
+            "/images",
+            data={
+                "algorithm": AES_GCM_PASSPHRASE,
+                "passphrase": "image passphrase",
+                "image": (BytesIO(sample_png()), name),
+                "_csrf_token": token,
+            },
+            content_type="multipart/form-data",
+            follow_redirects=True,
+        )
+
+    assets = store.list_assets(user.id, query="beta")
+    assert len(assets) == 1
+    assert assets[0].original_filename == "beta.png"
+
+    all_assets = store.list_assets(user.id, sort="name")
+    assert [asset.original_filename for asset in all_assets] == ["alpha.png", "beta.png", "gamma.png"]
+
+    token = csrf_token(client, "/dashboard")
+    ids = [asset.id for asset in store.list_assets(user.id)[:2]]
+    response = client.post(
+        "/images/bulk-delete",
+        data={"asset_ids": ids, "_csrf_token": token},
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    assert len(store.list_assets(user.id)) == 1
+
+
 def test_production_requires_strong_secrets(tmp_path) -> None:
     with pytest.raises(RuntimeError, match="SECRET_KEY"):
         make_app(

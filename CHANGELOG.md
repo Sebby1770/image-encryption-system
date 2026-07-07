@@ -1,0 +1,21 @@
+# Changelog
+
+## 0.2.0 — 2026-07-07
+
+### Added
+- **Vault search** by filename with algorithm filter and sort options (newest, oldest, name, largest)
+- **Bulk delete** for selected encrypted images with audit logging
+- **Encrypted thumbnail placeholders** showing dimensions and format without decrypting
+- **Algorithm breakdown metrics** on dashboard (AES-GCM vs RSA hybrid counts)
+- **REST API** endpoints for upload, decrypt, delete, audit, and vault stats
+- **CLI** (`ies encrypt` / `ies decrypt`) for portable `.ies` bundles
+- **Drag-and-drop upload** zone with activity log panel
+
+### Improved
+- CSRF protection and credential throttling with lockout backoff
+- Vault file permissions hardening (POSIX `0o700`/`0o600`)
+- Health endpoint reports version `0.2.0`
+
+### Tests
+- Vault search, sort, and bulk delete integration test
+- API upload/delete and audit event coverage

@@ -8,67 +8,145 @@
       <h1>Encrypted image vault</h1>
       <p>Upload an image, choose a key protection mode, and store only ciphertext.</p>
     </div>
-    <div class="metric">
-      <span>{{ assets|length }}</span>
-      <small>encrypted images</small>
+    <div class="metric-grid">
+      <div class="metric">
+        <span>{{ stats.asset_count }}</span>
+        <small>encrypted images</small>
+      </div>
+      <div class="metric">
+        <span>{{ format_bytes(stats.ciphertext_bytes) }}</span>
+        <small>ciphertext stored</small>
+      </div>
+      <div class="metric">
+        <span>{{ stats.algorithms.get("AES-GCM", 0) }}</span>
+        <small>AES-GCM assets</small>
+      </div>
+      <div class="metric">
+        <span>{{ stats.algorithms.get("RSA-HYBRID", 0) }}</span>
+        <small>RSA hybrid assets</small>
+      </div>
     </div>
   </section>
 
   <section class="workspace-grid">
-    <form class="upload-panel" method="post" action="{{ url_for('upload_image') }}" enctype="multipart/form-data">
-      <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-      <h2>Encrypt image</h2>
-      <label>
-        Image file
-        <input name="image" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp,image/tiff" required>
-      </label>
-      <label>
-        Algorithm
-        <select name="algorithm" id="algorithm-select">
-          {% for value, label in algorithms %}
-            <option value="{{ value }}">{{ label }}</option>
-          {% endfor %}
-        </select>
-      </label>
-      <label id="passphrase-field">
-        AES passphrase
-        <input name="passphrase" type="password" autocomplete="off" placeholder="Required for AES-GCM mode">
-      </label>
-      <p class="field-note" id="algorithm-note">
-        AES-GCM passphrase mode derives a key with Scrypt and wraps the image data key.
-      </p>
-      <button class="button button-primary" type="submit">Encrypt and store</button>
-    </form>
+    <div class="left-column">
+      <form class="upload-panel dropzone" method="post" action="{{ url_for('upload_image') }}" enctype="multipart/form-data" id="upload-form">
+        <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+        <h2>Encrypt image</h2>
+        <div class="drop-target" id="drop-target">
+          <p class="drop-title">Drop an image here</p>
+          <p class="drop-sub">or choose a file below</p>
+        </div>
+        <label>
+          Image file
+          <input name="image" id="image-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp,image/tiff" required>
+        </label>
+        <label>
+          Algorithm
+          <select name="algorithm" id="algorithm-select">
+            {% for value, label in algorithms %}
+              <option value="{{ value }}">{{ label }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label id="passphrase-field">
+          AES passphrase
+          <input name="passphrase" type="password" autocomplete="off" placeholder="Required for AES-GCM mode">
+        </label>
+        <p class="field-note" id="algorithm-note">
+          AES-GCM passphrase mode derives a key with Scrypt and wraps the image data key.
+        </p>
+        <button class="button button-primary" type="submit">Encrypt and store</button>
+      </form>
+
+      <section class="audit-panel" aria-label="Recent activity">
+        <h2>Activity log</h2>
+        {% if audit_events %}
+          <ol class="audit-list">
+            {% for event in audit_events %}
+              <li>
+                <span class="audit-action">{{ event.action }}</span>
+                <span class="audit-detail">{{ event.detail }}</span>
+                <time>{{ event.created_at }}</time>
+              </li>
+            {% endfor %}
+          </ol>
+        {% else %}
+          <p class="field-note">Security events such as uploads, decrypts, and deletions appear here.</p>
+        {% endif %}
+      </section>
+    </div>
 
     <section class="vault-list" aria-label="Encrypted images">
-      <h2>Vault</h2>
+      <div class="vault-toolbar">
+        <h2>Vault</h2>
+        <form class="vault-filters" method="get" action="{{ url_for('dashboard') }}">
+          <input name="q" type="search" placeholder="Search filename" value="{{ query }}">
+          <select name="algorithm">
+            <option value="">All algorithms</option>
+            <option value="AES-GCM" {% if filter_algorithm == "AES-GCM" %}selected{% endif %}>AES-GCM</option>
+            <option value="RSA-HYBRID" {% if filter_algorithm == "RSA-HYBRID" %}selected{% endif %}>RSA hybrid</option>
+          </select>
+          <select name="sort">
+            <option value="newest" {% if sort == "newest" %}selected{% endif %}>Newest first</option>
+            <option value="oldest" {% if sort == "oldest" %}selected{% endif %}>Oldest first</option>
+            <option value="name" {% if sort == "name" %}selected{% endif %}>Name A-Z</option>
+            <option value="largest" {% if sort == "largest" %}selected{% endif %}>Largest first</option>
+          </select>
+          <button class="button button-secondary" type="submit">Apply</button>
+        </form>
+      </div>
       {% if assets %}
+        <form method="post" action="{{ url_for('bulk_delete_images') }}" id="bulk-form" onsubmit="return confirm('Delete selected encrypted images permanently?');">
+          <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+          <div class="bulk-actions">
+            <label class="bulk-select-all">
+              <input type="checkbox" id="select-all">
+              <span>Select all</span>
+            </label>
+            <button class="button button-danger" type="submit">Delete selected</button>
+          </div>
         <div class="asset-list">
           {% for asset in assets %}
             <article class="asset-card">
+              <label class="asset-select">
+                <input type="checkbox" name="asset_ids" value="{{ asset.id }}" form="bulk-form">
+              </label>
+              <div class="asset-thumb" aria-hidden="true">
+                <span class="asset-thumb-lock">🔒</span>
+                <span class="asset-thumb-meta">{{ asset.width }}×{{ asset.height }}</span>
+                <span class="asset-thumb-format">{{ asset.image_format }}</span>
+              </div>
               <div>
                 <h3>{{ asset.original_filename }}</h3>
                 <p>{{ asset.algorithm }} · {{ asset.image_format }} · {{ asset.width }}x{{ asset.height }}</p>
                 <small>{{ asset.created_at }}</small>
               </div>
-              <form method="post" action="{{ url_for('decrypt_image', asset_id=asset.id) }}" target="_blank">
-                <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-                {% if asset.algorithm == "AES-GCM" %}
-                  <label>
-                    Passphrase
-                    <input name="passphrase" type="password" autocomplete="off" required>
-                  </label>
-                {% else %}
-                  <label>
-                    Private key password
-                    <input name="private_key_passphrase" type="password" autocomplete="current-password" required>
-                  </label>
-                {% endif %}
-                <button class="button button-secondary" type="submit">Decrypt preview</button>
-              </form>
+              <div class="asset-actions">
+                <form method="post" action="{{ url_for('decrypt_image', asset_id=asset.id) }}" target="_blank">
+                  <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+                  {% if asset.algorithm == "AES-GCM" %}
+                    <label>
+                      Passphrase
+                      <input name="passphrase" type="password" autocomplete="off" required>
+                    </label>
+                  {% else %}
+                    <label>
+                      Private key password
+                      <input name="private_key_passphrase" type="password" autocomplete="current-password" required>
+                    </label>
+                  {% endif %}
+                  <button class="button button-secondary" type="submit">Decrypt preview</button>
+                </form>
+                <form method="post" action="{{ url_for('delete_image', asset_id=asset.id) }}" onsubmit="return confirm('Delete this encrypted image permanently?');">
+                  <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+                  <button class="button button-danger" type="submit">Delete</button>
+                </form>
+              </div>
             </article>
           {% endfor %}
         </div>
+        </form>
       {% else %}
         <div class="empty-state">
           <h3>No encrypted images yet</h3>
@@ -82,6 +160,9 @@
     const select = document.querySelector("#algorithm-select");
     const passphrase = document.querySelector("#passphrase-field input");
     const note = document.querySelector("#algorithm-note");
+    const dropTarget = document.querySelector("#drop-target");
+    const imageInput = document.querySelector("#image-input");
+    const uploadForm = document.querySelector("#upload-form");
 
     function syncAlgorithmFields() {
       if (select.value === "RSA-HYBRID") {
@@ -98,5 +179,40 @@
 
     select.addEventListener("change", syncAlgorithmFields);
     syncAlgorithmFields();
+
+    ["dragenter", "dragover"].forEach((eventName) => {
+      dropTarget.addEventListener(eventName, (event) => {
+        event.preventDefault();
+        dropTarget.classList.add("dragover");
+      });
+    });
+
+    ["dragleave", "drop"].forEach((eventName) => {
+      dropTarget.addEventListener(eventName, (event) => {
+        event.preventDefault();
+        dropTarget.classList.remove("dragover");
+      });
+    });
+
+    dropTarget.addEventListener("drop", (event) => {
+      const files = event.dataTransfer?.files;
+      if (!files || files.length === 0) return;
+      imageInput.files = files;
+      dropTarget.querySelector(".drop-title").textContent = files[0].name;
+    });
+
+    imageInput.addEventListener("change", () => {
+      if (imageInput.files?.[0]) {
+        dropTarget.querySelector(".drop-title").textContent = imageInput.files[0].name;
+      }
+    });
+
+    const selectAll = document.querySelector("#select-all");
+    const assetChecks = () => Array.from(document.querySelectorAll('input[name="asset_ids"]'));
+    selectAll?.addEventListener("change", () => {
+      assetChecks().forEach((checkbox) => {
+        checkbox.checked = selectAll.checked;
+      });
+    });
   </script>
 {% endblock %}

@@ -35,9 +35,9 @@ from .crypto import (
     RSA_HYBRID,
     CryptoError,
     decrypt_image_bytes,
-    encrypt_image_bytes,
 )
 from .storage import EncryptedAsset, User, VaultStore
+from .uploads import asset_aad, encrypt_upload
 
 
 F = TypeVar("F", bound=Callable)
@@ -110,11 +110,32 @@ def create_app(test_config: dict | None = None) -> Flask:
         lockout_seconds=app.config["AUTH_RATE_LIMIT_LOCKOUT_SECONDS"],
     )
 
+    @app.after_request
+    def security_headers(response: Response) -> Response:
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        if request.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.get("/health")
+    def health() -> Response:
+        return jsonify(
+            {
+                "status": "ok",
+                "service": "image-encryption-system",
+                "version": "0.2.0",
+            }
+        )
+
     @app.context_processor
     def inject_globals() -> dict:
         return {
             "current_user": _current_user(store),
             "csrf_token": _csrf_token,
+            "format_bytes": _format_bytes,
             "algorithms": [
                 (AES_GCM_PASSPHRASE, "AES-GCM passphrase"),
                 (RSA_HYBRID, "RSA hybrid"),
@@ -155,6 +176,7 @@ def create_app(test_config: dict | None = None) -> Flask:
 
         session.clear()
         session["user_id"] = user.id
+        store.record_audit(user.id, "register", f"Account created for {user.username}")
         flash("Account created. Your RSA keys were generated and stored locally.", "success")
         return redirect(url_for("dashboard"))
 
@@ -181,6 +203,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         throttle.reset(throttle_key)
         session.clear()
         session["user_id"] = user.id
+        store.record_audit(user.id, "login", "Signed in via web session")
         flash("Signed in.", "success")
         return redirect(url_for("dashboard"))
 
@@ -194,8 +217,48 @@ def create_app(test_config: dict | None = None) -> Flask:
     @login_required(store)
     def dashboard() -> str:
         user = _current_user(store)
-        assets = store.list_assets(user.id)
-        return render_template("dashboard.html", assets=assets)
+        query = request.args.get("q", "")
+        algorithm = request.args.get("algorithm", "")
+        sort = request.args.get("sort", "newest")
+        assets = store.list_assets(
+            user.id,
+            query=query,
+            algorithm=algorithm,
+            sort=sort,
+        )
+        stats = store.vault_stats(user.id)
+        audit_events = store.list_audit_events(user.id)
+        return render_template(
+            "dashboard.html",
+            assets=assets,
+            stats=stats,
+            audit_events=audit_events,
+            query=query,
+            filter_algorithm=algorithm,
+            sort=sort,
+        )
+
+    @app.post("/images/bulk-delete")
+    @login_required(store)
+    def bulk_delete_images() -> Response:
+        user = _current_user(store)
+        raw_ids = request.form.getlist("asset_ids")
+        asset_ids = [int(value) for value in raw_ids if value.isdigit()]
+        if not asset_ids:
+            flash("Select at least one encrypted image to delete.", "error")
+            return redirect(url_for("dashboard"))
+
+        deleted = 0
+        for asset_id in asset_ids:
+            try:
+                asset = store.delete_asset(asset_id, user.id)
+                store.record_audit(user.id, "delete", f"Bulk removed {asset.original_filename}")
+                deleted += 1
+            except (LookupError, PermissionError):
+                continue
+
+        flash(f"Deleted {deleted} encrypted image(s).", "success")
+        return redirect(url_for("dashboard"))
 
     @app.post("/images")
     @login_required(store)
@@ -215,34 +278,30 @@ def create_app(test_config: dict | None = None) -> Flask:
 
         image_bytes = upload.read()
         try:
-            image_info = _inspect_image(image_bytes)
-            aad = _asset_aad(user.id, upload.filename, image_info["mime_type"])
             public_key = store.read_public_key(user.id) if algorithm == RSA_HYBRID else None
-            result = encrypt_image_bytes(
-                image_bytes,
-                algorithm,
+            ciphertext, metadata, image_info = encrypt_upload(
+                user_id=user.id,
+                filename=upload.filename,
+                image_bytes=image_bytes,
+                algorithm=algorithm,
                 passphrase=passphrase if algorithm == AES_GCM_PASSPHRASE else None,
                 public_key_pem=public_key,
-                aad=aad,
             )
-            metadata = {
-                **result.metadata,
-                "aad": {
-                    "user_id": user.id,
-                    "original_filename": upload.filename,
-                    "mime_type": image_info["mime_type"],
-                },
-            }
-            store.save_asset(
+            asset = store.save_asset(
                 user_id=user.id,
                 original_filename=upload.filename,
                 algorithm=algorithm,
-                mime_type=image_info["mime_type"],
-                image_format=image_info["format"],
-                width=image_info["width"],
-                height=image_info["height"],
+                mime_type=str(image_info["mime_type"]),
+                image_format=str(image_info["format"]),
+                width=int(image_info["width"]),
+                height=int(image_info["height"]),
                 metadata=metadata,
-                ciphertext=result.ciphertext,
+                ciphertext=ciphertext,
+            )
+            store.record_audit(
+                user.id,
+                "upload",
+                f"Encrypted {asset.original_filename} with {algorithm}",
             )
         except (CryptoError, ValueError, UnidentifiedImageError) as exc:
             flash(str(exc), "error")
@@ -267,7 +326,12 @@ def create_app(test_config: dict | None = None) -> Flask:
                 if asset.algorithm == RSA_HYBRID
                 else None,
                 private_key_passphrase=request.form.get("private_key_passphrase") or None,
-                aad=aad,
+                aad=_aad_from_metadata(asset),
+            )
+            store.record_audit(
+                user.id,
+                "decrypt",
+                f"Decrypted preview for {asset.original_filename}",
             )
         except (LookupError, PermissionError, CryptoError) as exc:
             flash(str(exc), "error")
@@ -279,6 +343,18 @@ def create_app(test_config: dict | None = None) -> Flask:
             download_name=asset.original_filename,
             as_attachment=False,
         )
+
+    @app.post("/images/<int:asset_id>/delete")
+    @login_required(store)
+    def delete_image(asset_id: int) -> Response:
+        user = _current_user(store)
+        try:
+            asset = store.delete_asset(asset_id, user.id)
+            store.record_audit(user.id, "delete", f"Removed {asset.original_filename} from vault")
+            flash("Encrypted image deleted.", "success")
+        except (LookupError, PermissionError) as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("dashboard"))
 
     @app.post("/api/token")
     def api_token() -> Response:
@@ -304,6 +380,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             return jsonify({"error": "invalid credentials"}), 401
 
         throttle.reset(throttle_key)
+        store.record_audit(user.id, "api_token", "Issued JWT access token")
         now = datetime.now(timezone.utc)
         token = jwt.encode(
             {
@@ -333,6 +410,117 @@ def create_app(test_config: dict | None = None) -> Flask:
                         "created_at": asset.created_at,
                     }
                     for asset in store.list_assets(user.id)
+                ]
+            }
+        )
+
+    @app.post("/api/images")
+    @jwt_required(store)
+    def api_upload_image() -> Response:
+        user = g.api_user
+        upload = request.files.get("image")
+        if upload is None or not upload.filename:
+            return jsonify({"error": "image file is required"}), 400
+
+        algorithm = request.form.get("algorithm", AES_GCM_PASSPHRASE)
+        passphrase = request.form.get("passphrase")
+        if not _allowed_extension(upload.filename, app.config["ALLOWED_EXTENSIONS"]):
+            return jsonify({"error": "unsupported file extension"}), 400
+
+        try:
+            public_key = store.read_public_key(user.id) if algorithm == RSA_HYBRID else None
+            ciphertext, metadata, image_info = encrypt_upload(
+                user_id=user.id,
+                filename=upload.filename,
+                image_bytes=upload.read(),
+                algorithm=algorithm,
+                passphrase=passphrase,
+                public_key_pem=public_key,
+            )
+            asset = store.save_asset(
+                user_id=user.id,
+                original_filename=upload.filename,
+                algorithm=algorithm,
+                mime_type=str(image_info["mime_type"]),
+                image_format=str(image_info["format"]),
+                width=int(image_info["width"]),
+                height=int(image_info["height"]),
+                metadata=metadata,
+                ciphertext=ciphertext,
+            )
+            store.record_audit(user.id, "upload", f"API encrypted {asset.original_filename}")
+            return jsonify({"image": _asset_payload(asset)}), 201
+        except (CryptoError, ValueError, UnidentifiedImageError) as exc:
+            return jsonify({"error": str(exc)}), 400
+
+    @app.get("/api/images/<int:asset_id>")
+    @jwt_required(store)
+    def api_get_image(asset_id: int) -> Response:
+        user = g.api_user
+        try:
+            asset = _owned_asset(store, asset_id, user)
+        except (LookupError, PermissionError) as exc:
+            status = 404 if isinstance(exc, LookupError) else 403
+            return jsonify({"error": str(exc)}), status
+        return jsonify({"image": _asset_payload(asset)})
+
+    @app.post("/api/images/<int:asset_id>/decrypt")
+    @jwt_required(store)
+    def api_decrypt_image(asset_id: int) -> Response:
+        user = g.api_user
+        payload = request.get_json(silent=True) or {}
+        try:
+            asset = _owned_asset(store, asset_id, user)
+            ciphertext = store.read_ciphertext(asset)
+            plaintext = decrypt_image_bytes(
+                ciphertext,
+                asset.metadata,
+                passphrase=payload.get("passphrase"),
+                private_key_pem=store.read_private_key(user.id)
+                if asset.algorithm == RSA_HYBRID
+                else None,
+                private_key_passphrase=payload.get("private_key_passphrase"),
+                aad=_aad_from_metadata(asset),
+            )
+            store.record_audit(user.id, "decrypt", f"API decrypted {asset.original_filename}")
+        except (LookupError, PermissionError, CryptoError) as exc:
+            status = 404 if isinstance(exc, LookupError) else 403 if isinstance(exc, PermissionError) else 400
+            return jsonify({"error": str(exc)}), status
+
+        return send_file(
+            BytesIO(plaintext),
+            mimetype=asset.mime_type,
+            download_name=asset.original_filename,
+            as_attachment=True,
+        )
+
+    @app.delete("/api/images/<int:asset_id>")
+    @jwt_required(store)
+    def api_delete_image(asset_id: int) -> Response:
+        user = g.api_user
+        try:
+            asset = store.delete_asset(asset_id, user.id)
+            store.record_audit(user.id, "delete", f"API deleted {asset.original_filename}")
+        except (LookupError, PermissionError) as exc:
+            status = 404 if isinstance(exc, LookupError) else 403
+            return jsonify({"error": str(exc)}), status
+        return jsonify({"deleted": True, "id": asset.id})
+
+    @app.get("/api/audit")
+    @jwt_required(store)
+    def api_audit_log() -> Response:
+        user = g.api_user
+        events = store.list_audit_events(user.id, limit=100)
+        return jsonify(
+            {
+                "events": [
+                    {
+                        "id": event.id,
+                        "action": event.action,
+                        "detail": event.detail,
+                        "created_at": event.created_at,
+                    }
+                    for event in events
                 ]
             }
         )
@@ -434,30 +622,33 @@ def _credential_throttle_key(username: str) -> str:
     return f"{remote}:{username.strip().lower() or 'anonymous'}"
 
 
-def _inspect_image(image_bytes: bytes) -> dict[str, int | str]:
-    with Image.open(BytesIO(image_bytes)) as image:
-        image.verify()
-
-    with Image.open(BytesIO(image_bytes)) as image:
-        image_format = image.format or "UNKNOWN"
-        mime_type = Image.MIME.get(image_format, "application/octet-stream")
-        width, height = image.size
-        return {
-            "format": image_format,
-            "mime_type": mime_type,
-            "width": width,
-            "height": height,
-        }
-
-
-def _asset_aad(user_id: int, original_filename: str, mime_type: str) -> bytes:
-    return f"user={user_id}|filename={original_filename}|mime={mime_type}".encode("utf-8")
-
-
 def _aad_from_metadata(asset: EncryptedAsset) -> bytes:
     aad = asset.metadata.get("aad", {})
-    return _asset_aad(
+    return asset_aad(
         int(aad.get("user_id", asset.user_id)),
         str(aad.get("original_filename", asset.original_filename)),
         str(aad.get("mime_type", asset.mime_type)),
     )
+
+
+def _asset_payload(asset: EncryptedAsset) -> dict:
+    return {
+        "id": asset.id,
+        "filename": asset.original_filename,
+        "algorithm": asset.algorithm,
+        "format": asset.image_format,
+        "size": {"width": asset.width, "height": asset.height},
+        "created_at": asset.created_at,
+    }
+
+
+def _format_bytes(value: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB"]
+    size = float(value)
+    unit = 0
+    while size >= 1024 and unit < len(units) - 1:
+        size /= 1024
+        unit += 1
+    if unit == 0:
+        return f"{value} {units[unit]}"
+    return f"{size:.1f} {units[unit]}"

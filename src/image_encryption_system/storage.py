@@ -41,6 +41,22 @@ class EncryptedAsset:
     created_at: str
 
 
+@dataclass(frozen=True)
+class AuditEvent:
+    id: int
+    user_id: int
+    action: str
+    detail: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class VaultStats:
+    asset_count: int
+    ciphertext_bytes: int
+    algorithms: dict[str, int]
+
+
 class VaultStore:
     def __init__(self, database_path: Path, vault_dir: Path, key_dir: Path):
         self.database_path = Path(database_path)
@@ -74,6 +90,15 @@ class VaultStore:
                     width INTEGER NOT NULL,
                     height INTEGER NOT NULL,
                     metadata_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (user_id) REFERENCES users (id)
+                );
+
+                CREATE TABLE IF NOT EXISTS audit_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    detail TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     FOREIGN KEY (user_id) REFERENCES users (id)
                 );
@@ -182,16 +207,91 @@ class VaultStore:
             raise LookupError("Encrypted image not found.")
         return _asset_from_row(row)
 
-    def list_assets(self, user_id: int) -> list[EncryptedAsset]:
+    def list_assets(
+        self,
+        user_id: int,
+        *,
+        query: str = "",
+        algorithm: str = "",
+        sort: str = "newest",
+    ) -> list[EncryptedAsset]:
+        sql = "SELECT * FROM encrypted_assets WHERE user_id = ?"
+        params: list[object] = [user_id]
+
+        if query.strip():
+            sql += " AND original_filename LIKE ?"
+            params.append(f"%{query.strip()}%")
+        if algorithm.strip():
+            sql += " AND algorithm = ?"
+            params.append(algorithm.strip())
+
+        order_map = {
+            "newest": "id DESC",
+            "oldest": "id ASC",
+            "name": "original_filename COLLATE NOCASE ASC",
+            "largest": "width * height DESC",
+        }
+        sql += f" ORDER BY {order_map.get(sort, 'id DESC')}"
+
         with self._connect() as db:
-            rows = db.execute(
-                "SELECT * FROM encrypted_assets WHERE user_id = ? ORDER BY id DESC",
-                (user_id,),
-            ).fetchall()
+            rows = db.execute(sql, params).fetchall()
         return [_asset_from_row(row) for row in rows]
+
+    def delete_assets(self, asset_ids: list[int], user_id: int) -> list[EncryptedAsset]:
+        deleted: list[EncryptedAsset] = []
+        for asset_id in asset_ids:
+            deleted.append(self.delete_asset(asset_id, user_id))
+        return deleted
 
     def read_ciphertext(self, asset: EncryptedAsset) -> bytes:
         return (self.vault_dir / asset.stored_filename).read_bytes()
+
+    def delete_asset(self, asset_id: int, user_id: int) -> EncryptedAsset:
+        asset = self.get_asset(asset_id)
+        if asset.user_id != user_id:
+            raise PermissionError("You do not have access to this encrypted image.")
+
+        ciphertext_path = self.vault_dir / asset.stored_filename
+        with self._connect() as db:
+            db.execute("DELETE FROM encrypted_assets WHERE id = ?", (asset_id,))
+        if ciphertext_path.exists():
+            ciphertext_path.unlink()
+        return asset
+
+    def record_audit(self, user_id: int, action: str, detail: str) -> None:
+        with self._connect() as db:
+            db.execute(
+                "INSERT INTO audit_events (user_id, action, detail, created_at) VALUES (?, ?, ?, ?)",
+                (user_id, action, detail, _utc_now()),
+            )
+
+    def list_audit_events(self, user_id: int, *, limit: int = 25) -> list[AuditEvent]:
+        with self._connect() as db:
+            rows = db.execute(
+                """
+                SELECT * FROM audit_events
+                WHERE user_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (user_id, limit),
+            ).fetchall()
+        return [_audit_from_row(row) for row in rows]
+
+    def vault_stats(self, user_id: int) -> VaultStats:
+        assets = self.list_assets(user_id)
+        algorithms: dict[str, int] = {}
+        ciphertext_bytes = 0
+        for asset in assets:
+            algorithms[asset.algorithm] = algorithms.get(asset.algorithm, 0) + 1
+            ciphertext_path = self.vault_dir / asset.stored_filename
+            if ciphertext_path.exists():
+                ciphertext_bytes += ciphertext_path.stat().st_size
+        return VaultStats(
+            asset_count=len(assets),
+            ciphertext_bytes=ciphertext_bytes,
+            algorithms=algorithms,
+        )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path)
@@ -241,5 +341,15 @@ def _asset_from_row(row: sqlite3.Row) -> EncryptedAsset:
         width=int(row["width"]),
         height=int(row["height"]),
         metadata=json.loads(str(row["metadata_json"])),
+        created_at=str(row["created_at"]),
+    )
+
+
+def _audit_from_row(row: sqlite3.Row) -> AuditEvent:
+    return AuditEvent(
+        id=int(row["id"]),
+        user_id=int(row["user_id"]),
+        action=str(row["action"]),
+        detail=str(row["detail"]),
         created_at=str(row["created_at"]),
     )
