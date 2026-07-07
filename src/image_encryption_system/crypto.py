@@ -33,6 +33,25 @@ class EncryptionResult:
     metadata: dict[str, Any]
 
 
+def rewrap_private_key(private_pem: bytes, old_passphrase: str, new_passphrase: str) -> bytes:
+    if not old_passphrase or not new_passphrase:
+        raise CryptoError("Both old and new passphrases are required.")
+    if len(new_passphrase) < 10:
+        raise CryptoError("New passphrase must be at least 10 characters.")
+
+    private_key = serialization.load_pem_private_key(
+        private_pem,
+        password=old_passphrase.encode("utf-8"),
+    )
+    return private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.BestAvailableEncryption(
+            new_passphrase.encode("utf-8")
+        ),
+    )
+
+
 def generate_rsa_key_pair(passphrase: str) -> tuple[bytes, bytes]:
     if not passphrase:
         raise CryptoError("A passphrase is required to protect the private key.")

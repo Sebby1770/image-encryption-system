@@ -10,8 +10,8 @@ from image_encryption_system.crypto import AES_GCM_PASSPHRASE
 from image_encryption_system.web import create_app
 
 
-def sample_png() -> bytes:
-    image = Image.new("RGB", (80, 48), "#b7791f")
+def sample_png(color: str = "#b7791f") -> bytes:
+    image = Image.new("RGB", (80, 48), color)
     output = BytesIO()
     image.save(output, format="PNG")
     return output.getvalue()
@@ -306,14 +306,18 @@ def test_vault_search_sort_and_bulk_delete(tmp_path) -> None:
     store = app.extensions["vault_store"]
     user = store.get_user_by_username("alice")
 
-    for name in ("alpha.png", "beta.png", "gamma.png"):
+    for name, color in (
+        ("alpha.png", "#b7791f"),
+        ("beta.png", "#2d6a4f"),
+        ("gamma.png", "#4a4e69"),
+    ):
         token = csrf_token(client, "/dashboard")
         client.post(
             "/images",
             data={
                 "algorithm": AES_GCM_PASSPHRASE,
                 "passphrase": "image passphrase",
-                "image": (BytesIO(sample_png()), name),
+                "image": (BytesIO(sample_png(color)), name),
                 "_csrf_token": token,
             },
             content_type="multipart/form-data",
@@ -437,6 +441,80 @@ def test_update_tags_rename_and_api_stats(tmp_path) -> None:
     stats = client.get("/api/stats", headers=headers).get_json()
     assert stats["assets"] == 1
     assert "final" in stats["tags"]
+
+
+def test_v050_notes_bulk_tags_password_docs_and_duplicate(tmp_path) -> None:
+    app = make_app(tmp_path)
+    client = app.test_client()
+
+    token = csrf_token(client, "/register")
+    client.post(
+        "/register",
+        data={"username": "alice", "password": "correct horse battery", "_csrf_token": token},
+        follow_redirects=True,
+    )
+
+    plaintext = sample_png()
+    token = csrf_token(client, "/dashboard")
+    client.post(
+        "/images",
+        data={
+            "algorithm": AES_GCM_PASSPHRASE,
+            "passphrase": "image passphrase",
+            "tags": "draft",
+            "notes": "first upload",
+            "image": (BytesIO(plaintext), "secret.png"),
+            "_csrf_token": token,
+        },
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+
+    store = app.extensions["vault_store"]
+    user = store.get_user_by_username("alice")
+    asset = store.list_assets(user.id)[0]
+    assert asset.notes == "first upload"
+    assert asset.metadata.get("content_hash")
+
+    token = csrf_token(client, "/dashboard")
+    duplicate = client.post(
+        "/images",
+        data={
+            "algorithm": AES_GCM_PASSPHRASE,
+            "passphrase": "image passphrase",
+            "image": (BytesIO(plaintext), "duplicate.png"),
+            "_csrf_token": token,
+        },
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert b"Duplicate image detected" in duplicate.data
+    assert len(store.list_assets(user.id)) == 1
+
+    token = csrf_token(client, "/dashboard")
+    client.post(
+        "/images/bulk-tags",
+        data={"asset_ids": [str(asset.id)], "tags": "archive,final", "_csrf_token": token},
+        follow_redirects=True,
+    )
+    assert store.get_asset(asset.id).tags == "archive,final"
+
+    token = csrf_token(client, "/dashboard")
+    client.post(
+        "/account/password",
+        data={
+            "current_password": "correct horse battery",
+            "new_password": "new horse battery",
+            "confirm_password": "new horse battery",
+            "_csrf_token": token,
+        },
+        follow_redirects=True,
+    )
+    assert store.authenticate_user("alice", "new horse battery")
+
+    docs = client.get("/api/docs").get_json()
+    assert docs["version"] == "0.5.0"
+    assert any(item["path"] == "/api/stats" for item in docs["endpoints"])
 
 
 def test_production_requires_strong_secrets(tmp_path) -> None:

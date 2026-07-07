@@ -39,6 +39,7 @@ class EncryptedAsset:
     height: int
     metadata: dict[str, Any]
     tags: str
+    notes: str
     created_at: str
 
 
@@ -106,6 +107,17 @@ class VaultStore:
                 """
             )
             self._ensure_tags_column(db)
+            self._ensure_notes_column(db)
+
+    def _ensure_notes_column(self, db: sqlite3.Connection) -> None:
+        columns = {
+            str(row[1])
+            for row in db.execute("PRAGMA table_info(encrypted_assets)").fetchall()
+        }
+        if "notes" not in columns:
+            db.execute(
+                "ALTER TABLE encrypted_assets ADD COLUMN notes TEXT NOT NULL DEFAULT ''"
+            )
 
     def _ensure_tags_column(self, db: sqlite3.Connection) -> None:
         columns = {
@@ -182,6 +194,7 @@ class VaultStore:
         metadata: dict[str, Any],
         ciphertext: bytes,
         tags: str = "",
+        notes: str = "",
     ) -> EncryptedAsset:
         safe_name = secure_filename(original_filename) or "image"
         stored_filename = f"{uuid4().hex}.enc"
@@ -193,9 +206,9 @@ class VaultStore:
                 """
                 INSERT INTO encrypted_assets (
                     user_id, original_filename, stored_filename, algorithm, mime_type,
-                    image_format, width, height, metadata_json, tags, created_at
+                    image_format, width, height, metadata_json, tags, notes, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id,
@@ -208,6 +221,7 @@ class VaultStore:
                     height,
                     json.dumps(metadata, sort_keys=True),
                     _normalize_tags(tags),
+                    notes.strip(),
                     now,
                 ),
             )
@@ -234,8 +248,8 @@ class VaultStore:
         params: list[object] = [user_id]
 
         if query.strip():
-            sql += " AND (original_filename LIKE ? OR tags LIKE ?)"
-            params.extend([f"%{query.strip()}%", f"%{query.strip()}%"])
+            sql += " AND (original_filename LIKE ? OR tags LIKE ? OR notes LIKE ?)"
+            params.extend([f"%{query.strip()}%", f"%{query.strip()}%", f"%{query.strip()}%"])
         if algorithm.strip():
             sql += " AND algorithm = ?"
             params.append(algorithm.strip())
@@ -254,6 +268,55 @@ class VaultStore:
         with self._connect() as db:
             rows = db.execute(sql, params).fetchall()
         return [_asset_from_row(row) for row in rows]
+
+    def find_asset_by_content_hash(self, user_id: int, content_hash: str) -> EncryptedAsset | None:
+        if not content_hash:
+            return None
+        for asset in self.list_assets(user_id):
+            if asset.metadata.get("content_hash") == content_hash:
+                return asset
+        return None
+
+    def change_user_password(self, user_id: int, old_password: str, new_password: str) -> User:
+        user = self.get_user(user_id)
+        if not check_password_hash(user.password_hash, old_password):
+            raise ValueError("Current password is incorrect.")
+        if len(new_password) < 10:
+            raise ValueError("New password must be at least 10 characters.")
+
+        from .crypto import rewrap_private_key
+
+        private_pem = self.read_private_key(user_id)
+        new_private_pem = rewrap_private_key(private_pem, old_password, new_password)
+        _write_owner_only_file(self.private_key_path(user_id), new_private_pem)
+        password_hash = generate_password_hash(new_password)
+        with self._connect() as db:
+            db.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (password_hash, user_id),
+            )
+        return self.get_user(user_id)
+
+    def bulk_update_tags(self, asset_ids: list[int], user_id: int, tags: str) -> int:
+        updated = 0
+        for asset_id in asset_ids:
+            try:
+                self.update_asset_tags(asset_id, user_id, tags)
+                updated += 1
+            except (LookupError, PermissionError):
+                continue
+        return updated
+
+    def update_asset_notes(self, asset_id: int, user_id: int, notes: str) -> EncryptedAsset:
+        asset = self.get_asset(asset_id)
+        if asset.user_id != user_id:
+            raise PermissionError("You do not have access to this encrypted image.")
+        with self._connect() as db:
+            db.execute(
+                "UPDATE encrypted_assets SET notes = ? WHERE id = ?",
+                (notes.strip(), asset_id),
+            )
+        return self.get_asset(asset_id)
 
     def update_asset_tags(self, asset_id: int, user_id: int, tags: str) -> EncryptedAsset:
         asset = self.get_asset(asset_id)
@@ -400,6 +463,7 @@ def _asset_from_row(row: sqlite3.Row) -> EncryptedAsset:
         height=int(row["height"]),
         metadata=json.loads(str(row["metadata_json"])),
         tags=str(row["tags"]) if "tags" in row.keys() else "",
+        notes=str(row["notes"]) if "notes" in row.keys() else "",
         created_at=str(row["created_at"]),
     )
 

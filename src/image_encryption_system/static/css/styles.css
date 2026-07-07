@@ -580,6 +580,23 @@ input:disabled {
   margin: 0 0 8px;
 }
 
+.bulk-tag-row,
+.password-form {
+  display: grid;
+  gap: 10px;
+}
+
+.bulk-tag-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  margin-bottom: 12px;
+}
+
+.asset-notes {
+  color: #9aa3b2;
+  font-size: 0.88rem;
+  margin: 6px 0 0;
+}
+
 @media (max-width: 860px) {
   .auth-grid,
   .workspace-grid,

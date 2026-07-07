@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.0 — 2026-07-07
+
+### Added
+- **Asset notes** on upload and per-card inline editing
+- **Bulk tag update** for selected vault assets
+- **Password change** with RSA private key re-wrapping
+- **`GET /api/docs`** catalog of REST endpoints
+- **Duplicate detection** via SHA-256 content hash on upload (web + API 409)
+
+### Improved
+- Vault search matches notes in addition to filenames and tags
+- API asset payloads include `notes` and `content_hash`
+
 ## 0.4.0 — 2026-07-07
 
 ### Added

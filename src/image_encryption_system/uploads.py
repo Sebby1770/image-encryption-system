@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from hashlib import sha256
 from io import BytesIO
 from typing import Any
 
@@ -51,6 +52,7 @@ def encrypt_upload(
     )
     metadata = {
         **result.metadata,
+        "content_hash": sha256(image_bytes).hexdigest(),
         "aad": {
             "user_id": user_id,
             "original_filename": filename,

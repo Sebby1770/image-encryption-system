@@ -53,6 +53,10 @@
           Tags
           <input name="tags" type="text" placeholder="comma,separated,tags">
         </label>
+        <label>
+          Notes
+          <input name="notes" type="text" placeholder="Optional vault note for this upload">
+        </label>
         <label id="passphrase-field">
           AES passphrase
           <input name="passphrase" type="password" autocomplete="off" placeholder="Required for AES-GCM mode">
@@ -62,6 +66,27 @@
         </p>
         <button class="button button-primary" type="submit">Encrypt and store</button>
       </form>
+
+      <section class="audit-panel" aria-label="Account security">
+        <h2>Change password</h2>
+        <form method="post" action="{{ url_for('change_password') }}" class="password-form">
+          <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+          <label>
+            Current password
+            <input name="current_password" type="password" autocomplete="current-password" required>
+          </label>
+          <label>
+            New password
+            <input name="new_password" type="password" autocomplete="new-password" minlength="10" required>
+          </label>
+          <label>
+            Confirm new password
+            <input name="confirm_password" type="password" autocomplete="new-password" minlength="10" required>
+          </label>
+          <button class="button button-secondary" type="submit">Update password</button>
+        </form>
+        <p class="field-note"><a href="{{ url_for('api_docs') }}" target="_blank" rel="noopener">API docs</a> catalog available at <code>/api/docs</code>.</p>
+      </section>
 
       <section class="audit-panel" aria-label="Security summary">
         <h2>Security summary</h2>
@@ -126,6 +151,9 @@
         </form>
       </div>
       {% if assets %}
+        <form method="post" action="{{ url_for('bulk_update_tags') }}" id="bulk-tag-form">
+          <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+        </form>
         <form method="post" action="{{ url_for('bulk_delete_images') }}" id="bulk-form" onsubmit="return confirm('Delete selected encrypted images permanently?');">
           <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
           <div class="bulk-actions">
@@ -135,11 +163,15 @@
             </label>
             <button class="button button-danger" type="submit">Delete selected</button>
           </div>
+          <div class="bulk-tag-row">
+            <input name="tags" type="text" placeholder="Bulk tag selected assets" form="bulk-tag-form">
+            <button class="button button-secondary" type="submit" form="bulk-tag-form">Apply tags</button>
+          </div>
         <div class="asset-list">
           {% for asset in assets %}
             <article class="asset-card">
               <label class="asset-select">
-                <input type="checkbox" name="asset_ids" value="{{ asset.id }}" form="bulk-form">
+                <input type="checkbox" name="asset_ids" value="{{ asset.id }}" form="bulk-form bulk-tag-form">
               </label>
               <div class="asset-thumb" aria-hidden="true">
                 <span class="asset-thumb-lock">🔒</span>
@@ -152,11 +184,19 @@
                 {% if asset.tags %}
                   <p class="asset-tags">{% for tag in asset.tags.split(',') %}<span class="tag-chip">{{ tag }}</span>{% endfor %}</p>
                 {% endif %}
+                {% if asset.notes %}
+                  <p class="asset-notes">{{ asset.notes }}</p>
+                {% endif %}
                 <small>{{ asset.created_at }}</small>
                 <form class="inline-edit" method="post" action="{{ url_for('update_tags', asset_id=asset.id) }}">
                   <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
                   <input name="tags" type="text" value="{{ asset.tags }}" placeholder="tags">
                   <button class="button button-ghost" type="submit">Save tags</button>
+                </form>
+                <form class="inline-edit" method="post" action="{{ url_for('update_notes', asset_id=asset.id) }}">
+                  <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+                  <input name="notes" type="text" value="{{ asset.notes }}" placeholder="notes">
+                  <button class="button button-ghost" type="submit">Save notes</button>
                 </form>
                 <form class="inline-edit" method="post" action="{{ url_for('rename_asset', asset_id=asset.id) }}">
                   <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">

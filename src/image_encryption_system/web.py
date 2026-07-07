@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from functools import wraps
+import hashlib
 import hmac
 from io import BytesIO
 import json as json_module
@@ -128,7 +129,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             {
                 "status": "ok",
                 "service": "image-encryption-system",
-                "version": "0.4.0",
+                "version": "0.5.0",
             }
         )
 
@@ -280,6 +281,75 @@ def create_app(test_config: dict | None = None) -> Flask:
             as_attachment=True,
         )
 
+    @app.get("/api/docs")
+    def api_docs() -> Response:
+        return jsonify(
+            {
+                "service": "image-encryption-system",
+                "version": "0.5.0",
+                "authentication": "Bearer JWT from POST /api/token",
+                "endpoints": [
+                    {"method": "GET", "path": "/health", "description": "Service health"},
+                    {"method": "GET", "path": "/api/docs", "description": "This API catalog"},
+                    {"method": "POST", "path": "/api/token", "description": "Issue JWT"},
+                    {"method": "GET", "path": "/api/stats", "description": "Vault stats and audit summary"},
+                    {"method": "GET", "path": "/api/images", "description": "List encrypted assets"},
+                    {"method": "POST", "path": "/api/images", "description": "Upload and encrypt image"},
+                    {"method": "GET", "path": "/api/images/<id>", "description": "Fetch asset metadata"},
+                    {"method": "POST", "path": "/api/images/<id>/decrypt", "description": "Decrypt asset"},
+                    {"method": "DELETE", "path": "/api/images/<id>", "description": "Delete asset"},
+                    {"method": "GET", "path": "/api/audit", "description": "Recent audit events"},
+                ],
+            }
+        )
+
+    @app.post("/account/password")
+    @login_required(store)
+    def change_password() -> Response:
+        user = _current_user(store)
+        old_password = request.form.get("current_password", "")
+        new_password = request.form.get("new_password", "")
+        confirm_password = request.form.get("confirm_password", "")
+        if new_password != confirm_password:
+            flash("New passwords do not match.", "error")
+            return redirect(url_for("dashboard"))
+        try:
+            store.change_user_password(user.id, old_password, new_password)
+            store.record_audit(user.id, "password", "Account password changed")
+            flash("Password updated and RSA private key re-wrapped.", "success")
+        except ValueError as exc:
+            flash(str(exc), "error")
+        except Exception as exc:
+            flash(f"Password change failed: {exc}", "error")
+        return redirect(url_for("dashboard"))
+
+    @app.post("/images/bulk-tags")
+    @login_required(store)
+    def bulk_update_tags() -> Response:
+        user = _current_user(store)
+        raw_ids = request.form.getlist("asset_ids")
+        asset_ids = [int(value) for value in raw_ids if value.isdigit()]
+        tags = request.form.get("tags", "")
+        if not asset_ids:
+            flash("Select at least one asset to tag.", "error")
+            return redirect(url_for("dashboard"))
+        updated = store.bulk_update_tags(asset_ids, user.id, tags)
+        store.record_audit(user.id, "update", f"Bulk tagged {updated} asset(s)")
+        flash(f"Updated tags on {updated} asset(s).", "success")
+        return redirect(url_for("dashboard"))
+
+    @app.post("/images/<int:asset_id>/notes")
+    @login_required(store)
+    def update_notes(asset_id: int) -> Response:
+        user = _current_user(store)
+        try:
+            asset = store.update_asset_notes(asset_id, user.id, request.form.get("notes", ""))
+            store.record_audit(user.id, "update", f"Updated notes for {asset.original_filename}")
+            flash("Notes updated.", "success")
+        except (LookupError, PermissionError) as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("dashboard"))
+
     @app.post("/images/<int:asset_id>/tags")
     @login_required(store)
     def update_tags(asset_id: int) -> Response:
@@ -378,6 +448,15 @@ def create_app(test_config: dict | None = None) -> Flask:
 
         image_bytes = upload.read()
         try:
+            content_hash = hashlib.sha256(image_bytes).hexdigest()
+            duplicate = store.find_asset_by_content_hash(user.id, content_hash)
+            if duplicate:
+                flash(
+                    f"Duplicate image detected — already stored as {duplicate.original_filename}.",
+                    "error",
+                )
+                return redirect(url_for("dashboard"))
+
             public_key = store.read_public_key(user.id) if algorithm == RSA_HYBRID else None
             ciphertext, metadata, image_info = encrypt_upload(
                 user_id=user.id,
@@ -398,6 +477,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                 metadata=metadata,
                 ciphertext=ciphertext,
                 tags=tags,
+                notes=request.form.get("notes", ""),
             )
             store.record_audit(
                 user.id,
@@ -552,11 +632,23 @@ def create_app(test_config: dict | None = None) -> Flask:
             return jsonify({"error": "unsupported file extension"}), 400
 
         try:
+            image_bytes = upload.read()
+            content_hash = hashlib.sha256(image_bytes).hexdigest()
+            duplicate = store.find_asset_by_content_hash(user.id, content_hash)
+            if duplicate:
+                return jsonify(
+                    {
+                        "error": "duplicate image",
+                        "existing_id": duplicate.id,
+                        "filename": duplicate.original_filename,
+                    }
+                ), 409
+
             public_key = store.read_public_key(user.id) if algorithm == RSA_HYBRID else None
             ciphertext, metadata, image_info = encrypt_upload(
                 user_id=user.id,
                 filename=upload.filename,
-                image_bytes=upload.read(),
+                image_bytes=image_bytes,
                 algorithm=algorithm,
                 passphrase=passphrase,
                 public_key_pem=public_key,
@@ -764,6 +856,8 @@ def _asset_payload(asset: EncryptedAsset) -> dict:
         "format": asset.image_format,
         "size": {"width": asset.width, "height": asset.height},
         "tags": [tag for tag in asset.tags.split(",") if tag],
+        "notes": asset.notes,
+        "content_hash": asset.metadata.get("content_hash"),
         "created_at": asset.created_at,
     }
 
