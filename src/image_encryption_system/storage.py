@@ -38,6 +38,7 @@ class EncryptedAsset:
     width: int
     height: int
     metadata: dict[str, Any]
+    tags: str
     created_at: str
 
 
@@ -104,6 +105,17 @@ class VaultStore:
                 );
                 """
             )
+            self._ensure_tags_column(db)
+
+    def _ensure_tags_column(self, db: sqlite3.Connection) -> None:
+        columns = {
+            str(row[1])
+            for row in db.execute("PRAGMA table_info(encrypted_assets)").fetchall()
+        }
+        if "tags" not in columns:
+            db.execute(
+                "ALTER TABLE encrypted_assets ADD COLUMN tags TEXT NOT NULL DEFAULT ''"
+            )
 
     def create_user(self, username: str, password: str) -> User:
         username = username.strip().lower()
@@ -169,6 +181,7 @@ class VaultStore:
         height: int,
         metadata: dict[str, Any],
         ciphertext: bytes,
+        tags: str = "",
     ) -> EncryptedAsset:
         safe_name = secure_filename(original_filename) or "image"
         stored_filename = f"{uuid4().hex}.enc"
@@ -180,9 +193,9 @@ class VaultStore:
                 """
                 INSERT INTO encrypted_assets (
                     user_id, original_filename, stored_filename, algorithm, mime_type,
-                    image_format, width, height, metadata_json, created_at
+                    image_format, width, height, metadata_json, tags, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id,
@@ -194,6 +207,7 @@ class VaultStore:
                     width,
                     height,
                     json.dumps(metadata, sort_keys=True),
+                    _normalize_tags(tags),
                     now,
                 ),
             )
@@ -213,17 +227,21 @@ class VaultStore:
         *,
         query: str = "",
         algorithm: str = "",
+        tag: str = "",
         sort: str = "newest",
     ) -> list[EncryptedAsset]:
         sql = "SELECT * FROM encrypted_assets WHERE user_id = ?"
         params: list[object] = [user_id]
 
         if query.strip():
-            sql += " AND original_filename LIKE ?"
-            params.append(f"%{query.strip()}%")
+            sql += " AND (original_filename LIKE ? OR tags LIKE ?)"
+            params.extend([f"%{query.strip()}%", f"%{query.strip()}%"])
         if algorithm.strip():
             sql += " AND algorithm = ?"
             params.append(algorithm.strip())
+        if tag.strip():
+            sql += " AND tags LIKE ?"
+            params.append(f"%{tag.strip()}%")
 
         order_map = {
             "newest": "id DESC",
@@ -277,6 +295,22 @@ class VaultStore:
                 (user_id, limit),
             ).fetchall()
         return [_audit_from_row(row) for row in rows]
+
+    def list_tags(self, user_id: int) -> list[str]:
+        tags: set[str] = set()
+        for asset in self.list_assets(user_id):
+            for tag in asset.tags.split(","):
+                normalized = tag.strip()
+                if normalized:
+                    tags.add(normalized)
+        return sorted(tags)
+
+    def audit_summary(self, user_id: int) -> dict[str, int]:
+        events = self.list_audit_events(user_id, limit=500)
+        summary: dict[str, int] = {}
+        for event in events:
+            summary[event.action] = summary.get(event.action, 0) + 1
+        return summary
 
     def vault_stats(self, user_id: int) -> VaultStats:
         assets = self.list_assets(user_id)
@@ -341,8 +375,14 @@ def _asset_from_row(row: sqlite3.Row) -> EncryptedAsset:
         width=int(row["width"]),
         height=int(row["height"]),
         metadata=json.loads(str(row["metadata_json"])),
+        tags=str(row["tags"]) if "tags" in row.keys() else "",
         created_at=str(row["created_at"]),
     )
+
+
+def _normalize_tags(tags: str) -> str:
+    parts = [part.strip().lower() for part in tags.split(",") if part.strip()]
+    return ",".join(dict.fromkeys(parts))
 
 
 def _audit_from_row(row: sqlite3.Row) -> AuditEvent:

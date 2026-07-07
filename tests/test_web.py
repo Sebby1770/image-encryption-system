@@ -338,6 +338,51 @@ def test_vault_search_sort_and_bulk_delete(tmp_path) -> None:
     assert len(store.list_assets(user.id)) == 1
 
 
+def test_tags_search_and_vault_export(tmp_path) -> None:
+    app = make_app(tmp_path)
+    client = app.test_client()
+
+    token = csrf_token(client, "/register")
+    client.post(
+        "/register",
+        data={"username": "alice", "password": "correct horse battery", "_csrf_token": token},
+    )
+
+    store = app.extensions["vault_store"]
+    user = store.get_user_by_username("alice")
+
+    for name, tags in (("holiday.png", "vacation, family"), ("work.png", "work")):
+        token = csrf_token(client, "/dashboard")
+        client.post(
+            "/images",
+            data={
+                "algorithm": AES_GCM_PASSPHRASE,
+                "passphrase": "image passphrase",
+                "tags": tags,
+                "image": (BytesIO(sample_png()), name),
+                "_csrf_token": token,
+            },
+            content_type="multipart/form-data",
+            follow_redirects=True,
+        )
+
+    tagged = store.list_assets(user.id, tag="vacation")
+    assert len(tagged) == 1
+    assert tagged[0].tags == "vacation,family"
+
+    token = csrf_token(client, "/dashboard")
+    client.post("/logout", data={"_csrf_token": token})
+    token = csrf_token(client, "/")
+    client.post(
+        "/login",
+        data={"username": "alice", "password": "correct horse battery", "_csrf_token": token},
+        follow_redirects=True,
+    )
+    response = client.get("/vault/export")
+    assert response.status_code == 200
+    assert response.mimetype == "application/zip"
+
+
 def test_production_requires_strong_secrets(tmp_path) -> None:
     with pytest.raises(RuntimeError, match="SECRET_KEY"):
         make_app(

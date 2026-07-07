@@ -451,6 +451,73 @@ input:disabled {
   font-weight: 700;
 }
 
+.summary-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.summary-chip {
+  background: #f8fbfa;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  display: inline-flex;
+  gap: 8px;
+  padding: 6px 12px;
+}
+
+.summary-chip strong {
+  color: var(--accent);
+}
+
+.summary-chip span {
+  color: var(--muted);
+  font-size: 0.82rem;
+  text-transform: uppercase;
+}
+
+.tag-chip {
+  background: var(--mint);
+  border-radius: 999px;
+  color: var(--accent);
+  display: inline-block;
+  font-size: 0.75rem;
+  font-weight: 700;
+  margin-right: 6px;
+  padding: 2px 8px;
+}
+
+.asset-tags {
+  margin: 6px 0 0;
+}
+
+.preview-modal {
+  border: 0;
+  border-radius: 12px;
+  max-width: min(92vw, 760px);
+  padding: 0;
+  width: min(92vw, 760px);
+}
+
+.preview-modal::backdrop {
+  background: rgba(15, 23, 42, 0.55);
+}
+
+.preview-modal-head {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  padding: 16px 18px 8px;
+}
+
+.preview-modal img {
+  display: block;
+  max-height: 70vh;
+  object-fit: contain;
+  width: 100%;
+}
+
 .asset-card h3 {
   font-size: 1rem;
   margin: 0 0 8px;

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.0 — 2026-07-07
+
+### Added
+- **Asset tags** on upload with comma-separated labels and tag-based vault filtering
+- **In-page decrypt preview** modal (no new tab)
+- **Vault ZIP export** with ciphertext files and JSON manifest
+- **Security summary** panel with audit action counts
+- **API search** supports filename and tag query parameters
+
+### Improved
+- Search now matches both filenames and tags
+- Health endpoint reports version `0.3.0`
+
 ## 0.2.0 — 2026-07-07
 
 ### Added

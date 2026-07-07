@@ -49,6 +49,10 @@
             {% endfor %}
           </select>
         </label>
+        <label>
+          Tags
+          <input name="tags" type="text" placeholder="comma,separated,tags">
+        </label>
         <label id="passphrase-field">
           AES passphrase
           <input name="passphrase" type="password" autocomplete="off" placeholder="Required for AES-GCM mode">
@@ -58,6 +62,18 @@
         </p>
         <button class="button button-primary" type="submit">Encrypt and store</button>
       </form>
+
+      <section class="audit-panel" aria-label="Security summary">
+        <h2>Security summary</h2>
+        <div class="summary-grid">
+          {% for action, count in audit_summary.items() %}
+            <div class="summary-chip"><strong>{{ count }}</strong><span>{{ action }}</span></div>
+          {% else %}
+            <p class="field-note">Audit events will appear after your first vault action.</p>
+          {% endfor %}
+        </div>
+        <a class="button button-ghost" href="{{ url_for('export_vault') }}">Export vault ZIP</a>
+      </section>
 
       <section class="audit-panel" aria-label="Recent activity">
         <h2>Activity log</h2>
@@ -81,7 +97,13 @@
       <div class="vault-toolbar">
         <h2>Vault</h2>
         <form class="vault-filters" method="get" action="{{ url_for('dashboard') }}">
-          <input name="q" type="search" placeholder="Search filename" value="{{ query }}">
+          <input name="q" type="search" placeholder="Search filename or tags" value="{{ query }}">
+          <select name="tag">
+            <option value="">All tags</option>
+            {% for tag_name in all_tags %}
+              <option value="{{ tag_name }}" {% if filter_tag == tag_name %}selected{% endif %}>{{ tag_name }}</option>
+            {% endfor %}
+          </select>
           <select name="algorithm">
             <option value="">All algorithms</option>
             <option value="AES-GCM" {% if filter_algorithm == "AES-GCM" %}selected{% endif %}>AES-GCM</option>
@@ -120,10 +142,13 @@
               <div>
                 <h3>{{ asset.original_filename }}</h3>
                 <p>{{ asset.algorithm }} · {{ asset.image_format }} · {{ asset.width }}x{{ asset.height }}</p>
+                {% if asset.tags %}
+                  <p class="asset-tags">{% for tag in asset.tags.split(',') %}<span class="tag-chip">{{ tag }}</span>{% endfor %}</p>
+                {% endif %}
                 <small>{{ asset.created_at }}</small>
               </div>
               <div class="asset-actions">
-                <form method="post" action="{{ url_for('decrypt_image', asset_id=asset.id) }}" target="_blank">
+                <form class="preview-form" data-asset-id="{{ asset.id }}" data-algorithm="{{ asset.algorithm }}">
                   <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
                   {% if asset.algorithm == "AES-GCM" %}
                     <label>
@@ -136,7 +161,7 @@
                       <input name="private_key_passphrase" type="password" autocomplete="current-password" required>
                     </label>
                   {% endif %}
-                  <button class="button button-secondary" type="submit">Decrypt preview</button>
+                  <button class="button button-secondary preview-button" type="submit">Preview in vault</button>
                 </form>
                 <form method="post" action="{{ url_for('delete_image', asset_id=asset.id) }}" onsubmit="return confirm('Delete this encrypted image permanently?');">
                   <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
@@ -155,6 +180,14 @@
       {% endif %}
     </section>
   </section>
+
+  <dialog id="preview-modal" class="preview-modal">
+    <div class="preview-modal-head">
+      <h2>Decrypted preview</h2>
+      <button type="button" id="close-preview" class="button button-ghost">Close</button>
+    </div>
+    <img id="preview-image" alt="Decrypted preview">
+  </dialog>
 
   <script>
     const select = document.querySelector("#algorithm-select");
@@ -212,6 +245,26 @@
     selectAll?.addEventListener("change", () => {
       assetChecks().forEach((checkbox) => {
         checkbox.checked = selectAll.checked;
+      });
+    });
+
+    const previewModal = document.querySelector("#preview-modal");
+    const previewImage = document.querySelector("#preview-image");
+    document.querySelector("#close-preview")?.addEventListener("click", () => previewModal.close());
+    document.querySelectorAll(".preview-form").forEach((form) => {
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const assetId = form.dataset.assetId;
+        const response = await fetch(`/images/${assetId}/preview`, {
+          method: "POST",
+          body: new FormData(form),
+        });
+        if (!response.ok) {
+          alert("Unable to decrypt preview.");
+          return;
+        }
+        previewImage.src = URL.createObjectURL(await response.blob());
+        previewModal.showModal();
       });
     });
   </script>

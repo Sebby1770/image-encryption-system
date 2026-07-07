@@ -4,9 +4,11 @@ from datetime import datetime, timedelta, timezone
 from functools import wraps
 import hmac
 from io import BytesIO
+import json as json_module
 from math import ceil
 from pathlib import Path
 import secrets
+import zipfile
 from sqlite3 import IntegrityError
 from threading import Lock
 import time
@@ -126,7 +128,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             {
                 "status": "ok",
                 "service": "image-encryption-system",
-                "version": "0.2.0",
+                "version": "0.3.0",
             }
         )
 
@@ -219,23 +221,63 @@ def create_app(test_config: dict | None = None) -> Flask:
         user = _current_user(store)
         query = request.args.get("q", "")
         algorithm = request.args.get("algorithm", "")
+        tag = request.args.get("tag", "")
         sort = request.args.get("sort", "newest")
         assets = store.list_assets(
             user.id,
             query=query,
             algorithm=algorithm,
+            tag=tag,
             sort=sort,
         )
         stats = store.vault_stats(user.id)
         audit_events = store.list_audit_events(user.id)
+        audit_summary = store.audit_summary(user.id)
+        all_tags = store.list_tags(user.id)
         return render_template(
             "dashboard.html",
             assets=assets,
             stats=stats,
             audit_events=audit_events,
+            audit_summary=audit_summary,
+            all_tags=all_tags,
             query=query,
             filter_algorithm=algorithm,
+            filter_tag=tag,
             sort=sort,
+        )
+
+    @app.get("/vault/export")
+    @login_required(store)
+    def export_vault() -> Response:
+        user = _current_user(store)
+        assets = store.list_assets(user.id)
+        archive = BytesIO()
+        manifest: list[dict[str, object]] = []
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+            for asset in assets:
+                ciphertext = store.read_ciphertext(asset)
+                bundle.writestr(f"ciphertext/{asset.stored_filename}", ciphertext)
+                manifest.append(
+                    {
+                        "id": asset.id,
+                        "filename": asset.original_filename,
+                        "algorithm": asset.algorithm,
+                        "format": asset.image_format,
+                        "size": {"width": asset.width, "height": asset.height},
+                        "tags": asset.tags,
+                        "created_at": asset.created_at,
+                        "metadata": asset.metadata,
+                    }
+                )
+            bundle.writestr("manifest.json", json_module.dumps(manifest, indent=2))
+        archive.seek(0)
+        store.record_audit(user.id, "export", f"Exported vault archive with {len(assets)} assets")
+        return send_file(
+            archive,
+            mimetype="application/zip",
+            download_name="encrypted-vault-export.zip",
+            as_attachment=True,
         )
 
     @app.post("/images/bulk-delete")
@@ -267,6 +309,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         upload = request.files.get("image")
         algorithm = request.form.get("algorithm", AES_GCM_PASSPHRASE)
         passphrase = request.form.get("passphrase", "")
+        tags = request.form.get("tags", "")
 
         if upload is None or not upload.filename:
             flash("Choose an image to encrypt.", "error")
@@ -297,6 +340,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                 height=int(image_info["height"]),
                 metadata=metadata,
                 ciphertext=ciphertext,
+                tags=tags,
             )
             store.record_audit(
                 user.id,
@@ -309,6 +353,34 @@ def create_app(test_config: dict | None = None) -> Flask:
 
         flash("Image encrypted and stored in the vault.", "success")
         return redirect(url_for("dashboard"))
+
+    @app.post("/images/<int:asset_id>/preview")
+    @login_required(store)
+    def preview_image(asset_id: int) -> Response:
+        user = _current_user(store)
+        try:
+            asset = _owned_asset(store, asset_id, user)
+            ciphertext = store.read_ciphertext(asset)
+            plaintext = decrypt_image_bytes(
+                ciphertext,
+                asset.metadata,
+                passphrase=request.form.get("passphrase") or None,
+                private_key_pem=store.read_private_key(user.id)
+                if asset.algorithm == RSA_HYBRID
+                else None,
+                private_key_passphrase=request.form.get("private_key_passphrase") or None,
+                aad=_aad_from_metadata(asset),
+            )
+            store.record_audit(user.id, "decrypt", f"In-page preview for {asset.original_filename}")
+        except (LookupError, PermissionError, CryptoError) as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        return send_file(
+            BytesIO(plaintext),
+            mimetype=asset.mime_type,
+            download_name=asset.original_filename,
+            as_attachment=False,
+        )
 
     @app.post("/images/<int:asset_id>/decrypt")
     @login_required(store)
@@ -398,18 +470,13 @@ def create_app(test_config: dict | None = None) -> Flask:
     @jwt_required(store)
     def api_images() -> Response:
         user = g.api_user
+        query = request.args.get("q", "")
+        tag = request.args.get("tag", "")
         return jsonify(
             {
                 "images": [
-                    {
-                        "id": asset.id,
-                        "filename": asset.original_filename,
-                        "algorithm": asset.algorithm,
-                        "format": asset.image_format,
-                        "size": {"width": asset.width, "height": asset.height},
-                        "created_at": asset.created_at,
-                    }
-                    for asset in store.list_assets(user.id)
+                    _asset_payload(asset)
+                    for asset in store.list_assets(user.id, query=query, tag=tag)
                 ]
             }
         )
@@ -447,6 +514,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                 height=int(image_info["height"]),
                 metadata=metadata,
                 ciphertext=ciphertext,
+                tags=request.form.get("tags", ""),
             )
             store.record_audit(user.id, "upload", f"API encrypted {asset.original_filename}")
             return jsonify({"image": _asset_payload(asset)}), 201
@@ -638,6 +706,7 @@ def _asset_payload(asset: EncryptedAsset) -> dict:
         "algorithm": asset.algorithm,
         "format": asset.image_format,
         "size": {"width": asset.width, "height": asset.height},
+        "tags": [tag for tag in asset.tags.split(",") if tag],
         "created_at": asset.created_at,
     }
 
