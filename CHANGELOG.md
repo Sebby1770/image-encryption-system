@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.0 — 2026-07-07
+
+### Added
+- **Vault health score** (A–D) from chain validity, entropy, tags, and asset count (`GET /api/vault/health`)
+- **Audit chain JSON export** for offline verification (`GET /api/audit/export` and `/audit/export`)
+- **Failed decrypt audit** events (`decrypt_failed`) on bad passphrase or time-lock
+- **Live time-lock countdown** on locked asset cards
+- **Entropy heat bars** visualizing per-asset randomness
+
+### Improved
+- Dashboard security summary shows chain status, average entropy, and locked asset count
+
 ## 0.6.0 — 2026-07-07
 
 ### Added

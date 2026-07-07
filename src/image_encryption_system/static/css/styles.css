@@ -607,6 +607,25 @@ input:disabled {
   font-size: 0.84rem;
 }
 
+.health-metric span {
+  color: #7bd88f;
+}
+
+.entropy-bar {
+  height: 6px;
+  margin-top: 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.entropy-bar span {
+  display: block;
+  height: 100%;
+  width: calc(var(--entropy) * 100%);
+  background: linear-gradient(90deg, #38d6c6, #f5c84b, #ff6f59);
+}
+
 @media (max-width: 860px) {
   .auth-grid,
   .workspace-grid,

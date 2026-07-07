@@ -25,6 +25,10 @@
         <span>{{ stats.algorithms.get("RSA-HYBRID", 0) }}</span>
         <small>RSA hybrid assets</small>
       </div>
+      <div class="metric health-metric">
+        <span>{{ vault_health.score }}</span>
+        <small>vault health ({{ vault_health.grade }})</small>
+      </div>
     </div>
   </section>
 
@@ -106,6 +110,8 @@
           <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
           <button class="button button-secondary" type="submit">Verify audit chain</button>
         </form>
+        <a class="button button-ghost" href="{{ url_for('export_audit_chain') }}">Export audit JSON</a>
+        <p class="field-note">Chain {{ "valid" if vault_health.chain_valid else "broken" }} · avg entropy {{ vault_health.average_entropy }} · {{ vault_health.locked_assets }} locked</p>
         <div class="vault-io">
           <a class="button button-ghost" href="{{ url_for('export_vault') }}">Export vault ZIP</a>
           <form method="post" action="{{ url_for('import_vault_manifest') }}" enctype="multipart/form-data" class="import-form">
@@ -193,7 +199,12 @@
                   {% if asset.metadata.get('entropy_bits') %} · {{ asset.metadata.entropy_bits }} bits entropy{% endif %}
                 </p>
                 {% if asset.metadata.get('unlock_after') %}
-                  <p class="timelock-chip">🔒 locked until {{ asset.metadata.unlock_after }}</p>
+                  <p class="timelock-chip" data-unlock="{{ asset.metadata.unlock_after }}">🔒 locked until {{ asset.metadata.unlock_after }}</p>
+                {% endif %}
+                {% if asset.metadata.get('entropy_bits') %}
+                  <div class="entropy-bar" style="--entropy: {{ (asset.metadata.entropy_bits / 8) if asset.metadata.entropy_bits <= 8 else 1 }}">
+                    <span></span>
+                  </div>
                 {% endif %}
                 {% if asset.tags %}
                   <p class="asset-tags">{% for tag in asset.tags.split(',') %}<span class="tag-chip">{{ tag }}</span>{% endfor %}</p>
@@ -317,6 +328,23 @@
       assetChecks().forEach((checkbox) => {
         checkbox.checked = selectAll.checked;
       });
+    });
+
+    document.querySelectorAll("[data-unlock]").forEach((node) => {
+      const unlockAt = new Date(node.dataset.unlock);
+      const tick = () => {
+        const remaining = unlockAt.getTime() - Date.now();
+        if (remaining <= 0) {
+          node.textContent = "🔓 unlock window open";
+          return;
+        }
+        const hours = Math.floor(remaining / 3600000);
+        const minutes = Math.floor((remaining % 3600000) / 60000);
+        const seconds = Math.floor((remaining % 60000) / 1000);
+        node.textContent = `🔒 unlock in ${hours}h ${minutes}m ${seconds}s`;
+        window.setTimeout(tick, 1000);
+      };
+      tick();
     });
 
     const previewModal = document.querySelector("#preview-modal");

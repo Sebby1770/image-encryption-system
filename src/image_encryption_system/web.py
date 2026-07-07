@@ -129,7 +129,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             {
                 "status": "ok",
                 "service": "image-encryption-system",
-                "version": "0.6.0",
+                "version": "0.7.0",
             }
         )
 
@@ -235,12 +235,14 @@ def create_app(test_config: dict | None = None) -> Flask:
         audit_events = store.list_audit_events(user.id)
         audit_summary = store.audit_summary(user.id)
         all_tags = store.list_tags(user.id)
+        vault_health = _vault_health(store, user.id)
         return render_template(
             "dashboard.html",
             assets=assets,
             stats=stats,
             audit_events=audit_events,
             audit_summary=audit_summary,
+            vault_health=vault_health,
             all_tags=all_tags,
             query=query,
             filter_algorithm=algorithm,
@@ -286,7 +288,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         return jsonify(
             {
                 "service": "image-encryption-system",
-                "version": "0.6.0",
+                "version": "0.7.0",
                 "authentication": "Bearer JWT from POST /api/token",
                 "endpoints": [
                     {"method": "GET", "path": "/health", "description": "Service health"},
@@ -300,6 +302,8 @@ def create_app(test_config: dict | None = None) -> Flask:
                     {"method": "DELETE", "path": "/api/images/<id>", "description": "Delete asset"},
                     {"method": "GET", "path": "/api/audit", "description": "Recent audit events"},
                     {"method": "GET", "path": "/api/audit/verify", "description": "Verify tamper-evident audit chain"},
+                    {"method": "GET", "path": "/api/audit/export", "description": "Export full audit chain JSON"},
+                    {"method": "GET", "path": "/api/vault/health", "description": "Composite vault health score"},
                 ],
             }
         )
@@ -392,6 +396,62 @@ def create_app(test_config: dict | None = None) -> Flask:
         except (KeyError, json_module.JSONDecodeError, zipfile.BadZipFile) as exc:
             flash(f"Invalid vault archive: {exc}", "error")
         return redirect(url_for("dashboard"))
+
+    @app.get("/api/vault/health")
+    @jwt_required(store)
+    def api_vault_health() -> Response:
+        user = g.api_user
+        return jsonify(_vault_health(store, user.id))
+
+    @app.get("/api/audit/export")
+    @jwt_required(store)
+    def api_audit_export() -> Response:
+        user = g.api_user
+        events = store.list_audit_events(user.id, limit=500)
+        return jsonify(
+            {
+                "chain": store.verify_audit_chain(user.id),
+                "events": [
+                    {
+                        "id": event.id,
+                        "action": event.action,
+                        "detail": event.detail,
+                        "created_at": event.created_at,
+                        "prev_hash": event.prev_hash,
+                        "chain_hash": event.chain_hash,
+                    }
+                    for event in reversed(events)
+                ],
+            }
+        )
+
+    @app.get("/audit/export")
+    @login_required(store)
+    def export_audit_chain() -> Response:
+        user = _current_user(store)
+        events = store.list_audit_events(user.id, limit=500)
+        payload = {
+            "chain": store.verify_audit_chain(user.id),
+            "events": [
+                {
+                    "id": event.id,
+                    "action": event.action,
+                    "detail": event.detail,
+                    "created_at": event.created_at,
+                    "prev_hash": event.prev_hash,
+                    "chain_hash": event.chain_hash,
+                }
+                for event in reversed(events)
+            ],
+        }
+        blob = BytesIO(json_module.dumps(payload, indent=2).encode("utf-8"))
+        store.record_audit(user.id, "export", "Exported tamper-evident audit chain")
+        return send_file(
+            blob,
+            mimetype="application/json",
+            download_name="audit-chain-export.json",
+            as_attachment=True,
+        )
 
     @app.get("/api/audit/verify")
     @jwt_required(store)
@@ -532,6 +592,8 @@ def create_app(test_config: dict | None = None) -> Flask:
             )
             store.record_audit(user.id, "decrypt", f"In-page preview for {asset.original_filename}")
         except (LookupError, PermissionError, CryptoError, ValueError) as exc:
+            if user:
+                store.record_audit(user.id, "decrypt_failed", f"Preview failed for asset {asset_id}: {exc}")
             return jsonify({"error": str(exc)}), 400
 
         return send_file(
@@ -566,6 +628,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                 f"Decrypted preview for {asset.original_filename}",
             )
         except (LookupError, PermissionError, CryptoError, ValueError) as exc:
+            store.record_audit(user.id, "decrypt_failed", f"Decrypt failed for asset {asset_id}: {exc}")
             flash(str(exc), "error")
             return redirect(url_for("dashboard"))
 
@@ -872,6 +935,33 @@ def _aad_from_metadata(asset: EncryptedAsset) -> bytes:
         str(aad.get("original_filename", asset.original_filename)),
         str(aad.get("mime_type", asset.mime_type)),
     )
+
+
+def _vault_health(store: VaultStore, user_id: int) -> dict[str, int | float | bool | str]:
+    stats = store.vault_stats(user_id)
+    chain = store.verify_audit_chain(user_id)
+    assets = store.list_assets(user_id)
+    entropies = [float(asset.metadata.get("entropy_bits", 0) or 0) for asset in assets]
+    average_entropy = sum(entropies) / len(entropies) if entropies else 0.0
+    locked_count = sum(1 for asset in assets if asset.metadata.get("unlock_after"))
+    score = int(
+        min(
+            100,
+            (45 if chain["valid"] else 0)
+            + min(25, stats.asset_count * 4)
+            + min(20, average_entropy * 2.5)
+            + min(10, len(store.list_tags(user_id)) * 2),
+        )
+    )
+    grade = "A" if score >= 85 else "B" if score >= 70 else "C" if score >= 50 else "D"
+    return {
+        "score": score,
+        "grade": grade,
+        "chain_valid": chain["valid"],
+        "average_entropy": round(average_entropy, 3),
+        "locked_assets": locked_count,
+        "asset_count": stats.asset_count,
+    }
 
 
 def _assert_unlocked(asset: EncryptedAsset) -> None:

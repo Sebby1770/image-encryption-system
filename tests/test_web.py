@@ -513,7 +513,7 @@ def test_v050_notes_bulk_tags_password_docs_and_duplicate(tmp_path) -> None:
     assert store.authenticate_user("alice", "new horse battery")
 
     docs = client.get("/api/docs").get_json()
-    assert docs["version"] == "0.6.0"
+    assert docs["version"] == "0.7.0"
     assert any(item["path"] == "/api/stats" for item in docs["endpoints"])
 
 
@@ -570,6 +570,60 @@ def test_v060_audit_chain_entropy_and_timelock(tmp_path) -> None:
     headers = {"Authorization": f"Bearer {response.get_json()['token']}"}
     verify = client.get("/api/audit/verify", headers=headers).get_json()
     assert verify["valid"] is True
+
+
+def test_v070_vault_health_audit_export_and_decrypt_failures(tmp_path) -> None:
+    app = make_app(tmp_path)
+    client = app.test_client()
+
+    token = csrf_token(client, "/register")
+    client.post(
+        "/register",
+        data={"username": "alice", "password": "correct horse battery", "_csrf_token": token},
+        follow_redirects=True,
+    )
+
+    token = csrf_token(client, "/dashboard")
+    client.post(
+        "/images",
+        data={
+            "algorithm": AES_GCM_PASSPHRASE,
+            "passphrase": "image passphrase",
+            "image": (BytesIO(sample_png()), "one.png"),
+            "_csrf_token": token,
+        },
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+
+    store = app.extensions["vault_store"]
+    user = store.get_user_by_username("alice")
+    asset = store.list_assets(user.id)[0]
+
+    token = csrf_token(client, "/dashboard")
+    client.post(
+        f"/images/{asset.id}/preview",
+        data={"passphrase": "wrong passphrase", "_csrf_token": token},
+    )
+    failures = [event for event in store.list_audit_events(user.id) if event.action == "decrypt_failed"]
+    assert failures
+
+    response = client.post(
+        "/api/token",
+        json={"username": "alice", "password": "correct horse battery"},
+    )
+    headers = {"Authorization": f"Bearer {response.get_json()['token']}"}
+    health = client.get("/api/vault/health", headers=headers).get_json()
+    assert health["score"] >= 50
+    assert "grade" in health
+
+    export = client.get("/api/audit/export", headers=headers).get_json()
+    assert export["chain"]["valid"] is True
+    assert export["events"]
+
+    download = client.get("/audit/export")
+    assert download.status_code == 200
+    assert b"chain_hash" in download.data
 
 
 def test_production_requires_strong_secrets(tmp_path) -> None:
