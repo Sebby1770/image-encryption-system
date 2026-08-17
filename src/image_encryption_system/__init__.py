@@ -1,6 +1,14 @@
-"""Image Encryption System package."""
+"""Image Encryption System — authenticated AES-GCM image vault."""
 
-from .web import create_app
+__version__ = "2.0.0"
 
-__all__ = ["create_app"]
 
+def __getattr__(name: str):
+    if name == "create_app":
+        from .web import create_app
+
+        return create_app
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = ["create_app", "__version__"]

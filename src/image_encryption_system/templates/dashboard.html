@@ -6,41 +6,78 @@
   <section class="dashboard-header">
     <div>
       <h1>Encrypted image vault</h1>
-      <p>Upload an image, choose a key protection mode, and store only ciphertext.</p>
+      <p>Upload an image, choose a key protection mode, and store only ciphertext. Share by re-wrapping the same AES data key.</p>
     </div>
-    <div class="metric">
-      <span>{{ assets|length }}</span>
-      <small>encrypted images</small>
+    <div class="metric-row">
+      <div class="metric">
+        <span>{{ assets|length }}</span>
+        <small>your images</small>
+      </div>
+      <div class="metric">
+        <span>{{ shared_items|length }}</span>
+        <small>shared with you</small>
+      </div>
     </div>
   </section>
 
   <section class="workspace-grid">
-    <form class="upload-panel" method="post" action="{{ url_for('upload_image') }}" enctype="multipart/form-data">
-      <h2>Encrypt image</h2>
-      <label>
-        Image file
-        <input name="image" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp,image/tiff" required>
-      </label>
-      <label>
-        Algorithm
-        <select name="algorithm" id="algorithm-select">
-          {% for value, label in algorithms %}
-            <option value="{{ value }}">{{ label }}</option>
-          {% endfor %}
-        </select>
-      </label>
-      <label id="passphrase-field">
-        AES passphrase
-        <input name="passphrase" type="password" autocomplete="off" placeholder="Required for AES-GCM mode">
-      </label>
-      <p class="field-note" id="algorithm-note">
-        AES-GCM passphrase mode derives a key with Scrypt and wraps the image data key.
-      </p>
-      <button class="button button-primary" type="submit">Encrypt and store</button>
-    </form>
+    <div class="sidebar-stack">
+      <form class="upload-panel" method="post" action="{{ url_for('upload_image') }}" enctype="multipart/form-data">
+        <h2>Encrypt image</h2>
+        <label>
+          Image file
+          <input name="image" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp,image/tiff" required>
+        </label>
+        <label>
+          Algorithm
+          <select name="algorithm" id="algorithm-select">
+            {% for value, label in algorithms %}
+              <option value="{{ value }}">{{ label }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label id="passphrase-field">
+          AES passphrase
+          <input name="passphrase" type="password" autocomplete="off" placeholder="Required for AES-GCM mode">
+        </label>
+        <p class="field-note" id="algorithm-note">
+          AES-GCM passphrase mode derives a key with Scrypt and wraps the image data key.
+        </p>
+        <button class="button button-primary" type="submit">Encrypt and store</button>
+      </form>
+
+      <form class="upload-panel" method="post" action="{{ url_for('restore_backup') }}" enctype="multipart/form-data">
+        <h2>Restore backup</h2>
+        <p class="field-note">Upload a zip exported from this vault. Ciphertext and metadata only — no private keys.</p>
+        <label>
+          Backup zip
+          <input name="backup" type="file" accept=".zip,application/zip" required>
+        </label>
+        <button class="button button-secondary" type="submit">Restore encrypted images</button>
+      </form>
+    </div>
 
     <section class="vault-list" aria-label="Encrypted images">
-      <h2>Vault</h2>
+      <div class="section-heading">
+        <h2>Vault</h2>
+        <form class="filter-bar" method="get" action="{{ url_for('dashboard') }}">
+          <label>
+            Search
+            <input name="q" type="search" value="{{ query }}" placeholder="Filter by name">
+          </label>
+          <label>
+            Algorithm
+            <select name="algorithm">
+              <option value="" {% if not selected_algorithm %}selected{% endif %}>All</option>
+              {% for value, label in algorithms %}
+                <option value="{{ value }}" {% if selected_algorithm == value %}selected{% endif %}>{{ label }}</option>
+              {% endfor %}
+            </select>
+          </label>
+          <button class="button button-ghost" type="submit">Filter</button>
+        </form>
+      </div>
+
       {% if assets %}
         <div class="asset-list">
           {% for asset in assets %}
@@ -49,37 +86,112 @@
                 <h3>{{ asset.original_filename }}</h3>
                 <p>{{ asset.algorithm }} · {{ asset.image_format }} · {{ asset.width }}x{{ asset.height }}</p>
                 <small>{{ asset.created_at }}</small>
-              </div>
-              <form method="post" action="{{ url_for('decrypt_image', asset_id=asset.id) }}" target="_blank">
-                {% if asset.algorithm == "AES-GCM" %}
-                  <label>
-                    Passphrase
-                    <input name="passphrase" type="password" autocomplete="off" required>
-                  </label>
-                {% else %}
-                  <label>
-                    Private key password
-                    <input name="private_key_passphrase" type="password" autocomplete="current-password" required>
-                  </label>
+                {% if recipients.get(asset.id) %}
+                  <p class="share-note">Shared with {{ recipients[asset.id]|join(", ") }}</p>
                 {% endif %}
-                <button class="button button-secondary" type="submit">Decrypt preview</button>
-              </form>
+              </div>
+              <div class="asset-actions">
+                <form method="post" action="{{ url_for('decrypt_image', asset_id=asset.id) }}" target="_blank">
+                  {% if asset.algorithm == "AES-GCM" %}
+                    <label>
+                      Passphrase
+                      <input name="passphrase" type="password" autocomplete="off" required>
+                    </label>
+                  {% else %}
+                    <label>
+                      Private key password
+                      <input name="private_key_passphrase" type="password" autocomplete="current-password" required>
+                    </label>
+                  {% endif %}
+                  <button class="button button-secondary" type="submit">Decrypt preview</button>
+                </form>
+                <div class="action-row">
+                  <button
+                    class="button button-ghost share-open"
+                    type="button"
+                    data-asset-id="{{ asset.id }}"
+                    data-algorithm="{{ asset.algorithm }}"
+                    data-filename="{{ asset.original_filename }}"
+                  >Share</button>
+                  <a class="button button-ghost" href="{{ url_for('download_ciphertext', asset_id=asset.id) }}">.ies</a>
+                  <form method="post" action="{{ url_for('delete_image', asset_id=asset.id) }}" onsubmit="return confirm('Delete this ciphertext permanently?');">
+                    <button class="button button-danger" type="submit">Delete</button>
+                  </form>
+                </div>
+              </div>
             </article>
           {% endfor %}
         </div>
       {% else %}
         <div class="empty-state">
-          <h3>No encrypted images yet</h3>
-          <p>Your uploaded photos will appear here after encryption.</p>
+          <h3>No encrypted images match</h3>
+          <p>Upload a photo or clear the search filter to see your vault.</p>
         </div>
       {% endif %}
+
+      <section class="shared-inbox" aria-label="Shared with me">
+        <h2>Shared with me</h2>
+        {% if shared_items %}
+          <div class="asset-list">
+            {% for item in shared_items %}
+              <article class="asset-card">
+                <div>
+                  <h3>{{ item.asset.original_filename }}</h3>
+                  <p>From {{ item.owner_username }} · {{ item.asset.algorithm }} · {{ item.asset.image_format }}</p>
+                  <small>Shared {{ item.share.created_at }}</small>
+                </div>
+                <form method="post" action="{{ url_for('decrypt_image', asset_id=item.asset.id) }}" target="_blank">
+                  <label>
+                    Your account password
+                    <input name="private_key_passphrase" type="password" autocomplete="current-password" required>
+                  </label>
+                  <button class="button button-secondary" type="submit">Decrypt preview</button>
+                </form>
+              </article>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div class="empty-state">
+            <h3>Nothing shared yet</h3>
+            <p>When another user re-wraps a data key to your RSA public key, it appears here.</p>
+          </div>
+        {% endif %}
+      </section>
     </section>
   </section>
+
+  <dialog class="share-modal" id="share-modal">
+    <form method="post" id="share-form">
+      <h2>Share <span id="share-filename">image</span></h2>
+      <p class="field-note">The same AES data key is unwrapped locally and re-wrapped with the recipient’s RSA public key. They decrypt with their own password.</p>
+      <label>
+        Recipient username
+        <input name="username" type="text" autocomplete="username" required>
+      </label>
+      <label id="share-passphrase-field">
+        AES passphrase
+        <input name="passphrase" type="password" autocomplete="off">
+      </label>
+      <label id="share-rsa-field" hidden>
+        Private key password
+        <input name="private_key_passphrase" type="password" autocomplete="current-password">
+      </label>
+      <div class="action-row">
+        <button class="button button-primary" type="submit">Share</button>
+        <button class="button button-ghost" type="button" id="share-cancel">Cancel</button>
+      </div>
+    </form>
+  </dialog>
 
   <script>
     const select = document.querySelector("#algorithm-select");
     const passphrase = document.querySelector("#passphrase-field input");
     const note = document.querySelector("#algorithm-note");
+    const modal = document.querySelector("#share-modal");
+    const shareForm = document.querySelector("#share-form");
+    const sharePassField = document.querySelector("#share-passphrase-field");
+    const shareRsaField = document.querySelector("#share-rsa-field");
+    const shareFilename = document.querySelector("#share-filename");
 
     function syncAlgorithmFields() {
       if (select.value === "RSA-HYBRID") {
@@ -94,8 +206,27 @@
       }
     }
 
+    function openShareModal(button) {
+      const assetId = button.dataset.assetId;
+      const algorithm = button.dataset.algorithm;
+      shareForm.action = `/images/${assetId}/share`;
+      shareFilename.textContent = button.dataset.filename;
+      const useRsa = algorithm === "RSA-HYBRID";
+      sharePassField.hidden = useRsa;
+      shareRsaField.hidden = !useRsa;
+      sharePassField.querySelector("input").required = !useRsa;
+      shareRsaField.querySelector("input").required = useRsa;
+      sharePassField.querySelector("input").value = "";
+      shareRsaField.querySelector("input").value = "";
+      modal.showModal();
+    }
+
     select.addEventListener("change", syncAlgorithmFields);
     syncAlgorithmFields();
+
+    document.querySelectorAll(".share-open").forEach((button) => {
+      button.addEventListener("click", () => openShareModal(button));
+    });
+    document.querySelector("#share-cancel").addEventListener("click", () => modal.close());
   </script>
 {% endblock %}
-

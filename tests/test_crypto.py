@@ -10,6 +10,10 @@ from image_encryption_system.crypto import (
     decrypt_image_bytes,
     encrypt_image_bytes,
     generate_rsa_key_pair,
+    pack_ies,
+    unpack_ies,
+    unwrap_data_key,
+    wrap_data_key_rsa,
 )
 
 
@@ -74,4 +78,46 @@ def test_rsa_hybrid_round_trip() -> None:
 
     assert decrypted == plaintext
     assert encrypted.metadata["key_wrap"]["type"] == "rsa-oaep-sha256"
+
+
+def test_rewrap_data_key_lets_recipient_decrypt() -> None:
+    plaintext = sample_png()
+    encrypted = encrypt_image_bytes(
+        plaintext,
+        AES_GCM_PASSPHRASE,
+        passphrase="image secret phrase",
+    )
+    data_key = unwrap_data_key(encrypted.metadata["key_wrap"], passphrase="image secret phrase")
+    bob_private, bob_public = generate_rsa_key_pair("bob account password")
+    shared_meta = {**encrypted.metadata, "key_wrap": wrap_data_key_rsa(data_key, bob_public)}
+
+    decrypted = decrypt_image_bytes(
+        encrypted.ciphertext,
+        shared_meta,
+        private_key_pem=bob_private,
+        private_key_passphrase="bob account password",
+    )
+    assert decrypted == plaintext
+
+    eve_private, _eve_public = generate_rsa_key_pair("eve account password")
+    with pytest.raises(CryptoError):
+        decrypt_image_bytes(
+            encrypted.ciphertext,
+            shared_meta,
+            private_key_pem=eve_private,
+            private_key_passphrase="eve account password",
+        )
+
+
+def test_ies_container_round_trip() -> None:
+    encrypted = encrypt_image_bytes(sample_png(), AES_GCM_PASSPHRASE, passphrase="pack passphrase")
+    blob = pack_ies(encrypted.ciphertext, encrypted.metadata)
+    ciphertext, metadata = unpack_ies(blob)
+    assert ciphertext == encrypted.ciphertext
+    assert metadata["algorithm"] == AES_GCM_PASSPHRASE
+
+
+def test_unpack_ies_rejects_garbage() -> None:
+    with pytest.raises(CryptoError):
+        unpack_ies(b"not-an-ies-file")
 

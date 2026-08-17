@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from base64 import b64decode, b64encode
 from dataclasses import dataclass
+import json
 import os
+import struct
 from typing import Any
 
 from cryptography.exceptions import InvalidTag
@@ -21,6 +23,9 @@ GCM_NONCE_BYTES = 12
 SCRYPT_N = 2**14
 SCRYPT_R = 8
 SCRYPT_P = 1
+IES_MAGIC = b"IES1"
+WRAP_SCRYPT = "scrypt-aes-gcm"
+WRAP_RSA = "rsa-oaep-sha256"
 
 
 class CryptoError(Exception):
@@ -91,23 +96,73 @@ def decrypt_image_bytes(
     aad: bytes = b"",
 ) -> bytes:
     try:
-        algorithm = metadata["algorithm"]
         image_nonce = _b64decode(metadata["image_nonce"])
         key_wrap = metadata["key_wrap"]
     except KeyError as exc:
         raise CryptoError("Encrypted image metadata is incomplete.") from exc
 
-    if algorithm == AES_GCM_PASSPHRASE:
-        data_key = _unwrap_key_with_passphrase(key_wrap, passphrase)
-    elif algorithm == RSA_HYBRID:
-        data_key = _unwrap_key_with_rsa(key_wrap, private_key_pem, private_key_passphrase)
-    else:
-        raise CryptoError(f"Unsupported algorithm: {algorithm}")
+    data_key = unwrap_data_key(
+        key_wrap,
+        passphrase=passphrase,
+        private_key_pem=private_key_pem,
+        private_key_passphrase=private_key_passphrase,
+    )
 
     try:
         return AESGCM(data_key).decrypt(image_nonce, ciphertext, aad)
     except InvalidTag as exc:
         raise CryptoError("Decryption failed. The key, passphrase, or ciphertext is invalid.") from exc
+
+
+def unwrap_data_key(
+    key_wrap: dict[str, Any],
+    *,
+    passphrase: str | None = None,
+    private_key_pem: bytes | None = None,
+    private_key_passphrase: str | None = None,
+) -> bytes:
+    """Recover the AES data key from passphrase or RSA wrapping metadata."""
+    wrap_type = key_wrap.get("type")
+    if wrap_type == WRAP_SCRYPT:
+        return _unwrap_key_with_passphrase(key_wrap, passphrase)
+    if wrap_type == WRAP_RSA:
+        return _unwrap_key_with_rsa(key_wrap, private_key_pem, private_key_passphrase)
+    raise CryptoError("Unsupported key wrapping metadata.")
+
+
+def wrap_data_key_rsa(data_key: bytes, public_key_pem: bytes) -> dict[str, str]:
+    """Re-wrap an existing AES data key with a recipient's RSA public key."""
+    if len(data_key) != AES_KEY_BYTES:
+        raise CryptoError("Refusing to wrap a data key of unexpected length.")
+    return _wrap_key_with_rsa(data_key, public_key_pem)
+
+
+def pack_ies(ciphertext: bytes, metadata: dict[str, Any]) -> bytes:
+    """Pack ciphertext and wrap metadata into a portable .ies vault file."""
+    raw_meta = json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return IES_MAGIC + struct.pack(">I", len(raw_meta)) + raw_meta + ciphertext
+
+
+def unpack_ies(blob: bytes) -> tuple[bytes, dict[str, Any]]:
+    """Split a portable .ies vault file into ciphertext and metadata."""
+    if len(blob) < 8 or blob[:4] != IES_MAGIC:
+        raise CryptoError("Not a valid IES vault file.")
+    meta_len = struct.unpack(">I", blob[4:8])[0]
+    start = 8
+    end = start + meta_len
+    if meta_len < 2 or end > len(blob):
+        raise CryptoError("IES vault file metadata is truncated.")
+    try:
+        metadata = json.loads(blob[start:end].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CryptoError("IES vault file metadata is invalid.") from exc
+    if not isinstance(metadata, dict):
+        raise CryptoError("IES vault file metadata is invalid.")
+    return blob[end:], metadata
+
+
+def cli_aad(filename: str) -> bytes:
+    return f"cli|filename={filename}".encode("utf-8")
 
 
 def _wrap_key_with_passphrase(data_key: bytes, passphrase: str | None) -> dict[str, str | int]:
@@ -120,7 +175,7 @@ def _wrap_key_with_passphrase(data_key: bytes, passphrase: str | None) -> dict[s
     wrapped_key = AESGCM(wrapping_key).encrypt(wrapping_nonce, data_key, b"image-data-key")
 
     return {
-        "type": "scrypt-aes-gcm",
+        "type": WRAP_SCRYPT,
         "salt": _b64encode(salt),
         "nonce": _b64encode(wrapping_nonce),
         "wrapped_key": _b64encode(wrapped_key),
@@ -133,7 +188,7 @@ def _wrap_key_with_passphrase(data_key: bytes, passphrase: str | None) -> dict[s
 def _unwrap_key_with_passphrase(key_wrap: dict[str, Any], passphrase: str | None) -> bytes:
     if not passphrase:
         raise CryptoError("A passphrase is required for AES-GCM decryption.")
-    if key_wrap.get("type") != "scrypt-aes-gcm":
+    if key_wrap.get("type") != WRAP_SCRYPT:
         raise CryptoError("Unsupported AES key wrapping metadata.")
 
     try:
@@ -170,7 +225,7 @@ def _wrap_key_with_rsa(data_key: bytes, public_key_pem: bytes | None) -> dict[st
         ),
     )
     return {
-        "type": "rsa-oaep-sha256",
+        "type": WRAP_RSA,
         "wrapped_key": _b64encode(wrapped_key),
     }
 
@@ -184,7 +239,7 @@ def _unwrap_key_with_rsa(
         raise CryptoError("RSA hybrid decryption requires a private key.")
     if not private_key_passphrase:
         raise CryptoError("RSA hybrid decryption requires the private key passphrase.")
-    if key_wrap.get("type") != "rsa-oaep-sha256":
+    if key_wrap.get("type") != WRAP_RSA:
         raise CryptoError("Unsupported RSA key wrapping metadata.")
 
     try:

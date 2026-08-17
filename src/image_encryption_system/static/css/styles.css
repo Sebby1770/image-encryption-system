@@ -34,12 +34,29 @@ a {
   background: rgba(255, 255, 255, 0.92);
   border-bottom: 1px solid var(--line);
   display: flex;
+  gap: 20px;
   justify-content: space-between;
   min-height: 64px;
   padding: 0 28px;
   position: sticky;
   top: 0;
   z-index: 10;
+}
+
+.nav-links {
+  display: flex;
+  flex: 1;
+  gap: 16px;
+}
+
+.nav-links a {
+  color: var(--muted);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.nav-links a:hover {
+  color: var(--accent-strong);
 }
 
 .brand {
@@ -231,6 +248,12 @@ input:disabled {
   color: var(--ink);
 }
 
+.button-danger {
+  background: #fff1f0;
+  border-color: #ffd0cc;
+  color: var(--red);
+}
+
 .auth-switch {
   color: var(--muted);
   margin-top: 22px;
@@ -323,11 +346,126 @@ input:disabled {
   margin: 0 0 8px;
 }
 
+.metric-row {
+  display: flex;
+  gap: 12px;
+}
+
+.sidebar-stack {
+  display: grid;
+  gap: 24px;
+}
+
+.section-heading {
+  display: grid;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.section-heading h2 {
+  margin-bottom: 0;
+}
+
+.filter-bar {
+  align-items: end;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) 180px auto;
+}
+
+.asset-actions {
+  display: grid;
+  gap: 10px;
+}
+
+.action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.action-row form {
+  margin: 0;
+}
+
+.action-row .button {
+  width: auto;
+}
+
+.share-note {
+  color: var(--accent-strong) !important;
+  font-size: 0.86rem;
+  margin-top: 8px !important;
+}
+
+.shared-inbox {
+  margin-top: 28px;
+}
+
+.share-modal {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  max-width: 460px;
+  padding: 24px;
+  width: calc(100% - 32px);
+}
+
+.share-modal::backdrop {
+  background: rgba(23, 33, 31, 0.35);
+}
+
+.share-modal form {
+  display: grid;
+  gap: 16px;
+}
+
+.share-modal h2 {
+  margin: 0;
+}
+
+.audit-panel {
+  padding: 24px;
+}
+
+.table-wrap {
+  overflow-x: auto;
+}
+
+.audit-table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+.audit-table th,
+.audit-table td {
+  border-bottom: 1px solid var(--line);
+  padding: 12px 10px;
+  text-align: left;
+}
+
+.audit-table th {
+  color: var(--muted);
+  font-size: 0.82rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.pill {
+  background: var(--mint);
+  border-radius: 999px;
+  display: inline-block;
+  font-size: 0.85rem;
+  font-weight: 700;
+  padding: 4px 10px;
+}
+
 @media (max-width: 860px) {
   .auth-grid,
   .workspace-grid,
   .dashboard-header,
-  .asset-card {
+  .asset-card,
+  .filter-bar {
     grid-template-columns: 1fr;
   }
 

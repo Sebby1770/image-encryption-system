@@ -1,23 +1,25 @@
 # Image Encryption System
 
-A Flask-based cybersecurity project that encrypts digital photos before storing
-them locally. It demonstrates practical image privacy controls: authenticated
-users, algorithm selection, secure key wrapping, encrypted file storage, and
-real-time decryption for authorized users.
+A Flask image vault that encrypts photos with **AES-256-GCM** before they touch
+disk. Per-image data keys are wrapped with Scrypt+AES or RSA-OAEP. Version
+**2.0.0** adds user-to-user sharing, an audit log, a standalone CLI, encrypted
+backups, and login lockout.
 
 ## Features
 
-- AES-256-GCM encryption for image contents.
-- RSA-OAEP hybrid mode where RSA wraps a per-image AES key.
-- Per-user RSA key pair generated at registration time.
-- Private keys encrypted with the user's password.
-- AES mode passphrase-based key wrapping with Scrypt.
-- Login-protected dashboard and ownership checks.
-- JWT API token endpoint for integrations.
-- Supports common image formats handled by Pillow: PNG, JPEG, WEBP, GIF, BMP,
-  and TIFF.
-- Encrypted local vault using SQLite metadata and binary encrypted files.
-- Tests for AES and RSA encryption/decryption flows.
+- AES-256-GCM encryption for image bytes (cryptography.io / OpenSSL).
+- RSA-OAEP hybrid mode: RSA wraps a fresh 256-bit AES data key.
+- Per-user RSA-3072 key pair generated at registration; private keys are
+  encrypted with the account password.
+- Share with another username by re-wrapping the **same** AES data key with
+  their RSA public key. Recipients decrypt with **their** password.
+- Owner-only audit log (web + `GET /api/audit`).
+- Encrypted backup zip (ciphertext + metadata, never private keys) and restore.
+- `ies` CLI for offline encrypt / decrypt / keygen.
+- Login rate limit (5 / 10 minutes, IP+user) and lockout after 8 failures.
+- 8 MB default upload limit; download ciphertext as `.ies`.
+- JWT API for listing images and reading the audit trail.
+- Tests for crypto, sharing, backup, CLI, and lockout.
 
 ## Tech Stack
 
@@ -28,9 +30,7 @@ real-time decryption for authorized users.
 - SQLite
 - PyJWT
 
-PyCrypto is intentionally not used because it is deprecated. The
-`cryptography` package uses OpenSSL-backed primitives and is the recommended
-Python choice for this kind of project.
+PyCrypto is intentionally not used because it is deprecated.
 
 ## Quick Start
 
@@ -38,40 +38,80 @@ Python choice for this kind of project.
 cd image-encryption-system
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e ".[dev]"
 python run.py
 ```
 
 Open `http://127.0.0.1:5000`, create an account, and upload an image.
 
-## Environment
+## CLI
 
-Copy `.env.example` to `.env` for deployment-style settings:
+```bash
+ies encrypt IN.png --passphrase 'a long secret' --out out.bin
+ies decrypt out.bin --passphrase 'a long secret' --out restored.png
+ies keygen --passphrase 'account password' --out-private key.pem --out-public pub.pem
+ies encrypt IN.png --public-key pub.pem --out photo.ies
+ies decrypt photo.ies --private-key key.pem --passphrase 'account password' --out restored.png
+```
+
+The CLI talks only to `crypto.py`. It does not start Flask or write decrypted
+images unless you pass `--out`.
+
+## Sharing
+
+On the dashboard, choose **Share** and enter another username. The server:
+
+1. Unwraps the AES data key with your passphrase (AES-GCM mode) or your RSA
+   private key (hybrid mode).
+2. Re-wraps that **same** key with the recipient's RSA public key.
+3. Stores the new wrap in `shares`. The ciphertext file is unchanged.
+
+The recipient sees the image under **Shared with me** and decrypts it with their
+account password. A third user cannot unwrap the shared key.
+
+## Audit
+
+`GET /audit` lists your events only: login, upload, decrypt, share, delete, and
+backup. `GET /api/audit` returns the same data as JSON.
+
+## Backup
+
+- `GET /backup` downloads a zip of your encrypted blobs plus `manifest.json`.
+- `POST /restore` (dashboard form) imports that zip into the current account.
+- Private keys and password hashes are never included.
+- Each vault item can also be downloaded as a portable `.ies` file.
+
+## Environment
 
 ```bash
 cp .env.example .env
 ```
 
-For local development, the app will run with development defaults. For any
-shared or public deployment, set strong values for:
+| Variable | Purpose |
+| --- | --- |
+| `SECRET_KEY` | Flask session signing |
+| `JWT_SECRET` | JWT HMAC secret |
+| `IES_INSTANCE_DIR` | SQLite, vault blobs, and RSA keys |
+| `IES_MAX_UPLOAD_BYTES` | Upload cap (default 8 MiB) |
 
-- `SECRET_KEY`
-- `JWT_SECRET`
-- `IES_INSTANCE_DIR`
+Use strong secrets for any shared deployment.
 
 ## How Encryption Works
 
-Every uploaded image is encrypted with a random 256-bit data key using
-AES-GCM. The selected algorithm controls how that data key is protected:
+Every uploaded image is encrypted with a random 256-bit data key using AES-GCM.
+The selected algorithm controls how that data key is protected:
 
-- `AES-GCM passphrase`: derives a wrapping key from the user-entered passphrase
-  using Scrypt, then wraps the image data key with AES-GCM.
-- `RSA hybrid`: encrypts the image data key with the user's RSA public key using
-  RSA-OAEP-SHA256. Decryption requires the encrypted private key and its
-  password.
+- `AES-GCM passphrase`: Scrypt derives a wrapping key, then AES-GCM wraps the
+  data key.
+- `RSA hybrid`: RSA-OAEP-SHA256 wraps the data key with the user's public key.
 
-The decrypted image is streamed back to the authenticated owner and is not saved
-to disk.
+The decrypted image is streamed to the authorized user and is **not** written to
+disk by the web app.
+
+## Threat model
+
+See [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) for goals, non-goals,
+trust boundaries, and production hardening notes.
 
 ## API
 
@@ -83,10 +123,17 @@ curl -X POST http://127.0.0.1:5000/api/token \
   -d '{"username":"alice","password":"correct horse battery staple"}'
 ```
 
-List encrypted images:
+List encrypted images (owned + shared):
 
 ```bash
 curl http://127.0.0.1:5000/api/images \
+  -H "Authorization: Bearer <token>"
+```
+
+Read your audit log:
+
+```bash
+curl http://127.0.0.1:5000/api/audit \
   -H "Authorization: Bearer <token>"
 ```
 
@@ -96,35 +143,25 @@ curl http://127.0.0.1:5000/api/images \
 pytest
 ```
 
+CI runs pytest on Python 3.11 and 3.12.
+
 ## Project Structure
 
 ```text
 image-encryption-system/
   src/image_encryption_system/
-    crypto.py          # AES-GCM, RSA-OAEP, key wrapping
-    storage.py         # SQLite metadata and encrypted vault files
-    web.py             # Flask app, auth, upload, decrypt, API routes
+    crypto.py          # AES-GCM, RSA-OAEP, .ies container, key re-wrap
+    storage.py         # SQLite, shares, audit, backup zip
+    web.py             # Flask app, auth, share, audit, API
+    cli.py             # ies console script
+    security.py        # login rate limit and lockout
     templates/         # HTML views
     static/css/        # UI styling
-  tests/               # Pytest coverage for crypto flows
-  docs/                # Security model and design notes
-  scripts/             # Utility scripts
-```
-
-## Add To GitHub
-
-```bash
-git init
-git add .
-git commit -m "Initial image encryption system"
-git branch -M main
-git remote add origin https://github.com/<your-username>/image-encryption-system.git
-git push -u origin main
+  tests/               # pytest coverage
+  docs/                # Threat model
 ```
 
 ## Security Notes
 
 This is a portfolio-ready educational project, not a complete production
-security product. Before using it with real sensitive data, add production-grade
-secret management, HTTPS, rate limiting, audit logging, backups, malware
-scanning for uploads, and hardened deployment settings.
+security product. Review the threat model before storing real sensitive photos.

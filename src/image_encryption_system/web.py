@@ -23,6 +23,7 @@ from flask import (
     url_for,
 )
 from PIL import Image, UnidentifiedImageError
+from werkzeug.exceptions import RequestEntityTooLarge
 
 from .config import Config
 from .crypto import (
@@ -31,8 +32,12 @@ from .crypto import (
     CryptoError,
     decrypt_image_bytes,
     encrypt_image_bytes,
+    pack_ies,
+    unwrap_data_key,
+    wrap_data_key_rsa,
 )
-from .storage import EncryptedAsset, User, VaultStore
+from .security import LoginGuard
+from .storage import AssetShare, EncryptedAsset, User, VaultStore
 
 
 F = TypeVar("F", bound=Callable)
@@ -48,6 +53,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.config["DATABASE_PATH"] = Path(app.config["DATABASE_PATH"])
     app.config["VAULT_DIR"] = Path(app.config["VAULT_DIR"])
     app.config["KEY_DIR"] = Path(app.config["KEY_DIR"])
+    app.config["MAX_CONTENT_LENGTH"] = int(app.config.get("MAX_CONTENT_LENGTH", 8 * 1024 * 1024))
 
     store = VaultStore(
         database_path=app.config["DATABASE_PATH"],
@@ -56,6 +62,12 @@ def create_app(test_config: dict | None = None) -> Flask:
     )
     store.init()
     app.extensions["vault_store"] = store
+    app.extensions["login_guard"] = LoginGuard(
+        max_attempts=int(app.config.get("LOGIN_RATE_LIMIT", 5)),
+        window_seconds=int(app.config.get("LOGIN_RATE_WINDOW_SECONDS", 600)),
+        lockout_threshold=int(app.config.get("LOGIN_LOCKOUT_THRESHOLD", 8)),
+        lockout_seconds=int(app.config.get("LOGIN_LOCKOUT_SECONDS", 900)),
+    )
 
     @app.context_processor
     def inject_globals() -> dict:
@@ -66,6 +78,14 @@ def create_app(test_config: dict | None = None) -> Flask:
                 (RSA_HYBRID, "RSA hybrid"),
             ],
         }
+
+    @app.errorhandler(RequestEntityTooLarge)
+    def too_large(_error: RequestEntityTooLarge):
+        limit_mb = int(app.config["MAX_CONTENT_LENGTH"]) // (1024 * 1024)
+        if _wants_json():
+            return jsonify({"error": f"upload exceeds the {limit_mb} MB limit"}), 413
+        flash(f"File exceeds the {limit_mb} MB upload limit.", "error")
+        return redirect(url_for("dashboard")), 413
 
     @app.get("/")
     def index() -> str | Response:
@@ -96,14 +116,18 @@ def create_app(test_config: dict | None = None) -> Flask:
         return redirect(url_for("dashboard"))
 
     @app.post("/login")
-    def login() -> Response:
+    def login():
         username = request.form.get("username", "")
         password = request.form.get("password", "")
+        blocked = _guard_login(app, username, json_mode=False)
+        if blocked is not None:
+            return blocked
+
         user = store.authenticate_user(username, password)
         if not user:
-            flash("Invalid username or password.", "error")
-            return redirect(url_for("index"))
+            return _failed_login(app, username, json_mode=False)
 
+        _login_success(app, store, user)
         session.clear()
         session["user_id"] = user.id
         flash("Signed in.", "success")
@@ -119,8 +143,21 @@ def create_app(test_config: dict | None = None) -> Flask:
     @login_required(store)
     def dashboard() -> str:
         user = _current_user(store)
-        assets = store.list_assets(user.id)
-        return render_template("dashboard.html", assets=assets)
+        query = (request.args.get("q") or "").strip()
+        algorithm = (request.args.get("algorithm") or "").strip() or None
+        assets = store.list_assets(user.id, query=query or None, algorithm=algorithm)
+        shared_items = store.list_shared_with_user(
+            user.id, query=query or None, algorithm=algorithm
+        )
+        recipients = store.list_recipients_for_owner(user.id)
+        return render_template(
+            "dashboard.html",
+            assets=assets,
+            shared_items=shared_items,
+            recipients=recipients,
+            query=query,
+            selected_algorithm=algorithm or "",
+        )
 
     @app.post("/images")
     @login_required(store)
@@ -158,7 +195,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                     "mime_type": image_info["mime_type"],
                 },
             }
-            store.save_asset(
+            asset = store.save_asset(
                 user_id=user.id,
                 original_filename=upload.filename,
                 algorithm=algorithm,
@@ -169,6 +206,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                 metadata=metadata,
                 ciphertext=result.ciphertext,
             )
+            _audit(store, user.id, "upload", asset.id)
         except (CryptoError, ValueError, UnidentifiedImageError) as exc:
             flash(str(exc), "error")
             return redirect(url_for("dashboard"))
@@ -181,19 +219,31 @@ def create_app(test_config: dict | None = None) -> Flask:
     def decrypt_image(asset_id: int) -> Response:
         user = _current_user(store)
         try:
-            asset = _owned_asset(store, asset_id, user)
+            asset, share = _accessible_asset(store, asset_id, user)
             ciphertext = store.read_ciphertext(asset)
             aad = _aad_from_metadata(asset)
-            plaintext = decrypt_image_bytes(
-                ciphertext,
-                asset.metadata,
-                passphrase=request.form.get("passphrase") or None,
-                private_key_pem=store.read_private_key(user.id)
-                if asset.algorithm == RSA_HYBRID
-                else None,
-                private_key_passphrase=request.form.get("private_key_passphrase") or None,
-                aad=aad,
-            )
+            metadata = dict(asset.metadata)
+            if share is not None:
+                metadata["key_wrap"] = share.key_wrap
+                plaintext = decrypt_image_bytes(
+                    ciphertext,
+                    metadata,
+                    private_key_pem=store.read_private_key(user.id),
+                    private_key_passphrase=request.form.get("private_key_passphrase") or None,
+                    aad=aad,
+                )
+            else:
+                plaintext = decrypt_image_bytes(
+                    ciphertext,
+                    metadata,
+                    passphrase=request.form.get("passphrase") or None,
+                    private_key_pem=store.read_private_key(user.id)
+                    if asset.algorithm == RSA_HYBRID
+                    else None,
+                    private_key_passphrase=request.form.get("private_key_passphrase") or None,
+                    aad=aad,
+                )
+            _audit(store, user.id, "decrypt", asset.id)
         except (LookupError, PermissionError, CryptoError) as exc:
             flash(str(exc), "error")
             return redirect(url_for("dashboard"))
@@ -205,15 +255,110 @@ def create_app(test_config: dict | None = None) -> Flask:
             as_attachment=False,
         )
 
+    @app.post("/images/<int:asset_id>/share")
+    @login_required(store)
+    def share_image(asset_id: int) -> Response:
+        user = _current_user(store)
+        recipient_name = request.form.get("username", "")
+        try:
+            _share_asset(
+                store,
+                owner=user,
+                asset_id=asset_id,
+                recipient_username=recipient_name,
+                passphrase=request.form.get("passphrase") or None,
+                private_key_passphrase=request.form.get("private_key_passphrase") or None,
+            )
+        except (LookupError, PermissionError, CryptoError, ValueError) as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("dashboard"))
+
+        flash(f"Shared with {recipient_name.strip().lower()}.", "success")
+        return redirect(url_for("dashboard"))
+
+    @app.post("/images/<int:asset_id>/delete")
+    @login_required(store)
+    def delete_image(asset_id: int) -> Response:
+        user = _current_user(store)
+        try:
+            asset = store.delete_asset(asset_id, user.id)
+            _audit(store, user.id, "delete", asset.id)
+        except (LookupError, PermissionError) as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("dashboard"))
+        flash(f"Deleted {asset.original_filename}.", "success")
+        return redirect(url_for("dashboard"))
+
+    @app.get("/images/<int:asset_id>/download")
+    @login_required(store)
+    def download_ciphertext(asset_id: int) -> Response:
+        user = _current_user(store)
+        try:
+            asset = _owned_asset(store, asset_id, user)
+        except (LookupError, PermissionError) as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("dashboard"))
+        blob = pack_ies(store.read_ciphertext(asset), asset.metadata)
+        download_name = f"{asset.original_filename}.ies"
+        return send_file(
+            BytesIO(blob),
+            mimetype="application/octet-stream",
+            download_name=download_name,
+            as_attachment=True,
+        )
+
+    @app.get("/audit")
+    @login_required(store)
+    def audit() -> str:
+        user = _current_user(store)
+        events = store.list_audit_events(user.id)
+        return render_template("audit.html", events=events)
+
+    @app.get("/backup")
+    @login_required(store)
+    def download_backup() -> Response:
+        user = _current_user(store)
+        archive = store.export_backup(user.id)
+        _audit(store, user.id, "backup")
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return send_file(
+            BytesIO(archive),
+            mimetype="application/zip",
+            download_name=f"ies-backup-{user.username}-{stamp}.zip",
+            as_attachment=True,
+        )
+
+    @app.post("/restore")
+    @login_required(store)
+    def restore_backup() -> Response:
+        user = _current_user(store)
+        upload = request.files.get("backup")
+        if upload is None or not upload.filename:
+            flash("Choose a backup zip to restore.", "error")
+            return redirect(url_for("dashboard"))
+        try:
+            restored = store.import_backup(user.id, upload.read())
+        except ValueError as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("dashboard"))
+        _audit(store, user.id, "backup")
+        flash(f"Restored {restored} encrypted image(s).", "success")
+        return redirect(url_for("dashboard"))
+
     @app.post("/api/token")
     def api_token() -> Response:
         payload = request.get_json(silent=True) or {}
         username = str(payload.get("username", ""))
         password = str(payload.get("password", ""))
+        blocked = _guard_login(app, username, json_mode=True)
+        if blocked is not None:
+            return blocked
+
         user = store.authenticate_user(username, password)
         if not user:
-            return jsonify({"error": "invalid credentials"}), 401
+            return _failed_login(app, username, json_mode=True)
 
+        _login_success(app, store, user)
         now = datetime.now(timezone.utc)
         token = jwt.encode(
             {
@@ -233,16 +378,51 @@ def create_app(test_config: dict | None = None) -> Flask:
         user = g.api_user
         return jsonify(
             {
-                "images": [
+                "images": [_asset_payload(asset) for asset in store.list_assets(user.id)],
+                "shared": [
                     {
-                        "id": asset.id,
-                        "filename": asset.original_filename,
-                        "algorithm": asset.algorithm,
-                        "format": asset.image_format,
-                        "size": {"width": asset.width, "height": asset.height},
-                        "created_at": asset.created_at,
+                        **_asset_payload(item.asset),
+                        "owner": item.owner_username,
+                        "shared_at": item.share.created_at,
                     }
-                    for asset in store.list_assets(user.id)
+                    for item in store.list_shared_with_user(user.id)
+                ],
+            }
+        )
+
+    @app.post("/api/images/<int:asset_id>/share")
+    @jwt_required(store)
+    def api_share_image(asset_id: int) -> Response:
+        user = g.api_user
+        payload = request.get_json(silent=True) or {}
+        try:
+            share = _share_asset(
+                store,
+                owner=user,
+                asset_id=asset_id,
+                recipient_username=str(payload.get("username", "")),
+                passphrase=payload.get("passphrase") or None,
+                private_key_passphrase=payload.get("private_key_passphrase") or None,
+            )
+        except (LookupError, PermissionError, CryptoError, ValueError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "share_id": share.id, "asset_id": asset_id})
+
+    @app.get("/api/audit")
+    @jwt_required(store)
+    def api_audit() -> Response:
+        user = g.api_user
+        return jsonify(
+            {
+                "events": [
+                    {
+                        "id": event.id,
+                        "action": event.action,
+                        "asset_id": event.asset_id,
+                        "ip": event.ip,
+                        "created_at": event.created_at,
+                    }
+                    for event in store.list_audit_events(user.id)
                 ]
             }
         )
@@ -305,6 +485,111 @@ def _owned_asset(store: VaultStore, asset_id: int, user: User) -> EncryptedAsset
     if asset.user_id != user.id:
         raise PermissionError("You do not have access to this encrypted image.")
     return asset
+
+
+def _accessible_asset(
+    store: VaultStore, asset_id: int, user: User
+) -> tuple[EncryptedAsset, AssetShare | None]:
+    asset = store.get_asset(asset_id)
+    if asset.user_id == user.id:
+        return asset, None
+    share = store.get_share(asset_id, user.id)
+    if share is None:
+        raise PermissionError("You do not have access to this encrypted image.")
+    return asset, share
+
+
+def _share_asset(
+    store: VaultStore,
+    *,
+    owner: User,
+    asset_id: int,
+    recipient_username: str,
+    passphrase: str | None,
+    private_key_passphrase: str | None,
+) -> AssetShare:
+    asset = _owned_asset(store, asset_id, owner)
+    recipient_name = recipient_username.strip().lower()
+    if not recipient_name:
+        raise ValueError("Recipient username is required.")
+    if recipient_name == owner.username:
+        raise ValueError("You already own this image.")
+    recipient = store.get_user_by_username(recipient_name)
+    if recipient is None:
+        raise LookupError("No account exists with that username.")
+
+    data_key = unwrap_data_key(
+        asset.metadata["key_wrap"],
+        passphrase=passphrase,
+        private_key_pem=store.read_private_key(owner.id) if asset.algorithm == RSA_HYBRID else None,
+        private_key_passphrase=private_key_passphrase if asset.algorithm == RSA_HYBRID else None,
+    )
+    recipient_wrap = wrap_data_key_rsa(data_key, store.read_public_key(recipient.id))
+    share = store.create_share(
+        asset_id=asset.id,
+        recipient_user_id=recipient.id,
+        key_wrap=recipient_wrap,
+    )
+    _audit(store, owner.id, "share", asset.id)
+    return share
+
+
+def _guard_login(app: Flask, username: str, *, json_mode: bool):
+    guard: LoginGuard = app.extensions["login_guard"]
+    verdict = guard.precheck(request.remote_addr or "", username)
+    if verdict == "locked":
+        return _locked_response(json_mode)
+    if verdict == "rate_limited":
+        if json_mode:
+            return jsonify({"error": "too many login attempts"}), 429
+        flash("Too many sign-in attempts. Please wait and try again.", "error")
+        return redirect(url_for("index")), 429
+    return None
+
+
+def _failed_login(app: Flask, username: str, *, json_mode: bool):
+    guard: LoginGuard = app.extensions["login_guard"]
+    if guard.record_failure(username):
+        return _locked_response(json_mode)
+    if json_mode:
+        return jsonify({"error": "invalid credentials"}), 401
+    flash("Invalid username or password.", "error")
+    return redirect(url_for("index"))
+
+
+def _locked_response(json_mode: bool):
+    if json_mode:
+        return jsonify({"error": "account locked"}), 403
+    flash("This account is locked because of too many failed sign-in attempts.", "error")
+    return redirect(url_for("index")), 403
+
+
+def _login_success(app: Flask, store: VaultStore, user: User) -> None:
+    guard: LoginGuard = app.extensions["login_guard"]
+    guard.record_success(user.username)
+    _audit(store, user.id, "login")
+
+
+def _audit(store: VaultStore, user_id: int, action: str, asset_id: int | None = None) -> None:
+    store.add_audit_event(user_id, action, asset_id=asset_id, ip=request.remote_addr)
+
+
+def _asset_payload(asset: EncryptedAsset) -> dict:
+    return {
+        "id": asset.id,
+        "filename": asset.original_filename,
+        "algorithm": asset.algorithm,
+        "format": asset.image_format,
+        "size": {"width": asset.width, "height": asset.height},
+        "created_at": asset.created_at,
+    }
+
+
+def _wants_json() -> bool:
+    if request.path.startswith("/api/"):
+        return True
+    accept = request.accept_mimetypes
+    return accept["application/json"] > accept["text/html"]
 
 
 def _allowed_extension(filename: str, allowed_extensions: set[str]) -> bool:

@@ -3,8 +3,9 @@
 ## Goals
 
 The system protects image confidentiality at rest by encrypting uploaded image
-bytes before they are written to storage. It also restricts image access to the
-authenticated user who uploaded the file.
+bytes before they are written to storage. Access is limited to the authenticated
+owner and to users the owner explicitly shares with. Sharing never writes
+plaintext and never hands the owner's passphrase to the recipient.
 
 ## Non-Goals
 
@@ -12,6 +13,7 @@ authenticated user who uploaded the file.
 - It does not scan uploaded files for malware.
 - It does not implement OAuth provider login out of the box.
 - It does not protect decrypted images after they are sent to the user's browser.
+- It does not hide metadata such as original filenames from the vault operator.
 
 ## Trust Boundaries
 
@@ -20,6 +22,8 @@ authenticated user who uploaded the file.
 - User password to RSA private key: private keys are encrypted at registration.
 - AES passphrase to AES data key: passphrases derive key-wrapping keys with
   Scrypt.
+- Owner to recipient: the same AES data key is re-wrapped with the recipient's
+  RSA public key. The ciphertext blob is unchanged.
 
 ## Encryption Design
 
@@ -34,23 +38,33 @@ The data key is protected in one of two ways:
 - RSA hybrid mode encrypts the data key with the user's RSA public key using
   RSA-OAEP with SHA-256.
 
+Sharing unwraps that data key in memory and wraps it again with RSA-OAEP for
+the recipient. Recipients always decrypt on the RSA path with their own
+password-protected private key.
+
 AES-GCM provides confidentiality and integrity. If ciphertext or metadata is
 modified, decryption fails.
 
 ## Access Control
 
 The web dashboard requires login. Each encrypted image record is tied to a
-`user_id`. Decryption routes check ownership before reading encrypted bytes.
-API routes require a valid signed JWT.
+`user_id`. Decryption routes allow the owner or a row in `shares`. API routes
+require a valid signed JWT. Audit events are scoped to the signed-in user.
+
+## Operational Controls
+
+- Login attempts are rate limited (5 / 10 minutes per IP+username).
+- Eight failed passwords lock the username in process memory.
+- Uploads are capped at 8 MB by default.
+- Passwords are compared with Werkzeug's constant-time `check_password_hash`.
+- Backups export ciphertext and wrap metadata only — never private keys.
 
 ## Recommended Production Hardening
 
 - Use HTTPS everywhere.
 - Store secrets in a managed secret store.
-- Add rate limiting to login, registration, and decrypt endpoints.
-- Add audit logs for encryption, decryption, and failed access attempts.
+- Persist rate limits and lockouts outside a single process.
 - Move encrypted objects to S3 with SSE-KMS or a similar managed storage layer.
 - Add malware and file-type scanning for uploads.
 - Consider envelope encryption with a managed KMS instead of local key files.
 - Add OAuth using a trusted identity provider if the app will be multi-user.
-

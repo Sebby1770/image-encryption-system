@@ -1,0 +1,44 @@
+{% extends "layout.html" %}
+
+{% block title %}Audit log - Image Encryption System{% endblock %}
+
+{% block content %}
+  <section class="dashboard-header">
+    <div>
+      <h1>Audit log</h1>
+      <p>Your vault activity only: sign-in, upload, decrypt, share, delete, and backup.</p>
+    </div>
+  </section>
+
+  <section class="vault-list audit-panel">
+    {% if events %}
+      <div class="table-wrap">
+        <table class="audit-table">
+          <thead>
+            <tr>
+              <th>When</th>
+              <th>Action</th>
+              <th>Asset</th>
+              <th>IP</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for event in events %}
+              <tr>
+                <td>{{ event.created_at }}</td>
+                <td><span class="pill">{{ event.action }}</span></td>
+                <td>{% if event.asset_id %}#{{ event.asset_id }}{% else %}—{% endif %}</td>
+                <td>{{ event.ip or "—" }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <div class="empty-state">
+        <h3>No events yet</h3>
+        <p>Encrypt, decrypt, share, or download a backup to populate this log.</p>
+      </div>
+    {% endif %}
+  </section>
+{% endblock %}
