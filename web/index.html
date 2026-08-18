@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Image Encryption System</title>
+    <meta name="description" content="Browser AES-256-GCM image vault. Ciphertext only — keys never leave this tab.">
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="./">Image Encryption System</a>
+      <nav class="nav" id="nav-authed" hidden>
+        <button class="linkish" data-view="vault">Vault</button>
+        <button class="linkish" data-view="audit">Audit</button>
+      </nav>
+      <div class="top-actions">
+        <span class="who" id="who"></span>
+        <button class="btn ghost" id="btn-signout" hidden>Sign out</button>
+        <a class="btn ghost" href="https://github.com/Sebby1770/image-encryption-system">GitHub</a>
+      </div>
+    </header>
+
+    <main class="shell">
+      <section id="view-auth" class="auth-grid">
+        <div class="panel">
+          <p class="eyebrow">Local browser vault · 2.3</p>
+          <h1>Encrypt photos before they sit on disk.</h1>
+          <p class="lede">
+            AES-256-GCM in this tab via the Web Crypto API. The passphrase never
+            leaves the browser. This is the public demo of the Flask vault —
+            same idea, no server.
+          </p>
+          <form id="form-auth" class="stack">
+            <label>Username <input name="username" autocomplete="username" required></label>
+            <label>Passphrase <input name="passphrase" type="password" autocomplete="current-password" minlength="8" required></label>
+            <div class="row">
+              <button class="btn primary" type="submit">Open vault</button>
+              <button class="btn" type="button" id="btn-register">Create account</button>
+            </div>
+            <p class="hint" id="auth-msg"></p>
+          </form>
+        </div>
+        <aside class="panel muted-panel">
+          <h2>What this site does</h2>
+          <ul>
+            <li>Derives a wrapping key with PBKDF2 (150k, SHA-256)</li>
+            <li>Encrypts pixels with AES-GCM and a fresh 256-bit data key</li>
+            <li>Stores only ciphertext in <code>localStorage</code></li>
+            <li>Exports a portable <code>.ies.json</code> blob</li>
+            <li>Capability links unwrap with a random token in the URL hash</li>
+          </ul>
+          <p class="hint">The Python app on GitHub also does RSA-OAEP sharing, CSRF, JWT, and lockout.</p>
+        </aside>
+      </section>
+
+      <section id="view-vault" hidden>
+        <div class="hero-row">
+          <div>
+            <h1>Encrypted image vault</h1>
+            <p>Upload a photo, wrap the data key with your passphrase, keep only ciphertext.</p>
+          </div>
+          <div class="metrics">
+            <div class="metric"><strong id="m-count">0</strong><span>images</span></div>
+            <div class="metric"><strong id="m-fav">0</strong><span>favorites</span></div>
+          </div>
+        </div>
+        <div class="workspace">
+          <form id="form-encrypt" class="panel stack">
+            <h2>Encrypt image</h2>
+            <label>Image file <input name="image" type="file" accept="image/*" required></label>
+            <label>Notes <input name="notes" placeholder="Optional (stored unencrypted)"></label>
+            <label class="check"><input name="favorite" type="checkbox"> Favorite</label>
+            <button class="btn primary" type="submit">Encrypt and store</button>
+            <p class="hint" id="enc-msg"></p>
+          </form>
+          <div>
+            <div class="filter-row">
+              <input id="filter-q" type="search" placeholder="Filter by name or notes">
+              <label class="check"><input id="filter-fav" type="checkbox"> Favorites</label>
+            </div>
+            <div id="asset-list" class="asset-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-audit" hidden>
+        <h1>Audit log</h1>
+        <p>This tab only. Nothing is sent to GitHub Pages.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>When</th><th>Action</th><th>File</th></tr></thead>
+            <tbody id="audit-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="view-link" hidden>
+        <div class="panel">
+          <h1 id="link-title">Shared image</h1>
+          <p id="link-meta" class="lede"></p>
+          <button class="btn primary" id="btn-link-decrypt">Decrypt and download</button>
+          <p class="hint" id="link-msg"></p>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="preview-modal" class="modal">
+      <form method="dialog">
+        <img id="preview-img" alt="Decrypted preview">
+        <p id="preview-name"></p>
+        <button class="btn">Close</button>
+      </form>
+    </dialog>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
