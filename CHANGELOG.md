@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.1.0 - 2026-08-18
+
+### Added
+
+- Revoke a share with `POST /share/<id>/revoke`. The shares row is deleted so
+  the recipient can no longer unwrap the data key. The dashboard shows a Revoke
+  button per recipient.
+- Change the account password at `GET/POST /account/password`. The new hash is
+  stored and the RSA private key PEM is re-encrypted with
+  `BestAvailableEncryption` using the new password.
+- CSRF tokens on every HTML POST form (session `csrf_token`). POSTs without a
+  valid token return 400. JSON `/api/*` routes stay token-based.
+- Persistent login guard in the `login_guard` SQLite table. Rate limit
+  (5 / 10 minutes) and lockout (8 failures) survive process restart.
+- Rotate the passphrase wrap on an AES-GCM asset: unwrap the data key with the
+  old passphrase, re-wrap it, and update metadata. Ciphertext is unchanged.
+
+### Changed
+
+- Package version is 2.1.0.
+
 ## 2.0.0 - 2026-08-18
 
 ### Added

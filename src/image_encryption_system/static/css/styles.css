@@ -398,6 +398,52 @@ input:disabled {
   margin-top: 8px !important;
 }
 
+.recipient-list {
+  display: grid;
+  gap: 8px;
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+}
+
+.recipient-row {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.recipient-row .share-note {
+  margin-top: 0 !important;
+}
+
+.recipient-row form {
+  margin: 0;
+}
+
+.recipient-row .button {
+  min-height: 32px;
+  padding: 4px 10px;
+  width: auto;
+}
+
+.rotate-details {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.rotate-details summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.rotate-form {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
 .shared-inbox {
   margin-top: 28px;
 }

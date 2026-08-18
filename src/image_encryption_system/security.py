@@ -1,78 +1,78 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from threading import Lock
-from time import monotonic
+from time import time
+from typing import TYPE_CHECKING
+
+
+if TYPE_CHECKING:
+    from .storage import VaultStore
 
 
 class LoginGuard:
-    """In-memory login throttle and failed-attempt lockout."""
+    """SQLite-backed login throttle and failed-attempt lockout."""
 
     def __init__(
         self,
+        store: VaultStore,
         *,
         max_attempts: int = 5,
         window_seconds: int = 600,
         lockout_threshold: int = 8,
         lockout_seconds: int = 900,
     ) -> None:
+        self.store = store
         self.max_attempts = max_attempts
         self.window_seconds = window_seconds
         self.lockout_threshold = lockout_threshold
         self.lockout_seconds = lockout_seconds
-        self._attempts: dict[tuple[str, str], list[float]] = defaultdict(list)
-        self._failures: dict[str, list[float]] = defaultdict(list)
-        self._lockouts: dict[str, float] = {}
         self._lock = Lock()
 
     def precheck(self, ip: str, username: str) -> str | None:
         """Return 'locked', 'rate_limited', or None if the attempt may proceed."""
-        now = monotonic()
+        now = time()
         username = _normalize(username)
         ip = ip or ""
         with self._lock:
-            locked_until = self._lockouts.get(username)
+            locked_until = self.store.login_guard_locked_until(username)
             if locked_until is not None and now < locked_until:
                 return "locked"
             if locked_until is not None and now >= locked_until:
-                self._lockouts.pop(username, None)
-                self._failures.pop(username, None)
+                self.store.login_guard_clear_failures(username)
 
-            key = (ip, username)
             cutoff = now - self.window_seconds
-            recent = [stamp for stamp in self._attempts[key] if stamp > cutoff]
+            self.store.login_guard_prune("attempt", username, ip=ip, before=cutoff)
+            recent = self.store.login_guard_stamps("attempt", username, ip=ip, since=cutoff)
             if len(recent) >= self.max_attempts:
-                self._attempts[key] = recent
                 return "rate_limited"
-            recent.append(now)
-            self._attempts[key] = recent
+            self.store.login_guard_add("attempt", username, ip=ip, created_at=now)
         return None
 
     def record_failure(self, username: str) -> bool:
         """Record a failed password check. True if the account is now locked."""
-        now = monotonic()
+        now = time()
         username = _normalize(username)
         with self._lock:
             window = max(self.lockout_seconds * 4, 3600)
-            recent = [stamp for stamp in self._failures[username] if stamp > now - window]
-            recent.append(now)
-            self._failures[username] = recent
+            cutoff = now - window
+            self.store.login_guard_prune("failure", username, before=cutoff)
+            self.store.login_guard_add("failure", username, created_at=now)
+            recent = self.store.login_guard_stamps("failure", username, since=cutoff)
             if len(recent) >= self.lockout_threshold:
-                self._lockouts[username] = now + self.lockout_seconds
+                self.store.login_guard_set_lockout(username, now + self.lockout_seconds)
                 return True
         return False
 
     def record_success(self, username: str) -> None:
         username = _normalize(username)
         with self._lock:
-            self._failures.pop(username, None)
-            self._lockouts.pop(username, None)
+            self.store.login_guard_clear_failures(username)
 
     def is_locked(self, username: str) -> bool:
         username = _normalize(username)
-        now = monotonic()
+        now = time()
         with self._lock:
-            locked_until = self._lockouts.get(username)
+            locked_until = self.store.login_guard_locked_until(username)
             return locked_until is not None and now < locked_until
 
 

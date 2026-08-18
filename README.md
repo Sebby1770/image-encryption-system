@@ -2,8 +2,8 @@
 
 A Flask image vault that encrypts photos with **AES-256-GCM** before they touch
 disk. Per-image data keys are wrapped with Scrypt+AES or RSA-OAEP. Version
-**2.0.0** adds user-to-user sharing, an audit log, a standalone CLI, encrypted
-backups, and login lockout.
+**2.1.0** adds share revoke, password change with RSA PEM re-wrap, CSRF on
+forms, persistent login lockout, and passphrase-wrap rotation.
 
 ## Features
 
@@ -13,13 +13,20 @@ backups, and login lockout.
   encrypted with the account password.
 - Share with another username by re-wrapping the **same** AES data key with
   their RSA public key. Recipients decrypt with **their** password.
+- Revoke a share from the dashboard; the recipient immediately loses decrypt
+  access.
+- Change password: new hash plus RSA private key PEM re-encrypted with the new
+  password (`BestAvailableEncryption`).
+- Rotate the passphrase wrap on an AES-GCM image (old passphrase required).
+- CSRF tokens on every HTML POST form.
 - Owner-only audit log (web + `GET /api/audit`).
 - Encrypted backup zip (ciphertext + metadata, never private keys) and restore.
 - `ies` CLI for offline encrypt / decrypt / keygen.
-- Login rate limit (5 / 10 minutes, IP+user) and lockout after 8 failures.
+- Login rate limit (5 / 10 minutes, IP+user) and lockout after 8 failures,
+  persisted in SQLite so a restart does not reset the counter.
 - 8 MB default upload limit; download ciphertext as `.ies`.
 - JWT API for listing images and reading the audit trail.
-- Tests for crypto, sharing, backup, CLI, and lockout.
+- Tests for crypto, sharing, revoke, backup, CLI, CSRF, and lockout.
 
 ## Tech Stack
 
@@ -67,12 +74,26 @@ On the dashboard, choose **Share** and enter another username. The server:
 3. Stores the new wrap in `shares`. The ciphertext file is unchanged.
 
 The recipient sees the image under **Shared with me** and decrypts it with their
-account password. A third user cannot unwrap the shared key.
+account password. A third user cannot unwrap the shared key. The owner can
+**Revoke** a recipient at any time; that deletes the `shares` row so decrypt
+fails for them.
+
+AES-GCM passphrase assets also have **Rotate passphrase**: the server unwraps
+the data key with the old passphrase and writes a new wrap. Shares stay valid
+because they hold their own RSA wrap of the same data key.
 
 ## Audit
 
-`GET /audit` lists your events only: login, upload, decrypt, share, delete, and
-backup. `GET /api/audit` returns the same data as JSON.
+`GET /audit` lists your events only: login, upload, decrypt, share, revoke,
+rotate, password change, delete, and backup. `GET /api/audit` returns the same
+data as JSON.
+
+## Account password
+
+`GET/POST /account/password` verifies the current password, stores a new hash,
+and re-encrypts `user-<id>-private.pem` with the new password. RSA-hybrid
+decrypt then uses the new password, not the old one. Image ciphertext is never
+rewritten.
 
 ## Backup
 
@@ -152,9 +173,9 @@ image-encryption-system/
   src/image_encryption_system/
     crypto.py          # AES-GCM, RSA-OAEP, .ies container, key re-wrap
     storage.py         # SQLite, shares, audit, backup zip
-    web.py             # Flask app, auth, share, audit, API
+    web.py             # Flask app, auth, share, revoke, audit, API
     cli.py             # ies console script
-    security.py        # login rate limit and lockout
+    security.py        # persistent login rate limit and lockout
     templates/         # HTML views
     static/css/        # UI styling
   tests/               # pytest coverage

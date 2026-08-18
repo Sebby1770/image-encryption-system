@@ -1,4 +1,5 @@
 from io import BytesIO
+import secrets
 
 from PIL import Image
 
@@ -29,10 +30,25 @@ def make_app(tmp_path, **overrides):
     return create_app(config)
 
 
+def csrf_token(client) -> str:
+    with client.session_transaction() as sess:
+        token = sess.get("csrf_token")
+        if not token:
+            token = secrets.token_urlsafe(32)
+            sess["csrf_token"] = token
+        return token
+
+
+def with_csrf(client, data: dict | None = None) -> dict:
+    payload = dict(data or {})
+    payload["csrf_token"] = csrf_token(client)
+    return payload
+
+
 def register(client, username: str, password: str = PASSWORD):
     return client.post(
         "/register",
-        data={"username": username, "password": password},
+        data=with_csrf(client, {"username": username, "password": password}),
         follow_redirects=True,
     )
 
@@ -40,23 +56,26 @@ def register(client, username: str, password: str = PASSWORD):
 def login(client, username: str, password: str = PASSWORD, **kwargs):
     return client.post(
         "/login",
-        data={"username": username, "password": password},
+        data=with_csrf(client, {"username": username, "password": password}),
         **kwargs,
     )
 
 
 def logout(client):
-    return client.post("/logout", follow_redirects=True)
+    return client.post("/logout", data=with_csrf(client), follow_redirects=True)
 
 
 def encrypt_png(client, filename: str = "secret.png", passphrase: str = "image passphrase"):
     return client.post(
         "/images",
-        data={
-            "algorithm": AES_GCM_PASSPHRASE,
-            "passphrase": passphrase,
-            "image": (BytesIO(sample_png()), filename),
-        },
+        data=with_csrf(
+            client,
+            {
+                "algorithm": AES_GCM_PASSPHRASE,
+                "passphrase": passphrase,
+                "image": (BytesIO(sample_png()), filename),
+            },
+        ),
         content_type="multipart/form-data",
         follow_redirects=True,
     )

@@ -23,6 +23,7 @@
   <section class="workspace-grid">
     <div class="sidebar-stack">
       <form class="upload-panel" method="post" action="{{ url_for('upload_image') }}" enctype="multipart/form-data">
+        {{ csrf_field }}
         <h2>Encrypt image</h2>
         <label>
           Image file
@@ -47,6 +48,7 @@
       </form>
 
       <form class="upload-panel" method="post" action="{{ url_for('restore_backup') }}" enctype="multipart/form-data">
+        {{ csrf_field }}
         <h2>Restore backup</h2>
         <p class="field-note">Upload a zip exported from this vault. Ciphertext and metadata only — no private keys.</p>
         <label>
@@ -87,11 +89,22 @@
                 <p>{{ asset.algorithm }} · {{ asset.image_format }} · {{ asset.width }}x{{ asset.height }}</p>
                 <small>{{ asset.created_at }}</small>
                 {% if recipients.get(asset.id) %}
-                  <p class="share-note">Shared with {{ recipients[asset.id]|join(", ") }}</p>
+                  <ul class="recipient-list">
+                    {% for rec in recipients[asset.id] %}
+                      <li class="recipient-row">
+                        <span class="share-note">Shared with {{ rec.username }}</span>
+                        <form method="post" action="{{ url_for('revoke_share', share_id=rec.share_id) }}">
+                          {{ csrf_field }}
+                          <button class="button button-danger" type="submit">Revoke</button>
+                        </form>
+                      </li>
+                    {% endfor %}
+                  </ul>
                 {% endif %}
               </div>
               <div class="asset-actions">
                 <form method="post" action="{{ url_for('decrypt_image', asset_id=asset.id) }}" target="_blank">
+                  {{ csrf_field }}
                   {% if asset.algorithm == "AES-GCM" %}
                     <label>
                       Passphrase
@@ -115,9 +128,27 @@
                   >Share</button>
                   <a class="button button-ghost" href="{{ url_for('download_ciphertext', asset_id=asset.id) }}">.ies</a>
                   <form method="post" action="{{ url_for('delete_image', asset_id=asset.id) }}" onsubmit="return confirm('Delete this ciphertext permanently?');">
+                    {{ csrf_field }}
                     <button class="button button-danger" type="submit">Delete</button>
                   </form>
                 </div>
+                {% if asset.algorithm == "AES-GCM" %}
+                  <details class="rotate-details">
+                    <summary>Rotate passphrase</summary>
+                    <form method="post" action="{{ url_for('rotate_passphrase', asset_id=asset.id) }}" class="rotate-form">
+                      {{ csrf_field }}
+                      <label>
+                        Current passphrase
+                        <input name="old_passphrase" type="password" autocomplete="off" required>
+                      </label>
+                      <label>
+                        New passphrase
+                        <input name="new_passphrase" type="password" autocomplete="off" required>
+                      </label>
+                      <button class="button button-ghost" type="submit">Rotate wrap</button>
+                    </form>
+                  </details>
+                {% endif %}
               </div>
             </article>
           {% endfor %}
@@ -141,6 +172,7 @@
                   <small>Shared {{ item.share.created_at }}</small>
                 </div>
                 <form method="post" action="{{ url_for('decrypt_image', asset_id=item.asset.id) }}" target="_blank">
+                  {{ csrf_field }}
                   <label>
                     Your account password
                     <input name="private_key_passphrase" type="password" autocomplete="current-password" required>
@@ -162,6 +194,7 @@
 
   <dialog class="share-modal" id="share-modal">
     <form method="post" id="share-form">
+      {{ csrf_field }}
       <h2>Share <span id="share-filename">image</span></h2>
       <p class="field-note">The same AES data key is unwrapped locally and re-wrapped with the recipient’s RSA public key. They decrypt with their own password.</p>
       <label>

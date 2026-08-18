@@ -137,6 +137,35 @@ def wrap_data_key_rsa(data_key: bytes, public_key_pem: bytes) -> dict[str, str]:
     return _wrap_key_with_rsa(data_key, public_key_pem)
 
 
+def wrap_data_key_passphrase(data_key: bytes, passphrase: str) -> dict[str, str | int]:
+    """Re-wrap an existing AES data key with a new Scrypt+AES passphrase."""
+    if len(data_key) != AES_KEY_BYTES:
+        raise CryptoError("Refusing to wrap a data key of unexpected length.")
+    return _wrap_key_with_passphrase(data_key, passphrase)
+
+
+def reencrypt_private_key_pem(
+    private_pem: bytes,
+    old_passphrase: str,
+    new_passphrase: str,
+) -> bytes:
+    """Load a password-wrapped RSA PEM and wrap it again with a new password."""
+    if not new_passphrase:
+        raise CryptoError("A passphrase is required to protect the private key.")
+    try:
+        private_key = serialization.load_pem_private_key(
+            private_pem,
+            password=old_passphrase.encode("utf-8") if old_passphrase else None,
+        )
+    except (ValueError, TypeError) as exc:
+        raise CryptoError("Current password is invalid.") from exc
+    return private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.BestAvailableEncryption(new_passphrase.encode("utf-8")),
+    )
+
+
 def pack_ies(ciphertext: bytes, metadata: dict[str, Any]) -> bytes:
     """Pack ciphertext and wrap metadata into a portable .ies vault file."""
     raw_meta = json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode("utf-8")

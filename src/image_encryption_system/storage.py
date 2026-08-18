@@ -6,6 +6,7 @@ from io import BytesIO
 import json
 from pathlib import Path, PurePosixPath
 import sqlite3
+import time
 from typing import Any
 from uuid import uuid4
 import zipfile
@@ -13,7 +14,7 @@ import zipfile
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
-from .crypto import generate_rsa_key_pair
+from .crypto import generate_rsa_key_pair, reencrypt_private_key_pem
 
 
 MAX_BACKUP_UNCOMPRESSED = 64 * 1024 * 1024
@@ -56,6 +57,12 @@ class SharedInboxItem:
     share: AssetShare
     asset: EncryptedAsset
     owner_username: str
+
+
+@dataclass(frozen=True)
+class ShareRecipient:
+    share_id: int
+    username: str
 
 
 @dataclass(frozen=True)
@@ -124,9 +131,20 @@ class VaultStore:
                     FOREIGN KEY (user_id) REFERENCES users (id)
                 );
 
+                CREATE TABLE IF NOT EXISTS login_guard (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    ip TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL,
+                    locked_until REAL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_assets_user ON encrypted_assets (user_id);
                 CREATE INDEX IF NOT EXISTS idx_shares_recipient ON shares (recipient_user_id);
                 CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_events (user_id, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_login_guard_lookup
+                    ON login_guard (kind, username, ip, created_at);
                 """
             )
 
@@ -176,6 +194,40 @@ class VaultStore:
 
     def read_private_key(self, user_id: int) -> bytes:
         return self.private_key_path(user_id).read_bytes()
+
+    def change_password(self, user_id: int, old_password: str, new_password: str) -> None:
+        user = self.get_user(user_id)
+        if not check_password_hash(user.password_hash, old_password):
+            raise ValueError("Current password is incorrect.")
+        if len(new_password) < 10:
+            raise ValueError("Password must be at least 10 characters.")
+
+        new_pem = reencrypt_private_key_pem(
+            self.read_private_key(user_id),
+            old_password,
+            new_password,
+        )
+        new_hash = generate_password_hash(new_password)
+        pem_path = self.private_key_path(user_id)
+        tmp_path = pem_path.with_name(pem_path.name + ".tmp")
+        tmp_path.write_bytes(new_pem)
+        try:
+            with self._connect() as db:
+                db.execute(
+                    "UPDATE users SET password_hash = ? WHERE id = ?",
+                    (new_hash, user_id),
+                )
+            tmp_path.replace(pem_path)
+        except Exception:
+            with self._connect() as db:
+                db.execute(
+                    "UPDATE users SET password_hash = ? WHERE id = ?",
+                    (user.password_hash, user_id),
+                )
+            raise
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
 
     def private_key_path(self, user_id: int) -> Path:
         return self.key_dir / f"user-{user_id}-private.pem"
@@ -271,6 +323,26 @@ class VaultStore:
     def read_ciphertext(self, asset: EncryptedAsset) -> bytes:
         return (self.vault_dir / asset.stored_filename).read_bytes()
 
+    def update_asset_metadata(
+        self,
+        asset_id: int,
+        user_id: int,
+        metadata: dict[str, Any],
+    ) -> EncryptedAsset:
+        asset = self.get_asset(asset_id)
+        if asset.user_id != user_id:
+            raise PermissionError("You do not have access to this encrypted image.")
+        with self._connect() as db:
+            db.execute(
+                """
+                UPDATE encrypted_assets
+                SET metadata_json = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (json.dumps(metadata, sort_keys=True), asset_id, user_id),
+            )
+        return self.get_asset(asset_id)
+
     def create_share(
         self,
         *,
@@ -306,6 +378,25 @@ class VaultStore:
                 (asset_id, recipient_user_id),
             ).fetchone()
         return _share_from_row(row) if row else None
+
+    def delete_share(self, share_id: int, owner_user_id: int) -> AssetShare:
+        with self._connect() as db:
+            row = db.execute(
+                """
+                SELECT s.*, ea.user_id AS owner_user_id
+                FROM shares AS s
+                JOIN encrypted_assets AS ea ON ea.id = s.asset_id
+                WHERE s.id = ?
+                """,
+                (share_id,),
+            ).fetchone()
+            if row is None:
+                raise LookupError("Share not found.")
+            if int(row["owner_user_id"]) != owner_user_id:
+                raise PermissionError("You can only revoke shares you created.")
+            share = _share_from_row(row)
+            db.execute("DELETE FROM shares WHERE id = ?", (share_id,))
+        return share
 
     def list_shared_with_user(
         self,
@@ -353,11 +444,11 @@ class VaultStore:
             )
         return items
 
-    def list_recipients_for_owner(self, owner_user_id: int) -> dict[int, list[str]]:
+    def list_recipients_for_owner(self, owner_user_id: int) -> dict[int, list[ShareRecipient]]:
         with self._connect() as db:
             rows = db.execute(
                 """
-                SELECT s.asset_id, u.username
+                SELECT s.id AS share_id, s.asset_id, u.username
                 FROM shares AS s
                 JOIN encrypted_assets AS ea ON ea.id = s.asset_id
                 JOIN users AS u ON u.id = s.recipient_user_id
@@ -366,10 +457,103 @@ class VaultStore:
                 """,
                 (owner_user_id,),
             ).fetchall()
-        mapping: dict[int, list[str]] = {}
+        mapping: dict[int, list[ShareRecipient]] = {}
         for row in rows:
-            mapping.setdefault(int(row["asset_id"]), []).append(str(row["username"]))
+            mapping.setdefault(int(row["asset_id"]), []).append(
+                ShareRecipient(share_id=int(row["share_id"]), username=str(row["username"]))
+            )
         return mapping
+
+    def login_guard_locked_until(self, username: str) -> float | None:
+        with self._connect() as db:
+            row = db.execute(
+                """
+                SELECT locked_until FROM login_guard
+                WHERE kind = 'lockout' AND username = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (username,),
+            ).fetchone()
+        if row is None or row["locked_until"] is None:
+            return None
+        return float(row["locked_until"])
+
+    def login_guard_set_lockout(self, username: str, locked_until: float) -> None:
+        with self._connect() as db:
+            db.execute(
+                "DELETE FROM login_guard WHERE kind = 'lockout' AND username = ?",
+                (username,),
+            )
+            db.execute(
+                """
+                INSERT INTO login_guard (kind, username, ip, created_at, locked_until)
+                VALUES ('lockout', ?, '', ?, ?)
+                """,
+                (username, time.time(), locked_until),
+            )
+
+    def login_guard_clear_failures(self, username: str) -> None:
+        with self._connect() as db:
+            db.execute(
+                "DELETE FROM login_guard WHERE username = ? AND kind IN ('failure', 'lockout')",
+                (username,),
+            )
+
+    def login_guard_stamps(
+        self,
+        kind: str,
+        username: str,
+        *,
+        ip: str | None = None,
+        since: float,
+    ) -> list[float]:
+        sql = """
+            SELECT created_at FROM login_guard
+            WHERE kind = ? AND username = ? AND created_at > ?
+        """
+        params: list[Any] = [kind, username, since]
+        if ip is not None:
+            sql += " AND ip = ?"
+            params.append(ip)
+        sql += " ORDER BY created_at"
+        with self._connect() as db:
+            rows = db.execute(sql, params).fetchall()
+        return [float(row["created_at"]) for row in rows]
+
+    def login_guard_add(
+        self,
+        kind: str,
+        username: str,
+        *,
+        ip: str = "",
+        created_at: float,
+        locked_until: float | None = None,
+    ) -> None:
+        with self._connect() as db:
+            db.execute(
+                """
+                INSERT INTO login_guard (kind, username, ip, created_at, locked_until)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (kind, username, ip, created_at, locked_until),
+            )
+
+    def login_guard_prune(
+        self,
+        kind: str,
+        username: str,
+        *,
+        ip: str | None = None,
+        before: float,
+    ) -> None:
+        sql = "DELETE FROM login_guard WHERE kind = ? AND username = ? AND created_at <= ?"
+        params: list[Any] = [kind, username, before]
+        if ip is not None:
+            sql += " AND ip = ?"
+            params.append(ip)
+        with self._connect() as db:
+            db.execute(sql, params)
 
     def add_audit_event(
         self,

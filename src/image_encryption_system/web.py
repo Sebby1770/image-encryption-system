@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from functools import wraps
+import hmac
 from io import BytesIO
 from pathlib import Path
+import secrets
 from sqlite3 import IntegrityError
 from typing import Callable, TypeVar
 
@@ -22,6 +24,7 @@ from flask import (
     session,
     url_for,
 )
+from markupsafe import Markup, escape
 from PIL import Image, UnidentifiedImageError
 from werkzeug.exceptions import RequestEntityTooLarge
 
@@ -34,6 +37,7 @@ from .crypto import (
     encrypt_image_bytes,
     pack_ies,
     unwrap_data_key,
+    wrap_data_key_passphrase,
     wrap_data_key_rsa,
 )
 from .security import LoginGuard
@@ -48,6 +52,8 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.config.from_object(Config)
     if test_config:
         app.config.update(test_config)
+    if "CSRF_ENABLED" not in app.config:
+        app.config["CSRF_ENABLED"] = not bool(app.config.get("TESTING"))
 
     app.config["INSTANCE_DIR"] = Path(app.config["INSTANCE_DIR"])
     app.config["DATABASE_PATH"] = Path(app.config["DATABASE_PATH"])
@@ -63,6 +69,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     store.init()
     app.extensions["vault_store"] = store
     app.extensions["login_guard"] = LoginGuard(
+        store,
         max_attempts=int(app.config.get("LOGIN_RATE_LIMIT", 5)),
         window_seconds=int(app.config.get("LOGIN_RATE_WINDOW_SECONDS", 600)),
         lockout_threshold=int(app.config.get("LOGIN_LOCKOUT_THRESHOLD", 8)),
@@ -73,11 +80,27 @@ def create_app(test_config: dict | None = None) -> Flask:
     def inject_globals() -> dict:
         return {
             "current_user": _current_user(store),
+            "csrf_token": _ensure_csrf_token(),
+            "csrf_field": _csrf_field(),
             "algorithms": [
                 (AES_GCM_PASSPHRASE, "AES-GCM passphrase"),
                 (RSA_HYBRID, "RSA hybrid"),
             ],
         }
+
+    @app.before_request
+    def csrf_protect():
+        _ensure_csrf_token()
+        if request.method != "POST" or not current_app.config.get("CSRF_ENABLED"):
+            return None
+        if request.path.startswith("/api/"):
+            return None
+        expected = session.get("csrf_token") or ""
+        submitted = request.form.get("csrf_token") or ""
+        if not expected or not submitted or not hmac.compare_digest(str(expected), str(submitted)):
+            if _wants_json():
+                return jsonify({"error": "missing or invalid CSRF token"}), 400
+            return ("Missing or invalid CSRF token.", 400)
 
     @app.errorhandler(RequestEntityTooLarge)
     def too_large(_error: RequestEntityTooLarge):
@@ -138,6 +161,30 @@ def create_app(test_config: dict | None = None) -> Flask:
         session.clear()
         flash("Signed out.", "success")
         return redirect(url_for("index"))
+
+    @app.get("/account/password")
+    @login_required(store)
+    def password_form() -> str:
+        return render_template("account.html")
+
+    @app.post("/account/password")
+    @login_required(store)
+    def change_password() -> Response:
+        user = _current_user(store)
+        old_password = request.form.get("old_password") or ""
+        new_password = request.form.get("new_password") or ""
+        confirm_password = request.form.get("confirm_password") or ""
+        if new_password != confirm_password:
+            flash("New password and confirmation do not match.", "error")
+            return redirect(url_for("password_form"))
+        try:
+            store.change_password(user.id, old_password, new_password)
+        except (ValueError, CryptoError) as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("password_form"))
+        _audit(store, user.id, "password_change")
+        flash("Password updated. Your RSA private key was re-encrypted.", "success")
+        return redirect(url_for("dashboard"))
 
     @app.get("/dashboard")
     @login_required(store)
@@ -244,7 +291,17 @@ def create_app(test_config: dict | None = None) -> Flask:
                     aad=aad,
                 )
             _audit(store, user.id, "decrypt", asset.id)
-        except (LookupError, PermissionError, CryptoError) as exc:
+        except PermissionError as exc:
+            if _wants_json():
+                return jsonify({"error": str(exc)}), 403
+            flash(str(exc), "error")
+            return redirect(url_for("dashboard"))
+        except LookupError as exc:
+            if _wants_json():
+                return jsonify({"error": str(exc)}), 404
+            flash(str(exc), "error")
+            return redirect(url_for("dashboard"))
+        except CryptoError as exc:
             flash(str(exc), "error")
             return redirect(url_for("dashboard"))
 
@@ -274,6 +331,40 @@ def create_app(test_config: dict | None = None) -> Flask:
             return redirect(url_for("dashboard"))
 
         flash(f"Shared with {recipient_name.strip().lower()}.", "success")
+        return redirect(url_for("dashboard"))
+
+    @app.post("/share/<int:share_id>/revoke")
+    @login_required(store)
+    def revoke_share(share_id: int) -> Response:
+        user = _current_user(store)
+        try:
+            share = store.delete_share(share_id, user.id)
+            _audit(store, user.id, "revoke", share.asset_id)
+        except (LookupError, PermissionError) as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("dashboard"))
+        flash("Share revoked. The recipient can no longer decrypt this image.", "success")
+        return redirect(url_for("dashboard"))
+
+    @app.post("/images/<int:asset_id>/rotate-passphrase")
+    @login_required(store)
+    def rotate_passphrase(asset_id: int) -> Response:
+        user = _current_user(store)
+        old_passphrase = request.form.get("old_passphrase") or ""
+        new_passphrase = request.form.get("new_passphrase") or ""
+        try:
+            asset = _owned_asset(store, asset_id, user)
+            if asset.algorithm != AES_GCM_PASSPHRASE:
+                raise ValueError("Only AES-GCM passphrase wraps can be rotated this way.")
+            metadata = dict(asset.metadata)
+            data_key = unwrap_data_key(metadata["key_wrap"], passphrase=old_passphrase)
+            metadata["key_wrap"] = wrap_data_key_passphrase(data_key, new_passphrase)
+            store.update_asset_metadata(asset.id, user.id, metadata)
+            _audit(store, user.id, "rotate", asset.id)
+        except (LookupError, PermissionError, CryptoError, ValueError) as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("dashboard"))
+        flash("Passphrase wrap rotated. Use the new passphrase to decrypt.", "success")
         return redirect(url_for("dashboard"))
 
     @app.post("/images/<int:asset_id>/delete")
@@ -467,6 +558,19 @@ def jwt_required(store: VaultStore) -> Callable[[F], F]:
         return wrapped  # type: ignore[return-value]
 
     return decorator
+
+
+def _ensure_csrf_token() -> str:
+    token = session.get("csrf_token")
+    if not isinstance(token, str) or not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return token
+
+
+def _csrf_field() -> Markup:
+    token = escape(_ensure_csrf_token())
+    return Markup(f'<input type="hidden" name="csrf_token" value="{token}">')
 
 
 def _current_user(store: VaultStore) -> User | None:

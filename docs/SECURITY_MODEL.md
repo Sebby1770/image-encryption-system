@@ -17,7 +17,8 @@ plaintext and never hands the owner's passphrase to the recipient.
 
 ## Trust Boundaries
 
-- Browser to Flask app: session cookies and optional JWT bearer tokens.
+- Browser to Flask app: session cookies, CSRF tokens on HTML POSTs, and
+  optional JWT bearer tokens.
 - Flask app to local vault: encrypted files and SQLite metadata.
 - User password to RSA private key: private keys are encrypted at registration.
 - AES passphrase to AES data key: passphrases derive key-wrapping keys with
@@ -54,7 +55,13 @@ require a valid signed JWT. Audit events are scoped to the signed-in user.
 ## Operational Controls
 
 - Login attempts are rate limited (5 / 10 minutes per IP+username).
-- Eight failed passwords lock the username in process memory.
+- Eight failed passwords lock the username for 15 minutes. Counters live in
+  the `login_guard` SQLite table so a process restart does not reset them.
+- HTML POST forms require a session CSRF token; missing or invalid tokens
+  return 400. JSON `/api/*` routes are exempt and use JWTs instead.
+- Password changes re-encrypt the RSA private key PEM with the new password.
+- Owners can revoke a share (delete the per-recipient wrap row) and rotate a
+  passphrase wrap without rewriting ciphertext.
 - Uploads are capped at 8 MB by default.
 - Passwords are compared with Werkzeug's constant-time `check_password_hash`.
 - Backups export ciphertext and wrap metadata only — never private keys.
@@ -63,7 +70,7 @@ require a valid signed JWT. Audit events are scoped to the signed-in user.
 
 - Use HTTPS everywhere.
 - Store secrets in a managed secret store.
-- Persist rate limits and lockouts outside a single process.
+- Terminate sessions after a password change if cookies may be stolen.
 - Move encrypted objects to S3 with SSE-KMS or a similar managed storage layer.
 - Add malware and file-type scanning for uploads.
 - Consider envelope encryption with a managed KMS instead of local key files.

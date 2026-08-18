@@ -11,8 +11,10 @@ from image_encryption_system.crypto import (
     encrypt_image_bytes,
     generate_rsa_key_pair,
     pack_ies,
+    reencrypt_private_key_pem,
     unpack_ies,
     unwrap_data_key,
+    wrap_data_key_passphrase,
     wrap_data_key_rsa,
 )
 
@@ -120,4 +122,58 @@ def test_ies_container_round_trip() -> None:
 def test_unpack_ies_rejects_garbage() -> None:
     with pytest.raises(CryptoError):
         unpack_ies(b"not-an-ies-file")
+
+
+def test_reencrypt_private_key_pem_uses_new_password() -> None:
+    plaintext = sample_png()
+    private_pem, public_pem = generate_rsa_key_pair("old password 1")
+    encrypted = encrypt_image_bytes(plaintext, RSA_HYBRID, public_key_pem=public_pem)
+    rotated = reencrypt_private_key_pem(private_pem, "old password 1", "new password 2")
+
+    with pytest.raises(CryptoError):
+        decrypt_image_bytes(
+            encrypted.ciphertext,
+            encrypted.metadata,
+            private_key_pem=rotated,
+            private_key_passphrase="old password 1",
+        )
+
+    assert (
+        decrypt_image_bytes(
+            encrypted.ciphertext,
+            encrypted.metadata,
+            private_key_pem=rotated,
+            private_key_passphrase="new password 2",
+        )
+        == plaintext
+    )
+
+
+def test_passphrase_wrap_rotation_round_trip() -> None:
+    plaintext = sample_png()
+    encrypted = encrypt_image_bytes(
+        plaintext,
+        AES_GCM_PASSPHRASE,
+        passphrase="old image passphrase",
+    )
+    data_key = unwrap_data_key(
+        encrypted.metadata["key_wrap"],
+        passphrase="old image passphrase",
+    )
+    rotated_meta = {
+        **encrypted.metadata,
+        "key_wrap": wrap_data_key_passphrase(data_key, "new image passphrase"),
+    }
+
+    assert decrypt_image_bytes(
+        encrypted.ciphertext,
+        rotated_meta,
+        passphrase="new image passphrase",
+    ) == plaintext
+    with pytest.raises(CryptoError):
+        decrypt_image_bytes(
+            encrypted.ciphertext,
+            rotated_meta,
+            passphrase="old image passphrase",
+        )
 

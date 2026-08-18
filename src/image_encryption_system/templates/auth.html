@@ -18,6 +18,7 @@
         method="post"
         action="{% if mode == 'register' %}{{ url_for('register') }}{% else %}{{ url_for('login') }}{% endif %}"
       >
+        {{ csrf_field }}
         <label>
           Username
           <input name="username" type="text" autocomplete="username" required>
