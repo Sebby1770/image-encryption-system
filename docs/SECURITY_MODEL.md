@@ -25,6 +25,9 @@ plaintext and never hands the owner's passphrase to the recipient.
   Scrypt.
 - Owner to recipient: the same AES data key is re-wrapped with the recipient's
   RSA public key. The ciphertext blob is unchanged.
+- Owner to capability link: the data key is re-wrapped with a random token.
+  Only the SHA-256 of the token is stored. Anyone who has the URL can decrypt
+  until expiry, download cap, or revoke.
 
 ## Encryption Design
 

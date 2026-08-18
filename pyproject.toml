@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "image-encryption-system"
-version = "2.2.0"
-description = "Authenticated AES-256-GCM image vault with RSA key wrapping, sharing, session bump, and CLI."
+version = "2.3.0"
+description = "Authenticated AES-256-GCM image vault with RSA wrapping, capability links, and CLI."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

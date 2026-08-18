@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from hashlib import sha256
 from io import BytesIO
 import json
 from pathlib import Path, PurePosixPath
@@ -42,6 +43,8 @@ class EncryptedAsset:
     height: int
     metadata: dict[str, Any]
     created_at: str
+    notes: str = ""
+    favorite: bool = False
 
 
 @dataclass(frozen=True)
@@ -77,6 +80,39 @@ class ShareRecipient:
     share_id: int
     username: str
     expires_at: str | None = None
+
+
+@dataclass(frozen=True)
+class LinkShare:
+    id: int
+    asset_id: int
+    token_hash: str
+    key_wrap: dict[str, Any]
+    created_at: str
+    expires_at: str | None = None
+    max_downloads: int | None = None
+    download_count: int = 0
+    label: str = ""
+
+    def is_expired(self, now: datetime | None = None) -> bool:
+        if not self.expires_at:
+            return False
+        moment = now or datetime.now(timezone.utc)
+        expires = datetime.fromisoformat(self.expires_at)
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment >= expires
+
+    def remaining_downloads(self) -> int | None:
+        if self.max_downloads is None:
+            return None
+        return max(0, int(self.max_downloads) - int(self.download_count))
+
+    def is_exhausted(self) -> bool:
+        remaining = self.remaining_downloads()
+        return remaining is not None and remaining <= 0
 
 
 @dataclass(frozen=True)
@@ -137,6 +173,19 @@ class VaultStore:
                     UNIQUE (asset_id, recipient_user_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS link_shares (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    asset_id INTEGER NOT NULL,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    key_wrap_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT,
+                    max_downloads INTEGER,
+                    download_count INTEGER NOT NULL DEFAULT 0,
+                    label TEXT,
+                    FOREIGN KEY (asset_id) REFERENCES encrypted_assets (id) ON DELETE CASCADE
+                );
+
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER,
@@ -158,6 +207,7 @@ class VaultStore:
 
                 CREATE INDEX IF NOT EXISTS idx_assets_user ON encrypted_assets (user_id);
                 CREATE INDEX IF NOT EXISTS idx_shares_recipient ON shares (recipient_user_id);
+                CREATE INDEX IF NOT EXISTS idx_link_shares_asset ON link_shares (asset_id);
                 CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_events (user_id, id DESC);
                 CREATE INDEX IF NOT EXISTS idx_login_guard_lookup
                     ON login_guard (kind, username, ip, created_at);
@@ -170,6 +220,13 @@ class VaultStore:
                 "token_version INTEGER NOT NULL DEFAULT 1",
             )
             _ensure_column(db, "shares", "expires_at", "expires_at TEXT")
+            _ensure_column(db, "encrypted_assets", "notes", "notes TEXT NOT NULL DEFAULT ''")
+            _ensure_column(
+                db,
+                "encrypted_assets",
+                "favorite",
+                "favorite INTEGER NOT NULL DEFAULT 0",
+            )
 
     def create_user(self, username: str, password: str) -> User:
         username = username.strip().lower()
@@ -287,6 +344,13 @@ class VaultStore:
                 """,
                 (user_id,),
             )
+            db.execute(
+                """
+                DELETE FROM link_shares
+                WHERE asset_id IN (SELECT id FROM encrypted_assets WHERE user_id = ?)
+                """,
+                (user_id,),
+            )
             db.execute("DELETE FROM encrypted_assets WHERE user_id = ?", (user_id,))
             db.execute("DELETE FROM audit_events WHERE user_id = ?", (user_id,))
             db.execute("DELETE FROM login_guard WHERE username = ?", (user.username,))
@@ -309,20 +373,24 @@ class VaultStore:
         height: int,
         metadata: dict[str, Any],
         ciphertext: bytes,
+        notes: str = "",
+        favorite: bool = False,
     ) -> EncryptedAsset:
         safe_name = secure_filename(original_filename) or "image"
         stored_filename = f"{uuid4().hex}.enc"
         (self.vault_dir / stored_filename).write_bytes(ciphertext)
         now = _utc_now()
+        stored_meta = dict(metadata)
+        stored_meta.setdefault("ciphertext_sha256", sha256(ciphertext).hexdigest())
 
         with self._connect() as db:
             cursor = db.execute(
                 """
                 INSERT INTO encrypted_assets (
                     user_id, original_filename, stored_filename, algorithm, mime_type,
-                    image_format, width, height, metadata_json, created_at
+                    image_format, width, height, metadata_json, created_at, notes, favorite
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id,
@@ -333,8 +401,10 @@ class VaultStore:
                     image_format,
                     width,
                     height,
-                    json.dumps(metadata, sort_keys=True),
+                    json.dumps(stored_meta, sort_keys=True),
                     now,
+                    notes or "",
+                    1 if favorite else 0,
                 ),
             )
             asset_id = int(cursor.lastrowid)
@@ -353,16 +423,20 @@ class VaultStore:
         *,
         query: str | None = None,
         algorithm: str | None = None,
+        favorites_only: bool = False,
     ) -> list[EncryptedAsset]:
         sql = "SELECT * FROM encrypted_assets WHERE user_id = ?"
         params: list[Any] = [user_id]
         if query:
-            sql += " AND LOWER(original_filename) LIKE ?"
-            params.append(f"%{query.strip().lower()}%")
+            sql += " AND (LOWER(original_filename) LIKE ? OR LOWER(COALESCE(notes, '')) LIKE ?)"
+            needle = f"%{query.strip().lower()}%"
+            params.extend([needle, needle])
         if algorithm:
             sql += " AND algorithm = ?"
             params.append(algorithm)
-        sql += " ORDER BY id DESC"
+        if favorites_only:
+            sql += " AND favorite = 1"
+        sql += " ORDER BY favorite DESC, id DESC"
         with self._connect() as db:
             rows = db.execute(sql, params).fetchall()
         return [_asset_from_row(row) for row in rows]
@@ -374,6 +448,7 @@ class VaultStore:
         path = self.vault_dir / asset.stored_filename
         with self._connect() as db:
             db.execute("DELETE FROM shares WHERE asset_id = ?", (asset_id,))
+            db.execute("DELETE FROM link_shares WHERE asset_id = ?", (asset_id,))
             db.execute(
                 "DELETE FROM encrypted_assets WHERE id = ? AND user_id = ?",
                 (asset_id, user_id),
@@ -384,6 +459,51 @@ class VaultStore:
 
     def read_ciphertext(self, asset: EncryptedAsset) -> bytes:
         return (self.vault_dir / asset.stored_filename).read_bytes()
+
+    def update_asset_details(
+        self,
+        asset_id: int,
+        user_id: int,
+        *,
+        original_filename: str | None = None,
+        notes: str | None = None,
+        favorite: bool | None = None,
+    ) -> EncryptedAsset:
+        asset = self.get_asset(asset_id)
+        if asset.user_id != user_id:
+            raise PermissionError("You do not have access to this encrypted image.")
+        next_name = (
+            secure_filename(original_filename) or asset.original_filename
+            if original_filename is not None
+            else asset.original_filename
+        )
+        if original_filename is not None and not next_name:
+            raise ValueError("Filename is required.")
+        next_notes = asset.notes if notes is None else notes
+        next_favorite = asset.favorite if favorite is None else bool(favorite)
+        with self._connect() as db:
+            db.execute(
+                """
+                UPDATE encrypted_assets
+                SET original_filename = ?, notes = ?, favorite = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (next_name, next_notes, 1 if next_favorite else 0, asset_id, user_id),
+            )
+        return self.get_asset(asset_id)
+
+    def delete_assets(self, asset_ids: list[int], user_id: int) -> list[EncryptedAsset]:
+        deleted: list[EncryptedAsset] = []
+        for asset_id in asset_ids:
+            deleted.append(self.delete_asset(int(asset_id), user_id))
+        return deleted
+
+    def ciphertext_sha256(self, asset: EncryptedAsset) -> str:
+        digest = sha256(self.read_ciphertext(asset)).hexdigest()
+        stored = str((asset.metadata or {}).get("ciphertext_sha256") or "")
+        if stored and stored != digest:
+            raise ValueError("Ciphertext integrity check failed.")
+        return digest
 
     def update_asset_metadata(
         self,
@@ -536,6 +656,129 @@ class VaultStore:
             )
         return mapping
 
+    def create_link_share(
+        self,
+        *,
+        asset_id: int,
+        token_hash: str,
+        key_wrap: dict[str, Any],
+        expires_at: str | None = None,
+        max_downloads: int | None = None,
+        label: str = "",
+    ) -> LinkShare:
+        now = _utc_now()
+        with self._connect() as db:
+            cursor = db.execute(
+                """
+                INSERT INTO link_shares (
+                    asset_id, token_hash, key_wrap_json, created_at,
+                    expires_at, max_downloads, download_count, label
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+                """,
+                (
+                    asset_id,
+                    token_hash,
+                    json.dumps(key_wrap, sort_keys=True),
+                    now,
+                    expires_at,
+                    max_downloads,
+                    label or "",
+                ),
+            )
+            link_id = int(cursor.lastrowid)
+        link = self.get_link_share(link_id)
+        if link is None:
+            raise RuntimeError("Link share was not persisted.")
+        return link
+
+    def get_link_share(self, link_id: int) -> LinkShare | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM link_shares WHERE id = ?",
+                (link_id,),
+            ).fetchone()
+        return _link_from_row(row) if row else None
+
+    def get_link_share_by_token_hash(self, token_hash: str) -> LinkShare | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM link_shares WHERE token_hash = ?",
+                (token_hash,),
+            ).fetchone()
+        return _link_from_row(row) if row else None
+
+    def increment_link_download(self, link_id: int) -> LinkShare:
+        with self._connect() as db:
+            db.execute(
+                """
+                UPDATE link_shares
+                SET download_count = download_count + 1
+                WHERE id = ?
+                """,
+                (link_id,),
+            )
+        link = self.get_link_share(link_id)
+        if link is None:
+            raise LookupError("Link share not found.")
+        return link
+
+    def delete_link_share(self, link_id: int, owner_user_id: int) -> LinkShare:
+        with self._connect() as db:
+            row = db.execute(
+                """
+                SELECT ls.*, ea.user_id AS owner_user_id
+                FROM link_shares AS ls
+                JOIN encrypted_assets AS ea ON ea.id = ls.asset_id
+                WHERE ls.id = ?
+                """,
+                (link_id,),
+            ).fetchone()
+            if row is None:
+                raise LookupError("Link share not found.")
+            if int(row["owner_user_id"]) != owner_user_id:
+                raise PermissionError("You can only revoke links you created.")
+            link = _link_from_row(row)
+            db.execute("DELETE FROM link_shares WHERE id = ?", (link_id,))
+        return link
+
+    def list_link_shares_for_owner(self, owner_user_id: int) -> dict[int, list[LinkShare]]:
+        with self._connect() as db:
+            rows = db.execute(
+                """
+                SELECT ls.*
+                FROM link_shares AS ls
+                JOIN encrypted_assets AS ea ON ea.id = ls.asset_id
+                WHERE ea.user_id = ?
+                ORDER BY ls.id DESC
+                """,
+                (owner_user_id,),
+            ).fetchall()
+        mapping: dict[int, list[LinkShare]] = {}
+        for row in rows:
+            link = _link_from_row(row)
+            mapping.setdefault(link.asset_id, []).append(link)
+        return mapping
+
+    def sweep_expired_shares(self, now: datetime | None = None) -> int:
+        stamp = (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")
+        with self._connect() as db:
+            shares = db.execute(
+                """
+                DELETE FROM shares
+                WHERE expires_at IS NOT NULL AND expires_at <= ?
+                """,
+                (stamp,),
+            )
+            links = db.execute(
+                """
+                DELETE FROM link_shares
+                WHERE expires_at IS NOT NULL AND expires_at <= ?
+                """,
+                (stamp,),
+            )
+            return int(shares.rowcount or 0) + int(links.rowcount or 0)
+
     def login_guard_locked_until(self, username: str) -> float | None:
         with self._connect() as db:
             row = db.execute(
@@ -687,6 +930,8 @@ class VaultStore:
                         "metadata": asset.metadata,
                         "blob": blob_name,
                         "created_at": asset.created_at,
+                        "notes": asset.notes,
+                        "favorite": asset.favorite,
                     }
                 )
             archive.writestr("manifest.json", json.dumps(manifest, indent=2, sort_keys=True))
@@ -732,6 +977,8 @@ class VaultStore:
                     height=int(item.get("height") or 0),
                     metadata=metadata,
                     ciphertext=ciphertext,
+                    notes=str(item.get("notes") or ""),
+                    favorite=bool(item.get("favorite")),
                 )
                 restored += 1
         return restored
@@ -767,6 +1014,9 @@ def _user_from_row(row: sqlite3.Row) -> User:
 
 
 def _asset_from_row(row: sqlite3.Row) -> EncryptedAsset:
+    keys = set(row.keys())
+    notes = str(row["notes"]) if "notes" in keys and row["notes"] is not None else ""
+    favorite = bool(int(row["favorite"])) if "favorite" in keys and row["favorite"] is not None else False
     return EncryptedAsset(
         id=int(row["id"]),
         user_id=int(row["user_id"]),
@@ -779,6 +1029,26 @@ def _asset_from_row(row: sqlite3.Row) -> EncryptedAsset:
         height=int(row["height"]),
         metadata=json.loads(str(row["metadata_json"])),
         created_at=str(row["created_at"]),
+        notes=notes,
+        favorite=favorite,
+    )
+
+
+def _link_from_row(row: sqlite3.Row) -> LinkShare:
+    keys = set(row.keys())
+    max_downloads = row["max_downloads"] if "max_downloads" in keys else None
+    download_count = row["download_count"] if "download_count" in keys else 0
+    label = row["label"] if "label" in keys else ""
+    return LinkShare(
+        id=int(row["id"]),
+        asset_id=int(row["asset_id"]),
+        token_hash=str(row["token_hash"]),
+        key_wrap=json.loads(str(row["key_wrap_json"])),
+        created_at=str(row["created_at"]),
+        expires_at=_optional_text(row["expires_at"]) if "expires_at" in keys else None,
+        max_downloads=int(max_downloads) if max_downloads is not None else None,
+        download_count=int(download_count or 0),
+        label=str(label or ""),
     )
 
 

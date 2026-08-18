@@ -1,5 +1,28 @@
 # Changelog
 
+## 2.3.0 - 2026-08-18
+
+### Added
+
+- Capability link shares: `POST /images/<id>/link` and `POST /api/images/<id>/link`
+  wrap the AES data key with a random token. Anyone with `/l/<token>` can decrypt
+  without an account. Optional `expires_hours` and `max_downloads`. The token is
+  stored only as SHA-256; revoke with `POST /link/<id>/revoke`.
+- Rename, notes, and favorites on vault items (`POST /images/<id>/meta`).
+  Dashboard search matches notes; `?favorites=1` filters starred images.
+- Ciphertext SHA-256 recorded at save time and checked before decrypt. Tampered
+  blobs fail closed. CLI `ies hash` prints the digest.
+- Session idle timeout (`IES_SESSION_IDLE_SECONDS`, default 30 minutes).
+- Audit CSV export at `GET /audit.csv`. RSA public key download at
+  `GET /account/public-key`.
+- CLI `ies rewrap` rotates the passphrase wrap on a portable `.ies` file without
+  rewriting ciphertext.
+- Expired user shares and capability links are swept on dashboard load.
+
+### Changed
+
+- Package version is 2.3.0.
+
 ## 2.2.0 - 2026-08-18
 
 ### Added

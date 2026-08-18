@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from functools import wraps
+from hashlib import sha256
 import hmac
 from io import BytesIO
 from pathlib import Path
 import secrets
 from sqlite3 import IntegrityError
+import time
 from typing import Callable, TypeVar
 
 import jwt
@@ -41,7 +43,7 @@ from .crypto import (
     wrap_data_key_rsa,
 )
 from .security import LoginGuard
-from .storage import AssetShare, EncryptedAsset, User, VaultStore
+from .storage import AssetShare, EncryptedAsset, LinkShare, User, VaultStore
 
 
 F = TypeVar("F", bound=Callable)
@@ -93,7 +95,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         _ensure_csrf_token()
         if request.method != "POST" or not current_app.config.get("CSRF_ENABLED"):
             return None
-        if request.path.startswith("/api/"):
+        if request.path.startswith("/api/") or request.path.startswith("/l/"):
             return None
         expected = session.get("csrf_token") or ""
         submitted = request.form.get("csrf_token") or ""
@@ -207,20 +209,30 @@ def create_app(test_config: dict | None = None) -> Flask:
     @login_required(store)
     def dashboard() -> str:
         user = _current_user(store)
+        store.sweep_expired_shares()
         query = (request.args.get("q") or "").strip()
         algorithm = (request.args.get("algorithm") or "").strip() or None
-        assets = store.list_assets(user.id, query=query or None, algorithm=algorithm)
+        favorites_only = (request.args.get("favorites") or "").strip() in {"1", "true", "on"}
+        assets = store.list_assets(
+            user.id,
+            query=query or None,
+            algorithm=algorithm,
+            favorites_only=favorites_only,
+        )
         shared_items = store.list_shared_with_user(
             user.id, query=query or None, algorithm=algorithm
         )
         recipients = store.list_recipients_for_owner(user.id)
+        links = store.list_link_shares_for_owner(user.id)
         return render_template(
             "dashboard.html",
             assets=assets,
             shared_items=shared_items,
             recipients=recipients,
+            links=links,
             query=query,
             selected_algorithm=algorithm or "",
+            favorites_only=favorites_only,
         )
 
     @app.post("/images")
@@ -286,6 +298,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         try:
             asset, share = _accessible_asset(store, asset_id, user)
             ciphertext = store.read_ciphertext(asset)
+            store.ciphertext_sha256(asset)
             aad = _aad_from_metadata(asset)
             metadata = dict(asset.metadata)
             if share is not None:
@@ -319,7 +332,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                 return jsonify({"error": str(exc)}), 404
             flash(str(exc), "error")
             return redirect(url_for("dashboard"))
-        except CryptoError as exc:
+        except (CryptoError, ValueError) as exc:
             flash(str(exc), "error")
             return redirect(url_for("dashboard"))
 
@@ -393,6 +406,140 @@ def create_app(test_config: dict | None = None) -> Flask:
         flash("Passphrase wrap rotated. Use the new passphrase to decrypt.", "success")
         return redirect(url_for("dashboard"))
 
+    @app.post("/images/<int:asset_id>/meta")
+    @login_required(store)
+    def update_image_meta(asset_id: int) -> Response:
+        user = _current_user(store)
+        favorite = str(request.form.get("favorite") or "").strip() in {"1", "true", "on", "yes"}
+        try:
+            asset = store.update_asset_details(
+                asset_id,
+                user.id,
+                original_filename=request.form.get("filename"),
+                notes=request.form.get("notes"),
+                favorite=favorite,
+            )
+            _audit(store, user.id, "meta", asset.id)
+        except (LookupError, PermissionError, ValueError) as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("dashboard"))
+        flash(f"Updated {asset.original_filename}.", "success")
+        return redirect(url_for("dashboard"))
+
+    @app.post("/images/delete-many")
+    @login_required(store)
+    def delete_many_images() -> Response:
+        user = _current_user(store)
+        raw_ids = request.form.getlist("asset_id")
+        ids: list[int] = []
+        for value in raw_ids:
+            try:
+                ids.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        deleted = 0
+        for asset_id in ids:
+            try:
+                asset = store.delete_asset(asset_id, user.id)
+                _audit(store, user.id, "delete", asset.id)
+                deleted += 1
+            except (LookupError, PermissionError):
+                continue
+        flash(f"Deleted {deleted} encrypted image(s).", "success")
+        return redirect(url_for("dashboard"))
+
+    @app.post("/images/<int:asset_id>/link")
+    @login_required(store)
+    def create_link_share(asset_id: int) -> Response:
+        user = _current_user(store)
+        try:
+            token, link = _create_link_share(
+                store,
+                owner=user,
+                asset_id=asset_id,
+                passphrase=request.form.get("passphrase") or None,
+                private_key_passphrase=request.form.get("private_key_passphrase") or None,
+                expires_at=_parse_share_expiry(
+                    request.form.get("expires_hours"),
+                    request.form.get("expires_days"),
+                ),
+                max_downloads=_parse_optional_int(request.form.get("max_downloads")),
+                label=(request.form.get("label") or "").strip(),
+            )
+        except (LookupError, PermissionError, CryptoError, ValueError) as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("dashboard"))
+        url = url_for("open_link_share", token=token, _external=True)
+        flash(
+            f"Capability link created for download cap {link.max_downloads or 'unlimited'}. "
+            f"Copy now (shown once): {url}",
+            "success",
+        )
+        return redirect(url_for("dashboard"))
+
+    @app.post("/link/<int:link_id>/revoke")
+    @login_required(store)
+    def revoke_link_share(link_id: int) -> Response:
+        user = _current_user(store)
+        try:
+            link = store.delete_link_share(link_id, user.id)
+            _audit(store, user.id, "revoke_link", link.asset_id)
+        except (LookupError, PermissionError) as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("dashboard"))
+        flash("Capability link revoked.", "success")
+        return redirect(url_for("dashboard"))
+
+    @app.get("/l/<token>")
+    def open_link_share(token: str):
+        store.sweep_expired_shares()
+        try:
+            link, asset = _resolve_link(store, token)
+        except (LookupError, PermissionError) as exc:
+            if _wants_json():
+                return jsonify({"error": str(exc)}), 404
+            return (str(exc), 404)
+        return render_template("link.html", asset=asset, link=link, token=token)
+
+    @app.post("/l/<token>/decrypt")
+    def decrypt_link_share(token: str):
+        try:
+            plaintext, asset = _decrypt_link(store, token, count=True)
+        except PermissionError as exc:
+            return jsonify({"error": str(exc)}), 403
+        except LookupError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except (CryptoError, ValueError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        return send_file(
+            BytesIO(plaintext),
+            mimetype=asset.mime_type,
+            download_name=asset.original_filename,
+            as_attachment=True,
+        )
+
+    @app.get("/l/<token>/blob")
+    def download_link_blob(token: str):
+        try:
+            link, asset = _resolve_link(store, token)
+            store.ciphertext_sha256(asset)
+            metadata = dict(asset.metadata)
+            metadata["key_wrap"] = link.key_wrap
+            blob = pack_ies(store.read_ciphertext(asset), metadata)
+            store.increment_link_download(link.id)
+        except PermissionError as exc:
+            return jsonify({"error": str(exc)}), 403
+        except LookupError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return send_file(
+            BytesIO(blob),
+            mimetype="application/octet-stream",
+            download_name=f"{asset.original_filename}.ies",
+            as_attachment=True,
+        )
+
     @app.post("/images/<int:asset_id>/delete")
     @login_required(store)
     def delete_image(asset_id: int) -> Response:
@@ -430,6 +577,38 @@ def create_app(test_config: dict | None = None) -> Flask:
         user = _current_user(store)
         events = store.list_audit_events(user.id)
         return render_template("audit.html", events=events)
+
+    @app.get("/audit.csv")
+    @login_required(store)
+    def audit_csv() -> Response:
+        user = _current_user(store)
+        events = store.list_audit_events(user.id, limit=2000)
+        lines = ["id,action,asset_id,ip,created_at"]
+        for event in events:
+            asset = "" if event.asset_id is None else str(event.asset_id)
+            ip = (event.ip or "").replace('"', '""')
+            lines.append(
+                f'{event.id},{event.action},{asset},"{ip}",{event.created_at}'
+            )
+        payload = "\n".join(lines) + "\n"
+        return Response(
+            payload,
+            mimetype="text/csv",
+            headers={
+                "Content-Disposition": f'attachment; filename="ies-audit-{user.username}.csv"'
+            },
+        )
+
+    @app.get("/account/public-key")
+    @login_required(store)
+    def download_public_key() -> Response:
+        user = _current_user(store)
+        return send_file(
+            BytesIO(store.read_public_key(user.id)),
+            mimetype="application/x-pem-file",
+            download_name=f"{user.username}-public.pem",
+            as_attachment=True,
+        )
 
     @app.get("/backup")
     @login_required(store)
@@ -539,6 +718,38 @@ def create_app(test_config: dict | None = None) -> Flask:
             }
         )
 
+    @app.post("/api/images/<int:asset_id>/link")
+    @jwt_required(store)
+    def api_create_link(asset_id: int) -> Response:
+        user = g.api_user
+        payload = request.get_json(silent=True) or {}
+        try:
+            token, link = _create_link_share(
+                store,
+                owner=user,
+                asset_id=asset_id,
+                passphrase=payload.get("passphrase") or None,
+                private_key_passphrase=payload.get("private_key_passphrase") or None,
+                expires_at=_parse_share_expiry(
+                    payload.get("expires_hours"),
+                    payload.get("expires_days"),
+                ),
+                max_downloads=_parse_optional_int(payload.get("max_downloads")),
+                label=str(payload.get("label") or ""),
+            )
+        except (LookupError, PermissionError, CryptoError, ValueError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify(
+            {
+                "ok": True,
+                "link_id": link.id,
+                "token": token,
+                "url": url_for("open_link_share", token=token, _external=True),
+                "expires_at": link.expires_at,
+                "max_downloads": link.max_downloads,
+            }
+        )
+
     @app.get("/api/audit")
     @jwt_required(store)
     def api_audit() -> Response:
@@ -621,6 +832,7 @@ def _establish_session(user: User) -> None:
     session.clear()
     session["user_id"] = user.id
     session["token_version"] = user.token_version
+    session["last_seen"] = time.time()
 
 
 def _current_user(store: VaultStore) -> User | None:
@@ -641,6 +853,17 @@ def _current_user(store: VaultStore) -> User | None:
     if cookie_version != user.token_version:
         session.clear()
         return None
+    idle = int(current_app.config.get("SESSION_IDLE_SECONDS", 1800) or 0)
+    if idle > 0:
+        try:
+            last_seen = float(session.get("last_seen") or 0)
+        except (TypeError, ValueError):
+            last_seen = 0.0
+        now = time.time()
+        if last_seen and now - last_seen > idle:
+            session.clear()
+            return None
+        session["last_seen"] = now
     return user
 
 
@@ -700,6 +923,83 @@ def _share_asset(
     return share
 
 
+def _hash_link_token(token: str) -> str:
+    return sha256(token.encode("utf-8")).hexdigest()
+
+
+def _create_link_share(
+    store: VaultStore,
+    *,
+    owner: User,
+    asset_id: int,
+    passphrase: str | None,
+    private_key_passphrase: str | None,
+    expires_at: str | None = None,
+    max_downloads: int | None = None,
+    label: str = "",
+) -> tuple[str, LinkShare]:
+    asset = _owned_asset(store, asset_id, owner)
+    if max_downloads is not None and max_downloads <= 0:
+        raise ValueError("max_downloads must be greater than zero.")
+    data_key = unwrap_data_key(
+        asset.metadata["key_wrap"],
+        passphrase=passphrase,
+        private_key_pem=store.read_private_key(owner.id) if asset.algorithm == RSA_HYBRID else None,
+        private_key_passphrase=private_key_passphrase if asset.algorithm == RSA_HYBRID else None,
+    )
+    token = secrets.token_urlsafe(32)
+    wrap = wrap_data_key_passphrase(data_key, token)
+    link = store.create_link_share(
+        asset_id=asset.id,
+        token_hash=_hash_link_token(token),
+        key_wrap=wrap,
+        expires_at=expires_at,
+        max_downloads=max_downloads,
+        label=label,
+    )
+    _audit(store, owner.id, "link", asset.id)
+    return token, link
+
+
+def _resolve_link(store: VaultStore, token: str) -> tuple[LinkShare, EncryptedAsset]:
+    link = store.get_link_share_by_token_hash(_hash_link_token(token))
+    if link is None:
+        raise LookupError("Link not found.")
+    if link.is_expired() or link.is_exhausted():
+        raise PermissionError("This capability link is no longer valid.")
+    return link, store.get_asset(link.asset_id)
+
+
+def _decrypt_link(
+    store: VaultStore, token: str, *, count: bool
+) -> tuple[bytes, EncryptedAsset]:
+    link, asset = _resolve_link(store, token)
+    store.ciphertext_sha256(asset)
+    metadata = dict(asset.metadata)
+    metadata["key_wrap"] = link.key_wrap
+    plaintext = decrypt_image_bytes(
+        store.read_ciphertext(asset),
+        metadata,
+        passphrase=token,
+        aad=_aad_from_metadata(asset),
+    )
+    if count:
+        store.increment_link_download(link.id)
+    return plaintext, asset
+
+
+def _parse_optional_int(raw: object) -> int | None:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError as exc:
+        raise ValueError("Expected a whole number.") from exc
+
+
 def _guard_login(app: Flask, username: str, *, json_mode: bool):
     guard: LoginGuard = app.extensions["login_guard"]
     verdict = guard.precheck(request.remote_addr or "", username)
@@ -748,6 +1048,8 @@ def _asset_payload(asset: EncryptedAsset) -> dict:
         "format": asset.image_format,
         "size": {"width": asset.width, "height": asset.height},
         "created_at": asset.created_at,
+        "notes": asset.notes,
+        "favorite": asset.favorite,
     }
 
 

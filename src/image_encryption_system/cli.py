@@ -6,6 +6,8 @@ from pathlib import Path
 import sys
 from typing import Sequence
 
+from hashlib import sha256
+
 from .crypto import (
     AES_GCM_PASSPHRASE,
     RSA_HYBRID,
@@ -17,6 +19,7 @@ from .crypto import (
     pack_ies,
     unpack_ies,
     unwrap_data_key,
+    wrap_data_key_passphrase,
 )
 
 
@@ -52,6 +55,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     verify_parser.add_argument("--passphrase", "-p", help="AES or private-key passphrase")
     verify_parser.add_argument("--private-key", type=Path, help="RSA private key (PEM)")
 
+    rewrap_parser = subparsers.add_parser(
+        "rewrap", help="Rotate the passphrase wrap on an .ies file (ciphertext unchanged)."
+    )
+    rewrap_parser.add_argument("input", type=Path, help="Input vault file")
+    rewrap_parser.add_argument("--out", "-o", type=Path, required=True, help="Output vault file")
+    rewrap_parser.add_argument("--old-passphrase", help="Current AES passphrase")
+    rewrap_parser.add_argument("--new-passphrase", help="Replacement AES passphrase")
+
+    hash_parser = subparsers.add_parser("hash", help="Print SHA-256 of the ciphertext payload.")
+    hash_parser.add_argument("input", type=Path, help="Input vault file")
+
     args = parser.parse_args(list(argv) if argv is not None else None)
     try:
         if args.command == "encrypt":
@@ -64,6 +78,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _inspect(args)
         if args.command == "verify":
             return _verify(args)
+        if args.command == "rewrap":
+            return _rewrap(args)
+        if args.command == "hash":
+            return _hash(args)
     except (CryptoError, OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -101,6 +119,7 @@ def _encrypt(args: argparse.Namespace) -> int:
         **result.metadata,
         "aad": {"source": "cli", "filename": source.name},
         "original_filename": source.name,
+        "ciphertext_sha256": sha256(result.ciphertext).hexdigest(),
     }
     args.out.write_bytes(pack_ies(result.ciphertext, metadata))
     return 0
@@ -148,16 +167,22 @@ def _inspect(args: argparse.Namespace) -> int:
     source: Path = args.input
     if not source.is_file():
         raise ValueError(f"input file not found: {source}")
-    _ciphertext, metadata = unpack_ies(source.read_bytes())
+    ciphertext, metadata = unpack_ies(source.read_bytes())
     wrap = metadata.get("key_wrap")
     wrap_type = wrap.get("type") if isinstance(wrap, dict) else None
     original = metadata.get("original_filename")
+    digest = sha256(ciphertext).hexdigest()
     print(f"version: {metadata.get('version', '')}")
     print(f"algorithm: {metadata.get('algorithm', '')}")
     if wrap_type:
         print(f"wrap: {wrap_type}")
     if original:
         print(f"original_filename: {original}")
+    print(f"ciphertext_sha256: {digest}")
+    stored = metadata.get("ciphertext_sha256")
+    if stored:
+        print(f"stored_sha256: {stored}")
+        print("integrity: ok" if stored == digest else "integrity: mismatch")
     return 0
 
 
@@ -184,6 +209,32 @@ def _verify(args: argparse.Namespace) -> int:
         private_key_passphrase=passphrase if private_key is not None else None,
     )
     print("ok")
+    return 0
+
+
+def _rewrap(args: argparse.Namespace) -> int:
+    source: Path = args.input
+    if not source.is_file():
+        raise ValueError(f"input file not found: {source}")
+    ciphertext, metadata = unpack_ies(source.read_bytes())
+    key_wrap = metadata.get("key_wrap")
+    if not isinstance(key_wrap, dict):
+        raise CryptoError("Encrypted image metadata is incomplete.")
+    old_passphrase = args.old_passphrase or getpass("Current AES passphrase: ")
+    new_passphrase = args.new_passphrase or getpass("New AES passphrase: ")
+    data_key = unwrap_data_key(key_wrap, passphrase=old_passphrase)
+    metadata["key_wrap"] = wrap_data_key_passphrase(data_key, new_passphrase)
+    metadata["ciphertext_sha256"] = sha256(ciphertext).hexdigest()
+    args.out.write_bytes(pack_ies(ciphertext, metadata))
+    return 0
+
+
+def _hash(args: argparse.Namespace) -> int:
+    source: Path = args.input
+    if not source.is_file():
+        raise ValueError(f"input file not found: {source}")
+    ciphertext, _metadata = unpack_ies(source.read_bytes())
+    print(sha256(ciphertext).hexdigest())
     return 0
 
 

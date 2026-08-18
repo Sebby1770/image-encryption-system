@@ -1,0 +1,23 @@
+{% extends "layout.html" %}
+
+{% block title %}Shared image - Image Encryption System{% endblock %}
+
+{% block content %}
+  <section class="auth-grid">
+    <div class="auth-panel">
+      <h1>{{ asset.original_filename }}</h1>
+      <p>{{ asset.image_format }} · {{ asset.width }}x{{ asset.height }}</p>
+      <p class="field-note">
+        This page does not require an account. The secret in the URL unwraps the AES data key.
+        {% if link.expires_at %}Expires {{ link.expires_at }}.{% endif %}
+        {% if link.max_downloads is not none %}
+          {{ link.remaining_downloads() }} of {{ link.max_downloads }} download(s) remaining.
+        {% endif %}
+      </p>
+      <form method="post" action="{{ url_for('decrypt_link_share', token=token) }}">
+        <button class="button button-primary" type="submit">Decrypt and download</button>
+      </form>
+      <p><a class="button button-ghost" href="{{ url_for('download_link_blob', token=token) }}">Download .ies ciphertext</a></p>
+    </div>
+  </section>
+{% endblock %}

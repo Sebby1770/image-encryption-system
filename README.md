@@ -2,8 +2,8 @@
 
 A Flask image vault that encrypts photos with **AES-256-GCM** before they touch
 disk. Per-image data keys are wrapped with Scrypt+AES or RSA-OAEP. Version
-**2.2.0** adds session/JWT bump on password change, share expiry, account
-delete, EXIF stripping on upload, and CLI inspect/verify.
+**2.3.0** adds capability link shares, notes/favorites, ciphertext integrity
+checks, session idle timeout, audit CSV, and CLI rewrap/hash.
 
 ## Features
 
@@ -26,7 +26,12 @@ delete, EXIF stripping on upload, and CLI inspect/verify.
 - CSRF tokens on every HTML POST form.
 - Owner-only audit log (web + `GET /api/audit`).
 - Encrypted backup zip (ciphertext + metadata, never private keys) and restore.
-- `ies` CLI for offline encrypt / decrypt / keygen / inspect / verify.
+- Capability links (`/l/<token>`) for people without accounts; optional expiry
+  and download cap. Token is stored hashed.
+- Rename, notes, and favorites on vault items.
+- Ciphertext SHA-256 integrity check before decrypt.
+- Session idle timeout (default 30 minutes).
+- `ies` CLI for offline encrypt / decrypt / keygen / inspect / verify / rewrap / hash.
 - Login rate limit (5 / 10 minutes, IP+user) and lockout after 8 failures,
   persisted in SQLite so a restart does not reset the counter.
 - 8 MB default upload limit; download ciphertext as `.ies`.
@@ -63,6 +68,8 @@ ies encrypt IN.png --passphrase 'a long secret' --out out.bin
 ies decrypt out.bin --passphrase 'a long secret' --out restored.png
 ies inspect out.bin
 ies verify out.bin --passphrase 'a long secret'
+ies hash out.bin
+ies rewrap out.bin --old-passphrase 'a long secret' --new-passphrase 'rotated' --out rotated.ies
 ies keygen --passphrase 'account password' --out-private key.pem --out-public pub.pem
 ies encrypt IN.png --public-key pub.pem --out photo.ies
 ies decrypt photo.ies --private-key key.pem --passphrase 'account password' --out restored.png

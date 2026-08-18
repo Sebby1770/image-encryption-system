@@ -76,6 +76,10 @@
               {% endfor %}
             </select>
           </label>
+          <label>
+            <input name="favorites" type="checkbox" value="1" {% if favorites_only %}checked{% endif %}>
+            Favorites
+          </label>
           <button class="button button-ghost" type="submit">Filter</button>
         </form>
       </div>
@@ -85,9 +89,12 @@
           {% for asset in assets %}
             <article class="asset-card">
               <div>
-                <h3>{{ asset.original_filename }}</h3>
+                <h3>{{ asset.original_filename }}{% if asset.favorite %} ★{% endif %}</h3>
                 <p>{{ asset.algorithm }} · {{ asset.image_format }} · {{ asset.width }}x{{ asset.height }}</p>
                 <small>{{ asset.created_at }}</small>
+                {% if asset.notes %}
+                  <p class="field-note">{{ asset.notes }}</p>
+                {% endif %}
                 {% if recipients.get(asset.id) %}
                   <ul class="recipient-list">
                     {% for rec in recipients[asset.id] %}
@@ -101,6 +108,26 @@
                         <form method="post" action="{{ url_for('revoke_share', share_id=rec.share_id) }}">
                           {{ csrf_field }}
                           <button class="button button-danger" type="submit">Revoke</button>
+                        </form>
+                      </li>
+                    {% endfor %}
+                  </ul>
+                {% endif %}
+                {% if links.get(asset.id) %}
+                  <ul class="recipient-list">
+                    {% for link in links[asset.id] %}
+                      <li class="recipient-row">
+                        <span class="share-note">
+                          Link #{{ link.id }}
+                          {% if link.label %} · {{ link.label }}{% endif %}
+                          · used {{ link.download_count }}{% if link.max_downloads %}/{{ link.max_downloads }}{% endif %}
+                          {% if link.expires_at %}
+                            <span class="expiry-note">· expires {{ link.expires_at }}</span>
+                          {% endif %}
+                        </span>
+                        <form method="post" action="{{ url_for('revoke_link_share', link_id=link.id) }}">
+                          {{ csrf_field }}
+                          <button class="button button-danger" type="submit">Revoke link</button>
                         </form>
                       </li>
                     {% endfor %}
@@ -131,12 +158,38 @@
                     data-algorithm="{{ asset.algorithm }}"
                     data-filename="{{ asset.original_filename }}"
                   >Share</button>
+                  <button
+                    class="button button-ghost link-open"
+                    type="button"
+                    data-asset-id="{{ asset.id }}"
+                    data-algorithm="{{ asset.algorithm }}"
+                    data-filename="{{ asset.original_filename }}"
+                  >Link</button>
                   <a class="button button-ghost" href="{{ url_for('download_ciphertext', asset_id=asset.id) }}">.ies</a>
                   <form method="post" action="{{ url_for('delete_image', asset_id=asset.id) }}" onsubmit="return confirm('Delete this ciphertext permanently?');">
                     {{ csrf_field }}
                     <button class="button button-danger" type="submit">Delete</button>
                   </form>
                 </div>
+                <details class="rotate-details">
+                  <summary>Rename / notes</summary>
+                  <form method="post" action="{{ url_for('update_image_meta', asset_id=asset.id) }}" class="rotate-form">
+                    {{ csrf_field }}
+                    <label>
+                      Filename
+                      <input name="filename" type="text" value="{{ asset.original_filename }}" required>
+                    </label>
+                    <label>
+                      Notes
+                      <input name="notes" type="text" value="{{ asset.notes }}" placeholder="Optional note (stored unencrypted)">
+                    </label>
+                    <label>
+                      <input name="favorite" type="checkbox" value="1" {% if asset.favorite %}checked{% endif %}>
+                      Favorite
+                    </label>
+                    <button class="button button-ghost" type="submit">Save details</button>
+                  </form>
+                </details>
                 {% if asset.algorithm == "AES-GCM" %}
                   <details class="rotate-details">
                     <summary>Rotate passphrase</summary>
@@ -204,6 +257,38 @@
       </section>
     </section>
   </section>
+
+  <dialog class="share-modal" id="link-modal">
+    <form method="post" id="link-form">
+      {{ csrf_field }}
+      <h2>Capability link for <span id="link-filename">image</span></h2>
+      <p class="field-note">Creates a secret URL. Anyone with the token can decrypt without an account. The token is shown once.</p>
+      <label>
+        Expires in hours (optional)
+        <input name="expires_hours" type="number" min="1" step="1" placeholder="Never">
+      </label>
+      <label>
+        Max downloads (optional)
+        <input name="max_downloads" type="number" min="1" step="1" placeholder="Unlimited">
+      </label>
+      <label>
+        Label (optional)
+        <input name="label" type="text" placeholder="reviewer, printer, …">
+      </label>
+      <label id="link-passphrase-field">
+        AES passphrase
+        <input name="passphrase" type="password" autocomplete="off">
+      </label>
+      <label id="link-rsa-field" hidden>
+        Private key password
+        <input name="private_key_passphrase" type="password" autocomplete="current-password">
+      </label>
+      <div class="action-row">
+        <button class="button button-primary" type="submit">Create link</button>
+        <button class="button button-ghost" type="button" id="link-cancel">Cancel</button>
+      </div>
+    </form>
+  </dialog>
 
   <dialog class="share-modal" id="share-modal">
     <form method="post" id="share-form">
@@ -278,5 +363,31 @@
       button.addEventListener("click", () => openShareModal(button));
     });
     document.querySelector("#share-cancel").addEventListener("click", () => modal.close());
+
+    const linkModal = document.querySelector("#link-modal");
+    const linkForm = document.querySelector("#link-form");
+    const linkPassField = document.querySelector("#link-passphrase-field");
+    const linkRsaField = document.querySelector("#link-rsa-field");
+    const linkFilename = document.querySelector("#link-filename");
+
+    function openLinkModal(button) {
+      const assetId = button.dataset.assetId;
+      const algorithm = button.dataset.algorithm;
+      linkForm.action = `/images/${assetId}/link`;
+      linkFilename.textContent = button.dataset.filename;
+      const useRsa = algorithm === "RSA-HYBRID";
+      linkPassField.hidden = useRsa;
+      linkRsaField.hidden = !useRsa;
+      linkPassField.querySelector("input").required = !useRsa;
+      linkRsaField.querySelector("input").required = useRsa;
+      linkPassField.querySelector("input").value = "";
+      linkRsaField.querySelector("input").value = "";
+      linkModal.showModal();
+    }
+
+    document.querySelectorAll(".link-open").forEach((button) => {
+      button.addEventListener("click", () => openLinkModal(button));
+    });
+    document.querySelector("#link-cancel").addEventListener("click", () => linkModal.close());
   </script>
 {% endblock %}
