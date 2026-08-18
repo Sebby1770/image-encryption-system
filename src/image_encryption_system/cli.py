@@ -16,6 +16,7 @@ from .crypto import (
     generate_rsa_key_pair,
     pack_ies,
     unpack_ies,
+    unwrap_data_key,
 )
 
 
@@ -43,6 +44,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     keygen_parser.add_argument("--out-private", type=Path, default=Path("ies-private.pem"))
     keygen_parser.add_argument("--out-public", type=Path, default=Path("ies-public.pem"))
 
+    inspect_parser = subparsers.add_parser("inspect", help="Print public .ies metadata (no secrets).")
+    inspect_parser.add_argument("input", type=Path, help="Input vault file")
+
+    verify_parser = subparsers.add_parser("verify", help="Unwrap the data key only; exit 0 on success.")
+    verify_parser.add_argument("input", type=Path, help="Input vault file")
+    verify_parser.add_argument("--passphrase", "-p", help="AES or private-key passphrase")
+    verify_parser.add_argument("--private-key", type=Path, help="RSA private key (PEM)")
+
     args = parser.parse_args(list(argv) if argv is not None else None)
     try:
         if args.command == "encrypt":
@@ -51,6 +60,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _decrypt(args)
         if args.command == "keygen":
             return _keygen(args)
+        if args.command == "inspect":
+            return _inspect(args)
+        if args.command == "verify":
+            return _verify(args)
     except (CryptoError, OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -128,6 +141,49 @@ def _keygen(args: argparse.Namespace) -> int:
     private_pem, public_pem = generate_rsa_key_pair(passphrase)
     args.out_private.write_bytes(private_pem)
     args.out_public.write_bytes(public_pem)
+    return 0
+
+
+def _inspect(args: argparse.Namespace) -> int:
+    source: Path = args.input
+    if not source.is_file():
+        raise ValueError(f"input file not found: {source}")
+    _ciphertext, metadata = unpack_ies(source.read_bytes())
+    wrap = metadata.get("key_wrap")
+    wrap_type = wrap.get("type") if isinstance(wrap, dict) else None
+    original = metadata.get("original_filename")
+    print(f"version: {metadata.get('version', '')}")
+    print(f"algorithm: {metadata.get('algorithm', '')}")
+    if wrap_type:
+        print(f"wrap: {wrap_type}")
+    if original:
+        print(f"original_filename: {original}")
+    return 0
+
+
+def _verify(args: argparse.Namespace) -> int:
+    source: Path = args.input
+    if not source.is_file():
+        raise ValueError(f"input file not found: {source}")
+    _ciphertext, metadata = unpack_ies(source.read_bytes())
+    key_wrap = metadata.get("key_wrap")
+    if not isinstance(key_wrap, dict):
+        raise CryptoError("Encrypted image metadata is incomplete.")
+
+    passphrase = args.passphrase
+    private_key = Path(args.private_key).read_bytes() if args.private_key else None
+    if private_key is not None and not passphrase:
+        passphrase = getpass("Private key passphrase: ")
+    elif private_key is None and not passphrase:
+        passphrase = getpass("AES passphrase: ")
+
+    unwrap_data_key(
+        key_wrap,
+        passphrase=None if private_key is not None else passphrase,
+        private_key_pem=private_key,
+        private_key_passphrase=passphrase if private_key is not None else None,
+    )
+    print("ok")
     return 0
 
 

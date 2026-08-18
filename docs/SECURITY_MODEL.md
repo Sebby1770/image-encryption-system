@@ -49,8 +49,9 @@ modified, decryption fails.
 ## Access Control
 
 The web dashboard requires login. Each encrypted image record is tied to a
-`user_id`. Decryption routes allow the owner or a row in `shares`. API routes
-require a valid signed JWT. Audit events are scoped to the signed-in user.
+`user_id`. Decryption routes allow the owner or a non-expired row in `shares`.
+API routes require a valid signed JWT whose `ver` claim matches
+`users.token_version`. Audit events are scoped to the signed-in user.
 
 ## Operational Controls
 
@@ -59,9 +60,13 @@ require a valid signed JWT. Audit events are scoped to the signed-in user.
   the `login_guard` SQLite table so a process restart does not reset them.
 - HTML POST forms require a session CSRF token; missing or invalid tokens
   return 400. JSON `/api/*` routes are exempt and use JWTs instead.
-- Password changes re-encrypt the RSA private key PEM with the new password.
-- Owners can revoke a share (delete the per-recipient wrap row) and rotate a
-  passphrase wrap without rewriting ciphertext.
+- Password changes re-encrypt the RSA private key PEM with the new password
+  and increment `token_version`, so other sessions and JWTs fail.
+- Owners can revoke a share (delete the per-recipient wrap row), set an
+  optional expiry, and rotate a passphrase wrap without rewriting ciphertext.
+- Expired shares are treated as revoked at decrypt time.
+- Account deletion removes ciphertext, shares, keys, and the user row.
+- EXIF is stripped before encryption when present.
 - Uploads are capped at 8 MB by default.
 - Passwords are compared with Werkzeug's constant-time `check_password_hash`.
 - Backups export ciphertext and wrap metadata only — never private keys.
@@ -70,7 +75,8 @@ require a valid signed JWT. Audit events are scoped to the signed-in user.
 
 - Use HTTPS everywhere.
 - Store secrets in a managed secret store.
-- Terminate sessions after a password change if cookies may be stolen.
+- Sessions and JWTs already bump `token_version` on password change; keep
+  cookie flags (`Secure`, `HttpOnly`, `SameSite`) tight in production.
 - Move encrypted objects to S3 with SSE-KMS or a similar managed storage layer.
 - Add malware and file-type scanning for uploads.
 - Consider envelope encryption with a managed KMS instead of local key files.

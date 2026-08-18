@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.2.0 - 2026-08-18
+
+### Added
+
+- Session and JWT versioning via `users.token_version` (default 1). A password
+  change increments the version. The session cookie stores the version and JWT
+  tokens carry a `ver` claim; mismatches are treated as signed-out / invalid.
+- Optional share expiry: `POST /images/<id>/share` and the JSON share API accept
+  `expires_hours` or `expires_days`. Expired shares cannot be decrypted by the
+  recipient (same as revoked). The dashboard shows the expiry.
+- `POST /account/delete` with password confirmation and CSRF. Deletes vault
+  blobs, shares, RSA keys, audit rows, and the user.
+- EXIF is stripped on upload: images with EXIF are re-saved with Pillow without
+  EXIF before encryption so camera/GPS tags never enter ciphertext.
+- CLI: `ies inspect file.ies` prints algorithm and version (no secrets).
+  `ies verify file.ies --passphrase` unwraps the data key only and exits 0/1.
+
+### Changed
+
+- Package version is 2.2.0.
+
 ## 2.1.0 - 2026-08-18
 
 ### Added

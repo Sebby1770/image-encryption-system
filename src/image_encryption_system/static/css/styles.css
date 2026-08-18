@@ -398,6 +398,11 @@ input:disabled {
   margin-top: 8px !important;
 }
 
+.expiry-note {
+  color: var(--amber);
+  font-weight: 600;
+}
+
 .recipient-list {
   display: grid;
   gap: 8px;

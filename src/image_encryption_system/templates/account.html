@@ -31,10 +31,26 @@
       <h2>What this does</h2>
       <ul>
         <li>Verifies your current password</li>
-        <li>Stores a new password hash</li>
+        <li>Stores a new password hash and increments the session version</li>
         <li>Re-encrypts your RSA private key with BestAvailableEncryption</li>
+        <li>Signs out other browser sessions and API tokens</li>
         <li>Leaves image ciphertext and shares unchanged</li>
       </ul>
+      <form
+        class="form-stack"
+        method="post"
+        action="{{ url_for('delete_account') }}"
+        onsubmit="return confirm('Permanently delete this account, keys, and encrypted images?');"
+      >
+        {{ csrf_field }}
+        <h2>Delete account</h2>
+        <p class="field-note">This removes your user row, RSA keys, shares, and vault blobs. It cannot be undone.</p>
+        <label>
+          Confirm password
+          <input name="password" type="password" autocomplete="current-password" required>
+        </label>
+        <button class="button button-danger" type="submit">Delete account</button>
+      </form>
     </div>
   </section>
 {% endblock %}

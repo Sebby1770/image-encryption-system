@@ -92,7 +92,12 @@
                   <ul class="recipient-list">
                     {% for rec in recipients[asset.id] %}
                       <li class="recipient-row">
-                        <span class="share-note">Shared with {{ rec.username }}</span>
+                        <span class="share-note">
+                          Shared with {{ rec.username }}
+                          {% if rec.expires_at %}
+                            <span class="expiry-note">· expires {{ rec.expires_at }}</span>
+                          {% endif %}
+                        </span>
                         <form method="post" action="{{ url_for('revoke_share', share_id=rec.share_id) }}">
                           {{ csrf_field }}
                           <button class="button button-danger" type="submit">Revoke</button>
@@ -169,7 +174,15 @@
                 <div>
                   <h3>{{ item.asset.original_filename }}</h3>
                   <p>From {{ item.owner_username }} · {{ item.asset.algorithm }} · {{ item.asset.image_format }}</p>
-                  <small>Shared {{ item.share.created_at }}</small>
+                  <small>
+                    Shared {{ item.share.created_at }}
+                    {% if item.share.expires_at %}
+                      <span class="expiry-note">
+                        · expires {{ item.share.expires_at }}
+                        {% if item.share.is_expired() %}(expired){% endif %}
+                      </span>
+                    {% endif %}
+                  </small>
                 </div>
                 <form method="post" action="{{ url_for('decrypt_image', asset_id=item.asset.id) }}" target="_blank">
                   {{ csrf_field }}
@@ -200,6 +213,10 @@
       <label>
         Recipient username
         <input name="username" type="text" autocomplete="username" required>
+      </label>
+      <label>
+        Expires in hours (optional)
+        <input name="expires_hours" type="number" min="1" step="1" placeholder="Never">
       </label>
       <label id="share-passphrase-field">
         AES passphrase

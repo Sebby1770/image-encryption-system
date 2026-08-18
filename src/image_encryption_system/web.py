@@ -133,8 +133,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             flash(str(exc), "error")
             return redirect(url_for("register_form"))
 
-        session.clear()
-        session["user_id"] = user.id
+        _establish_session(user)
         flash("Account created. Your RSA keys were generated and stored locally.", "success")
         return redirect(url_for("dashboard"))
 
@@ -151,8 +150,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             return _failed_login(app, username, json_mode=False)
 
         _login_success(app, store, user)
-        session.clear()
-        session["user_id"] = user.id
+        _establish_session(user)
         flash("Signed in.", "success")
         return redirect(url_for("dashboard"))
 
@@ -182,9 +180,28 @@ def create_app(test_config: dict | None = None) -> Flask:
         except (ValueError, CryptoError) as exc:
             flash(str(exc), "error")
             return redirect(url_for("password_form"))
+        refreshed = store.get_user(user.id)
+        session["token_version"] = refreshed.token_version
         _audit(store, user.id, "password_change")
-        flash("Password updated. Your RSA private key was re-encrypted.", "success")
+        flash(
+            "Password updated. Your RSA private key was re-encrypted. Other sessions were signed out.",
+            "success",
+        )
         return redirect(url_for("dashboard"))
+
+    @app.post("/account/delete")
+    @login_required(store)
+    def delete_account() -> Response:
+        user = _current_user(store)
+        password = request.form.get("password") or ""
+        try:
+            store.delete_account(user.id, password)
+        except ValueError as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("password_form"))
+        session.clear()
+        flash("Account deleted.", "success")
+        return redirect(url_for("index"))
 
     @app.get("/dashboard")
     @login_required(store)
@@ -224,6 +241,7 @@ def create_app(test_config: dict | None = None) -> Flask:
 
         image_bytes = upload.read()
         try:
+            image_bytes = _strip_image_exif(image_bytes)
             image_info = _inspect_image(image_bytes)
             aad = _asset_aad(user.id, upload.filename, image_info["mime_type"])
             public_key = store.read_public_key(user.id) if algorithm == RSA_HYBRID else None
@@ -318,19 +336,27 @@ def create_app(test_config: dict | None = None) -> Flask:
         user = _current_user(store)
         recipient_name = request.form.get("username", "")
         try:
-            _share_asset(
+            share = _share_asset(
                 store,
                 owner=user,
                 asset_id=asset_id,
                 recipient_username=recipient_name,
                 passphrase=request.form.get("passphrase") or None,
                 private_key_passphrase=request.form.get("private_key_passphrase") or None,
+                expires_at=_parse_share_expiry(
+                    request.form.get("expires_hours"),
+                    request.form.get("expires_days"),
+                ),
             )
         except (LookupError, PermissionError, CryptoError, ValueError) as exc:
             flash(str(exc), "error")
             return redirect(url_for("dashboard"))
 
-        flash(f"Shared with {recipient_name.strip().lower()}.", "success")
+        name = recipient_name.strip().lower()
+        if share.expires_at:
+            flash(f"Shared with {name}. Expires {share.expires_at}.", "success")
+        else:
+            flash(f"Shared with {name}.", "success")
         return redirect(url_for("dashboard"))
 
     @app.post("/share/<int:share_id>/revoke")
@@ -457,6 +483,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                 "iss": app.config["JWT_ISSUER"],
                 "iat": now,
                 "exp": now + timedelta(hours=2),
+                "ver": user.token_version,
             },
             app.config["JWT_SECRET"],
             algorithm="HS256",
@@ -475,6 +502,8 @@ def create_app(test_config: dict | None = None) -> Flask:
                         **_asset_payload(item.asset),
                         "owner": item.owner_username,
                         "shared_at": item.share.created_at,
+                        "expires_at": item.share.expires_at,
+                        "expired": item.share.is_expired(),
                     }
                     for item in store.list_shared_with_user(user.id)
                 ],
@@ -494,10 +523,21 @@ def create_app(test_config: dict | None = None) -> Flask:
                 recipient_username=str(payload.get("username", "")),
                 passphrase=payload.get("passphrase") or None,
                 private_key_passphrase=payload.get("private_key_passphrase") or None,
+                expires_at=_parse_share_expiry(
+                    payload.get("expires_hours"),
+                    payload.get("expires_days"),
+                ),
             )
         except (LookupError, PermissionError, CryptoError, ValueError) as exc:
             return jsonify({"error": str(exc)}), 400
-        return jsonify({"ok": True, "share_id": share.id, "asset_id": asset_id})
+        return jsonify(
+            {
+                "ok": True,
+                "share_id": share.id,
+                "asset_id": asset_id,
+                "expires_at": share.expires_at,
+            }
+        )
 
     @app.get("/api/audit")
     @jwt_required(store)
@@ -550,7 +590,11 @@ def jwt_required(store: VaultStore) -> Callable[[F], F]:
                     algorithms=["HS256"],
                     issuer=current_app.config["JWT_ISSUER"],
                 )
-                g.api_user = store.get_user(int(payload["sub"]))
+                user = store.get_user(int(payload["sub"]))
+                token_version = int(payload.get("ver", 1))
+                if token_version != user.token_version:
+                    raise ValueError("token version mismatch")
+                g.api_user = user
             except Exception:
                 return jsonify({"error": "invalid bearer token"}), 401
             return view(*args, **kwargs)
@@ -573,15 +617,31 @@ def _csrf_field() -> Markup:
     return Markup(f'<input type="hidden" name="csrf_token" value="{token}">')
 
 
+def _establish_session(user: User) -> None:
+    session.clear()
+    session["user_id"] = user.id
+    session["token_version"] = user.token_version
+
+
 def _current_user(store: VaultStore) -> User | None:
     user_id = session.get("user_id")
     if not user_id:
         return None
     try:
-        return store.get_user(int(user_id))
+        user = store.get_user(int(user_id))
     except LookupError:
         session.clear()
         return None
+    cookie_version = session.get("token_version", 1)
+    try:
+        cookie_version = int(cookie_version)
+    except (TypeError, ValueError):
+        session.clear()
+        return None
+    if cookie_version != user.token_version:
+        session.clear()
+        return None
+    return user
 
 
 def _owned_asset(store: VaultStore, asset_id: int, user: User) -> EncryptedAsset:
@@ -598,7 +658,7 @@ def _accessible_asset(
     if asset.user_id == user.id:
         return asset, None
     share = store.get_share(asset_id, user.id)
-    if share is None:
+    if share is None or share.is_expired():
         raise PermissionError("You do not have access to this encrypted image.")
     return asset, share
 
@@ -611,6 +671,7 @@ def _share_asset(
     recipient_username: str,
     passphrase: str | None,
     private_key_passphrase: str | None,
+    expires_at: str | None = None,
 ) -> AssetShare:
     asset = _owned_asset(store, asset_id, owner)
     recipient_name = recipient_username.strip().lower()
@@ -633,6 +694,7 @@ def _share_asset(
         asset_id=asset.id,
         recipient_user_id=recipient.id,
         key_wrap=recipient_wrap,
+        expires_at=expires_at,
     )
     _audit(store, owner.id, "share", asset.id)
     return share
@@ -714,6 +776,87 @@ def _inspect_image(image_bytes: bytes) -> dict[str, int | str]:
             "width": width,
             "height": height,
         }
+
+
+def _strip_image_exif(image_bytes: bytes) -> bytes:
+    """Re-save pixels without EXIF so location and camera tags never enter ciphertext."""
+    with Image.open(BytesIO(image_bytes)) as image:
+        image.load()
+        image_format = (image.format or "PNG").upper()
+        if image_format == "JPG":
+            image_format = "JPEG"
+        if not _image_has_exif(image, image_bytes):
+            return image_bytes
+
+        cleaned = image.copy()
+        cleaned.info.pop("exif", None)
+        cleaned.info.pop("xmp", None)
+        cleaned.getexif().clear()
+        if image_format == "JPEG" and cleaned.mode not in {"RGB", "L", "CMYK"}:
+            cleaned = cleaned.convert("RGB")
+
+        output = BytesIO()
+        save_kwargs: dict[str, object] = {"format": image_format}
+        if image_format == "JPEG":
+            save_kwargs["quality"] = 95
+            save_kwargs["exif"] = b""
+        cleaned.save(output, **save_kwargs)
+        return output.getvalue()
+
+
+def _image_has_exif(image: Image.Image, raw: bytes) -> bool:
+    if image.info.get("exif"):
+        return True
+    try:
+        if dict(image.getexif()):
+            return True
+    except Exception:
+        pass
+    return _jpeg_has_exif_marker(raw)
+
+
+def _jpeg_has_exif_marker(data: bytes) -> bool:
+    if len(data) < 4 or data[:2] != b"\xff\xd8":
+        return False
+    index = 2
+    length = len(data)
+    while index + 4 <= length and data[index] == 0xFF:
+        marker = data[index + 1]
+        if marker == 0xDA:
+            break
+        if marker in {0x00, 0xFF}:
+            index += 1
+            continue
+        if marker == 0xD8 or marker == 0xD9 or 0xD0 <= marker <= 0xD7:
+            index += 2
+            continue
+        seglen = int.from_bytes(data[index + 2 : index + 4], "big")
+        if seglen < 2:
+            break
+        payload_start = index + 4
+        payload_end = index + 2 + seglen
+        if payload_end > length:
+            break
+        if marker == 0xE1 and data[payload_start : payload_start + 4] == b"Exif":
+            return True
+        index = payload_end
+    return False
+
+
+def _parse_share_expiry(raw_hours: object, raw_days: object) -> str | None:
+    hours_text = "" if raw_hours is None else str(raw_hours).strip()
+    days_text = "" if raw_days is None else str(raw_days).strip()
+    if not hours_text and not days_text:
+        return None
+    try:
+        hours = float(hours_text) if hours_text else float(days_text) * 24.0
+    except ValueError as exc:
+        raise ValueError("Expiry must be a number of hours or days.") from exc
+    if hours <= 0:
+        raise ValueError("Expiry must be greater than zero.")
+    if hours > 24 * 365 * 20:
+        raise ValueError("Expiry is too far in the future.")
+    return (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat(timespec="seconds")
 
 
 def _asset_aad(user_id: int, original_filename: str, mime_type: str) -> bytes:

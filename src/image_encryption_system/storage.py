@@ -26,6 +26,7 @@ class User:
     username: str
     password_hash: str
     created_at: str
+    token_version: int = 1
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,18 @@ class AssetShare:
     recipient_user_id: int
     key_wrap: dict[str, Any]
     created_at: str
+    expires_at: str | None = None
+
+    def is_expired(self, now: datetime | None = None) -> bool:
+        if not self.expires_at:
+            return False
+        moment = now or datetime.now(timezone.utc)
+        expires = datetime.fromisoformat(self.expires_at)
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment >= expires
 
 
 @dataclass(frozen=True)
@@ -63,6 +76,7 @@ class SharedInboxItem:
 class ShareRecipient:
     share_id: int
     username: str
+    expires_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -92,7 +106,8 @@ class VaultStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     username TEXT NOT NULL UNIQUE,
                     password_hash TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    token_version INTEGER NOT NULL DEFAULT 1
                 );
 
                 CREATE TABLE IF NOT EXISTS encrypted_assets (
@@ -116,6 +131,7 @@ class VaultStore:
                     recipient_user_id INTEGER NOT NULL,
                     key_wrap_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    expires_at TEXT,
                     FOREIGN KEY (asset_id) REFERENCES encrypted_assets (id) ON DELETE CASCADE,
                     FOREIGN KEY (recipient_user_id) REFERENCES users (id),
                     UNIQUE (asset_id, recipient_user_id)
@@ -147,6 +163,13 @@ class VaultStore:
                     ON login_guard (kind, username, ip, created_at);
                 """
             )
+            _ensure_column(
+                db,
+                "users",
+                "token_version",
+                "token_version INTEGER NOT NULL DEFAULT 1",
+            )
+            _ensure_column(db, "shares", "expires_at", "expires_at TEXT")
 
     def create_user(self, username: str, password: str) -> User:
         username = username.strip().lower()
@@ -160,7 +183,10 @@ class VaultStore:
 
         with self._connect() as db:
             cursor = db.execute(
-                "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+                """
+                INSERT INTO users (username, password_hash, created_at, token_version)
+                VALUES (?, ?, ?, 1)
+                """,
                 (username, password_hash, now),
             )
             user_id = int(cursor.lastrowid)
@@ -214,15 +240,23 @@ class VaultStore:
         try:
             with self._connect() as db:
                 db.execute(
-                    "UPDATE users SET password_hash = ? WHERE id = ?",
+                    """
+                    UPDATE users
+                    SET password_hash = ?, token_version = token_version + 1
+                    WHERE id = ?
+                    """,
                     (new_hash, user_id),
                 )
             tmp_path.replace(pem_path)
         except Exception:
             with self._connect() as db:
                 db.execute(
-                    "UPDATE users SET password_hash = ? WHERE id = ?",
-                    (user.password_hash, user_id),
+                    """
+                    UPDATE users
+                    SET password_hash = ?, token_version = ?
+                    WHERE id = ?
+                    """,
+                    (user.password_hash, user.token_version, user_id),
                 )
             raise
         finally:
@@ -234,6 +268,34 @@ class VaultStore:
 
     def public_key_path(self, user_id: int) -> Path:
         return self.key_dir / f"user-{user_id}-public.pem"
+
+    def delete_account(self, user_id: int, password: str) -> User:
+        user = self.get_user(user_id)
+        if not check_password_hash(user.password_hash, password):
+            raise ValueError("Current password is incorrect.")
+
+        assets = self.list_assets(user_id)
+        ciphertext_paths = [self.vault_dir / asset.stored_filename for asset in assets]
+        key_paths = [self.private_key_path(user_id), self.public_key_path(user_id)]
+
+        with self._connect() as db:
+            db.execute("DELETE FROM shares WHERE recipient_user_id = ?", (user_id,))
+            db.execute(
+                """
+                DELETE FROM shares
+                WHERE asset_id IN (SELECT id FROM encrypted_assets WHERE user_id = ?)
+                """,
+                (user_id,),
+            )
+            db.execute("DELETE FROM encrypted_assets WHERE user_id = ?", (user_id,))
+            db.execute("DELETE FROM audit_events WHERE user_id = ?", (user_id,))
+            db.execute("DELETE FROM login_guard WHERE username = ?", (user.username,))
+            db.execute("DELETE FROM users WHERE id = ?", (user_id,))
+
+        for path in ciphertext_paths + key_paths:
+            if path.exists():
+                path.unlink()
+        return user
 
     def save_asset(
         self,
@@ -349,19 +411,23 @@ class VaultStore:
         asset_id: int,
         recipient_user_id: int,
         key_wrap: dict[str, Any],
+        expires_at: str | None = None,
     ) -> AssetShare:
         now = _utc_now()
         payload = json.dumps(key_wrap, sort_keys=True)
         with self._connect() as db:
             db.execute(
                 """
-                INSERT INTO shares (asset_id, recipient_user_id, key_wrap_json, created_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO shares (
+                    asset_id, recipient_user_id, key_wrap_json, created_at, expires_at
+                )
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(asset_id, recipient_user_id) DO UPDATE SET
                     key_wrap_json = excluded.key_wrap_json,
-                    created_at = excluded.created_at
+                    created_at = excluded.created_at,
+                    expires_at = excluded.expires_at
                 """,
-                (asset_id, recipient_user_id, payload, now),
+                (asset_id, recipient_user_id, payload, now, expires_at),
             )
         share = self.get_share(asset_id, recipient_user_id)
         if share is None:
@@ -411,6 +477,7 @@ class VaultStore:
                    s.recipient_user_id AS share_recipient_user_id,
                    s.key_wrap_json AS share_key_wrap_json,
                    s.created_at AS shared_at,
+                   s.expires_at AS share_expires_at,
                    u.username AS owner_username
             FROM shares AS s
             JOIN encrypted_assets AS ea ON ea.id = s.asset_id
@@ -437,6 +504,7 @@ class VaultStore:
                         recipient_user_id=int(row["share_recipient_user_id"]),
                         key_wrap=json.loads(str(row["share_key_wrap_json"])),
                         created_at=str(row["shared_at"]),
+                        expires_at=_optional_text(row["share_expires_at"]),
                     ),
                     asset=_asset_from_row(row),
                     owner_username=str(row["owner_username"]),
@@ -448,7 +516,7 @@ class VaultStore:
         with self._connect() as db:
             rows = db.execute(
                 """
-                SELECT s.id AS share_id, s.asset_id, u.username
+                SELECT s.id AS share_id, s.asset_id, s.expires_at, u.username
                 FROM shares AS s
                 JOIN encrypted_assets AS ea ON ea.id = s.asset_id
                 JOIN users AS u ON u.id = s.recipient_user_id
@@ -460,7 +528,11 @@ class VaultStore:
         mapping: dict[int, list[ShareRecipient]] = {}
         for row in rows:
             mapping.setdefault(int(row["asset_id"]), []).append(
-                ShareRecipient(share_id=int(row["share_id"]), username=str(row["username"]))
+                ShareRecipient(
+                    share_id=int(row["share_id"]),
+                    username=str(row["username"]),
+                    expires_at=_optional_text(row["expires_at"]),
+                )
             )
         return mapping
 
@@ -683,11 +755,14 @@ def _safe_zip_member(name: str) -> str:
 
 
 def _user_from_row(row: sqlite3.Row) -> User:
+    keys = set(row.keys())
+    token_version = int(row["token_version"]) if "token_version" in keys else 1
     return User(
         id=int(row["id"]),
         username=str(row["username"]),
         password_hash=str(row["password_hash"]),
         created_at=str(row["created_at"]),
+        token_version=token_version,
     )
 
 
@@ -708,13 +783,29 @@ def _asset_from_row(row: sqlite3.Row) -> EncryptedAsset:
 
 
 def _share_from_row(row: sqlite3.Row) -> AssetShare:
+    keys = set(row.keys())
+    expires_at = _optional_text(row["expires_at"]) if "expires_at" in keys else None
     return AssetShare(
         id=int(row["id"]),
         asset_id=int(row["asset_id"]),
         recipient_user_id=int(row["recipient_user_id"]),
         key_wrap=json.loads(str(row["key_wrap_json"])),
         created_at=str(row["created_at"]),
+        expires_at=expires_at,
     )
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text or None
+
+
+def _ensure_column(db: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    existing = {str(row[1]) for row in db.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
 
 def _audit_from_row(row: sqlite3.Row) -> AuditEvent:

@@ -2,8 +2,8 @@
 
 A Flask image vault that encrypts photos with **AES-256-GCM** before they touch
 disk. Per-image data keys are wrapped with Scrypt+AES or RSA-OAEP. Version
-**2.1.0** adds share revoke, password change with RSA PEM re-wrap, CSRF on
-forms, persistent login lockout, and passphrase-wrap rotation.
+**2.2.0** adds session/JWT bump on password change, share expiry, account
+delete, EXIF stripping on upload, and CLI inspect/verify.
 
 ## Features
 
@@ -16,17 +16,22 @@ forms, persistent login lockout, and passphrase-wrap rotation.
 - Revoke a share from the dashboard; the recipient immediately loses decrypt
   access.
 - Change password: new hash plus RSA private key PEM re-encrypted with the new
-  password (`BestAvailableEncryption`).
+  password (`BestAvailableEncryption`). Other sessions and JWTs stop working.
+- Delete account (`POST /account/delete`): password confirm + CSRF removes
+  assets, shares, keys, and the user row.
+- Share expiry: optional `expires_hours` / `expires_days`; decrypt fails after
+  the deadline (treated like revoke).
+- EXIF is stripped before encryption so GPS/camera tags never enter ciphertext.
 - Rotate the passphrase wrap on an AES-GCM image (old passphrase required).
 - CSRF tokens on every HTML POST form.
 - Owner-only audit log (web + `GET /api/audit`).
 - Encrypted backup zip (ciphertext + metadata, never private keys) and restore.
-- `ies` CLI for offline encrypt / decrypt / keygen.
+- `ies` CLI for offline encrypt / decrypt / keygen / inspect / verify.
 - Login rate limit (5 / 10 minutes, IP+user) and lockout after 8 failures,
   persisted in SQLite so a restart does not reset the counter.
 - 8 MB default upload limit; download ciphertext as `.ies`.
-- JWT API for listing images and reading the audit trail.
-- Tests for crypto, sharing, revoke, backup, CLI, CSRF, and lockout.
+- JWT API for listing images and reading the audit trail (`ver` claim).
+- Tests for crypto, sharing, revoke, expiry, backup, CLI, CSRF, and lockout.
 
 ## Tech Stack
 
@@ -56,13 +61,16 @@ Open `http://127.0.0.1:5000`, create an account, and upload an image.
 ```bash
 ies encrypt IN.png --passphrase 'a long secret' --out out.bin
 ies decrypt out.bin --passphrase 'a long secret' --out restored.png
+ies inspect out.bin
+ies verify out.bin --passphrase 'a long secret'
 ies keygen --passphrase 'account password' --out-private key.pem --out-public pub.pem
 ies encrypt IN.png --public-key pub.pem --out photo.ies
 ies decrypt photo.ies --private-key key.pem --passphrase 'account password' --out restored.png
 ```
 
 The CLI talks only to `crypto.py`. It does not start Flask or write decrypted
-images unless you pass `--out`.
+images unless you pass `--out`. `inspect` prints algorithm and version only.
+`verify` unwraps the data key and exits 0 or 1.
 
 ## Sharing
 
@@ -76,7 +84,9 @@ On the dashboard, choose **Share** and enter another username. The server:
 The recipient sees the image under **Shared with me** and decrypts it with their
 account password. A third user cannot unwrap the shared key. The owner can
 **Revoke** a recipient at any time; that deletes the `shares` row so decrypt
-fails for them.
+fails for them. Optional `expires_hours` (or `expires_days`) stores `expires_at`;
+an expired share is treated as revoked on decrypt. The dashboard shows the
+expiry.
 
 AES-GCM passphrase assets also have **Rotate passphrase**: the server unwraps
 the data key with the old passphrase and writes a new wrap. Shares stay valid
@@ -91,9 +101,13 @@ data as JSON.
 ## Account password
 
 `GET/POST /account/password` verifies the current password, stores a new hash,
-and re-encrypts `user-<id>-private.pem` with the new password. RSA-hybrid
-decrypt then uses the new password, not the old one. Image ciphertext is never
-rewritten.
+increments `token_version`, and re-encrypts `user-<id>-private.pem` with the
+new password. Other browser sessions and JWTs whose `ver` claim no longer
+matches are rejected. RSA-hybrid decrypt then uses the new password, not the
+old one. Image ciphertext is never rewritten.
+
+`POST /account/delete` confirms the password (and CSRF) then deletes the
+account: vault blobs, shares, RSA keys, audit rows, and the user.
 
 ## Backup
 
@@ -119,7 +133,8 @@ Use strong secrets for any shared deployment.
 
 ## How Encryption Works
 
-Every uploaded image is encrypted with a random 256-bit data key using AES-GCM.
+Uploaded images are re-saved without EXIF when metadata is present, then
+encrypted with a random 256-bit data key using AES-GCM.
 The selected algorithm controls how that data key is protected:
 
 - `AES-GCM passphrase`: Scrypt derives a wrapping key, then AES-GCM wraps the
