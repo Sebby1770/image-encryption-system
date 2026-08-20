@@ -1,0 +1,15 @@
+{% extends "layout.html" %}
+
+{% block title %}Too many attempts - Image Vault{% endblock %}
+
+{% block content %}
+  <section class="auth-panel throttle-panel">
+    <p class="eyebrow">Rate limited</p>
+    <h1>Too many authentication attempts</h1>
+    <p>
+      This vault pauses credential guesses after repeated failures.
+      {% if retry_after %}Try again in about {{ retry_after }} seconds.{% endif %}
+    </p>
+    <p><a class="button button-primary" href="{{ url_for('index') }}">Back to sign in</a></p>
+  </section>
+{% endblock %}

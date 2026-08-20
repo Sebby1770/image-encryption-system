@@ -10,6 +10,7 @@ from image_encryption_system.crypto import (
     decrypt_image_bytes,
     encrypt_image_bytes,
     generate_rsa_key_pair,
+    reencrypt_private_key,
 )
 
 
@@ -74,4 +75,27 @@ def test_rsa_hybrid_round_trip() -> None:
 
     assert decrypted == plaintext
     assert encrypted.metadata["key_wrap"]["type"] == "rsa-oaep-sha256"
+
+
+def test_reencrypt_private_key_keeps_rsa_hybrid_working() -> None:
+    plaintext = sample_png()
+    private_key, public_key = generate_rsa_key_pair("old-password-ok")
+    encrypted = encrypt_image_bytes(plaintext, RSA_HYBRID, public_key_pem=public_key)
+
+    rewritten = reencrypt_private_key(private_key, "old-password-ok", "new-password-ok")
+    decrypted = decrypt_image_bytes(
+        encrypted.ciphertext,
+        encrypted.metadata,
+        private_key_pem=rewritten,
+        private_key_passphrase="new-password-ok",
+    )
+    assert decrypted == plaintext
+
+    with pytest.raises(CryptoError):
+        decrypt_image_bytes(
+            encrypted.ciphertext,
+            encrypted.metadata,
+            private_key_pem=rewritten,
+            private_key_passphrase="old-password-ok",
+        )
 

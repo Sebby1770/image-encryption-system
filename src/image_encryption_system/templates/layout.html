@@ -3,17 +3,26 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Local image vault with AES-256-GCM and RSA-OAEP hybrid encryption.">
     <title>{% block title %}Image Encryption System{% endblock %}</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
   </head>
   <body>
     <header class="topbar">
-      <a class="brand" href="{{ url_for('index') }}">Image Encryption System</a>
+      <a class="brand" href="{{ url_for('index') }}">
+        <span class="brand-mark" aria-hidden="true"></span>
+        Image Vault
+      </a>
       {% if current_user %}
-        <form method="post" action="{{ url_for('logout') }}">
+        <nav class="topbar-nav">
+          <a href="{{ url_for('dashboard') }}">Vault</a>
+          <a href="{{ url_for('settings') }}">Account</a>
           <span class="signed-in">{{ current_user.username }}</span>
-          <button type="submit" class="button button-ghost">Sign out</button>
-        </form>
+          <form method="post" action="{{ url_for('logout') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" class="button button-ghost">Sign out</button>
+          </form>
+        </nav>
       {% endif %}
     </header>
 
@@ -30,6 +39,10 @@
 
       {% block content %}{% endblock %}
     </main>
+
+    <footer class="site-footer">
+      <span>Local-only ciphertext vault · v{{ app_version }}</span>
+    </footer>
+    {% block scripts %}{% endblock %}
   </body>
 </html>
-

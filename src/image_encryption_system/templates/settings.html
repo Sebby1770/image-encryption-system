@@ -1,0 +1,54 @@
+{% extends "layout.html" %}
+
+{% block title %}Account - Image Vault{% endblock %}
+
+{% block content %}
+  <section class="dashboard-header">
+    <div>
+      <p class="eyebrow">Account</p>
+      <h1>Keys, password, audit</h1>
+      <p>Changing your password re-wraps the encrypted RSA private key. Ciphertext files stay put.</p>
+    </div>
+  </section>
+
+  <section class="workspace-grid">
+    <form class="upload-panel" method="post" action="{{ url_for('change_password') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <h2>Change password</h2>
+      <label>
+        Current password
+        <input name="current_password" type="password" autocomplete="current-password" required>
+      </label>
+      <label>
+        New password
+        <input name="new_password" type="password" autocomplete="new-password" minlength="10" required>
+      </label>
+      <label>
+        Confirm new password
+        <input name="confirm_password" type="password" autocomplete="new-password" minlength="10" required>
+      </label>
+      <p class="field-note">Use at least 10 characters. This also unlocks RSA-hybrid images.</p>
+      <button class="button button-primary" type="submit">Update password</button>
+    </form>
+
+    <section class="vault-list" aria-label="Audit log">
+      <h2>Recent activity</h2>
+      {% if events %}
+        <ol class="audit-list">
+          {% for event in events %}
+            <li>
+              <strong>{{ event.event_type }}</strong>
+              <span>{{ event.detail }}</span>
+              <small>{{ event.created_at }}</small>
+            </li>
+          {% endfor %}
+        </ol>
+      {% else %}
+        <div class="empty-state">
+          <h3>No events yet</h3>
+          <p>Encrypt, decrypt, export, and sign-in events will appear here.</p>
+        </div>
+      {% endif %}
+    </section>
+  </section>
+{% endblock %}

@@ -38,16 +38,34 @@ def generate_rsa_key_pair(passphrase: str) -> tuple[bytes, bytes]:
         raise CryptoError("A passphrase is required to protect the private key.")
 
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
-    private_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.BestAvailableEncryption(passphrase.encode("utf-8")),
-    )
+    private_pem = _serialize_private_key(private_key, passphrase)
     public_pem = private_key.public_key().public_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
     )
     return private_pem, public_pem
+
+
+def reencrypt_private_key(private_pem: bytes, old_passphrase: str, new_passphrase: str) -> bytes:
+    """Decrypt a PEM private key with the old password and wrap it with the new one."""
+    if not new_passphrase:
+        raise CryptoError("A new passphrase is required.")
+    try:
+        private_key = serialization.load_pem_private_key(
+            private_pem,
+            password=old_passphrase.encode("utf-8"),
+        )
+    except (ValueError, TypeError) as exc:
+        raise CryptoError("Current password is invalid.") from exc
+    return _serialize_private_key(private_key, new_passphrase)
+
+
+def _serialize_private_key(private_key: Any, passphrase: str) -> bytes:
+    return private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.BestAvailableEncryption(passphrase.encode("utf-8")),
+    )
 
 
 def encrypt_image_bytes(

@@ -1,23 +1,23 @@
 # Image Encryption System
 
-A Flask-based cybersecurity project that encrypts digital photos before storing
-them locally. It demonstrates practical image privacy controls: authenticated
-users, algorithm selection, secure key wrapping, encrypted file storage, and
-real-time decryption for authorized users.
+A local Flask vault that encrypts digital photos **before** they are written to
+disk. Authenticated users pick a wrapping mode, ciphertext lives in a directory
+the app owns, and decrypted bytes are streamed back — never saved as plaintext.
+
+**Version 1.0.0**
 
 ## Features
 
-- AES-256-GCM encryption for image contents.
-- RSA-OAEP hybrid mode where RSA wraps a per-image AES key.
-- Per-user RSA key pair generated at registration time.
-- Private keys encrypted with the user's password.
-- AES mode passphrase-based key wrapping with Scrypt.
-- Login-protected dashboard and ownership checks.
-- JWT API token endpoint for integrations.
-- Supports common image formats handled by Pillow: PNG, JPEG, WEBP, GIF, BMP,
-  and TIFF.
-- Encrypted local vault using SQLite metadata and binary encrypted files.
-- Tests for AES and RSA encryption/decryption flows.
+- AES-256-GCM for image contents with a fresh 256-bit data key per upload.
+- RSA-OAEP hybrid mode: RSA wraps the per-image AES key.
+- Per-user RSA-3072 key pair generated at registration; private key encrypted
+  with the account password and stored mode `0600`.
+- AES-GCM passphrase mode: Scrypt → wrapping key → AES-GCM wrap of the data key.
+- Login-protected dashboard, CSRF on browser POSTs, owner checks on every read.
+- Sliding-window throttle + account lockout on `/login` and `/api/token` (HTTP 429).
+- JWT API for list / upload / decrypt / delete / audit.
+- Audit log, password change (re-wraps the RSA key), vault backup export, delete.
+- CLI for the same encryption scheme without running the web app.
 
 ## Tech Stack
 
@@ -28,21 +28,24 @@ real-time decryption for authorized users.
 - SQLite
 - PyJWT
 
-PyCrypto is intentionally not used because it is deprecated. The
-`cryptography` package uses OpenSSL-backed primitives and is the recommended
-Python choice for this kind of project.
+PyCrypto is intentionally not used because it is deprecated.
 
 ## Quick Start
 
 ```bash
-cd image-encryption-system
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e ".[dev]"
 python run.py
 ```
 
 Open `http://127.0.0.1:5000`, create an account, and upload an image.
+
+Debug mode is **off**. For the Werkzeug debugger locally:
+
+```bash
+IES_DEBUG=1 python run.py
+```
 
 ## Environment
 
@@ -52,26 +55,28 @@ Copy `.env.example` to `.env` for deployment-style settings:
 cp .env.example .env
 ```
 
-For local development, the app will run with development defaults. For any
-shared or public deployment, set strong values for:
-
-- `SECRET_KEY`
-- `JWT_SECRET`
-- `IES_INSTANCE_DIR`
+| Variable | Purpose |
+| --- | --- |
+| `SECRET_KEY` | Flask session signing (set a long random value in production) |
+| `JWT_SECRET` | JWT signing key |
+| `IES_INSTANCE_DIR` | SQLite DB, vault files, and key directory |
+| `IES_DEBUG` / `FLASK_DEBUG` | Opt-in debug server |
+| `IES_SECURE_COOKIES` | Mark the session cookie `Secure` (use with HTTPS) |
+| `IES_AUTH_MAX_FAILURES` | Failures before 429 / lockout (default 5) |
+| `IES_AUTH_WINDOW_SECONDS` | Sliding window for the in-memory throttle |
+| `IES_AUTH_LOCKOUT_SECONDS` | Persistent lockout duration |
 
 ## How Encryption Works
 
 Every uploaded image is encrypted with a random 256-bit data key using
 AES-GCM. The selected algorithm controls how that data key is protected:
 
-- `AES-GCM passphrase`: derives a wrapping key from the user-entered passphrase
-  using Scrypt, then wraps the image data key with AES-GCM.
-- `RSA hybrid`: encrypts the image data key with the user's RSA public key using
-  RSA-OAEP-SHA256. Decryption requires the encrypted private key and its
-  password.
+- `AES-GCM passphrase`: Scrypt → AES-GCM wrap of the data key.
+- `RSA hybrid`: RSA-OAEP-SHA256 wrap of the data key with the user's public key.
+  Decryption needs the encrypted private key and the account password.
 
-The decrypted image is streamed back to the authenticated owner and is not saved
-to disk.
+Associated data binds ciphertext to the owning user, original filename, and
+MIME type. Tampering fails closed.
 
 ## API
 
@@ -90,10 +95,30 @@ curl http://127.0.0.1:5000/api/images \
   -H "Authorization: Bearer <token>"
 ```
 
+Health check: `GET /health`.
+
+## CLI
+
+```bash
+python -m image_encryption_system encrypt photo.png --passphrase 'a long passphrase'
+python -m image_encryption_system decrypt photo.png.enc --meta photo.png.enc.json \
+  --out photo-out.png --passphrase 'a long passphrase'
+```
+
+After `pip install -e .` the `image-vault` command is equivalent.
+
 ## Tests
 
 ```bash
 pytest
+```
+
+## Docker
+
+```bash
+docker build -t image-vault .
+docker run --rm -p 5000:5000 -v vault-data:/data \
+  -e SECRET_KEY=... -e JWT_SECRET=... image-vault
 ```
 
 ## Project Structure
@@ -102,29 +127,18 @@ pytest
 image-encryption-system/
   src/image_encryption_system/
     crypto.py          # AES-GCM, RSA-OAEP, key wrapping
-    storage.py         # SQLite metadata and encrypted vault files
-    web.py             # Flask app, auth, upload, decrypt, API routes
+    storage.py         # SQLite, 0600 key files, audit, lockout
+    throttle.py        # In-memory credential throttle
+    web.py             # Flask app
+    cli.py             # encrypt / decrypt CLI
     templates/         # HTML views
-    static/css/        # UI styling
-  tests/               # Pytest coverage for crypto flows
-  docs/                # Security model and design notes
-  scripts/             # Utility scripts
+    static/            # CSS + dashboard JS
+  tests/               # Pytest coverage
+  docs/                # Security model
+  CHANGELOG.md
+  SECURITY.md
 ```
 
-## Add To GitHub
+## License
 
-```bash
-git init
-git add .
-git commit -m "Initial image encryption system"
-git branch -M main
-git remote add origin https://github.com/<your-username>/image-encryption-system.git
-git push -u origin main
-```
-
-## Security Notes
-
-This is a portfolio-ready educational project, not a complete production
-security product. Before using it with real sensitive data, add production-grade
-secret management, HTTPS, rate limiting, audit logging, backups, malware
-scanning for uploads, and hardened deployment settings.
+MIT

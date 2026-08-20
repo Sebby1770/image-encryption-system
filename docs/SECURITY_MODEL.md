@@ -45,12 +45,16 @@ API routes require a valid signed JWT.
 
 ## Recommended Production Hardening
 
-- Use HTTPS everywhere.
-- Store secrets in a managed secret store.
-- Add rate limiting to login, registration, and decrypt endpoints.
-- Add audit logs for encryption, decryption, and failed access attempts.
-- Move encrypted objects to S3 with SSE-KMS or a similar managed storage layer.
+- Use HTTPS everywhere and set `IES_SECURE_COOKIES=1`.
+- Store `SECRET_KEY` and `JWT_SECRET` in a managed secret store.
+- Keep `IES_DEBUG` unset. Debug mode is opt-in only.
+- Confirm the `keys/` and `vault/` directories stay mode `0700` after deploy.
+- Move encrypted objects to S3 with SSE-KMS or a similar managed storage layer
+  if you outgrow the local disk vault.
 - Add malware and file-type scanning for uploads.
 - Consider envelope encryption with a managed KMS instead of local key files.
 - Add OAuth using a trusted identity provider if the app will be multi-user.
+
+Login, token issue, and failed decrypts are already throttled or audited in
+1.0.0. See `CHANGELOG.md` and `SECURITY.md`.
 

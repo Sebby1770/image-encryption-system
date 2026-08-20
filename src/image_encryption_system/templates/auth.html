@@ -1,16 +1,17 @@
 {% extends "layout.html" %}
 
 {% block title %}
-  {% if mode == "register" %}Create Account{% else %}Sign In{% endif %} - Image Encryption System
+  {% if mode == "register" %}Create Account{% else %}Sign In{% endif %} - Image Vault
 {% endblock %}
 
 {% block content %}
   <section class="auth-grid" aria-label="Authentication">
     <div class="auth-panel">
-      <h1>{% if mode == "register" %}Create a secure vault{% else %}Sign in to your vault{% endif %}</h1>
+      <p class="eyebrow">Encrypted at rest</p>
+      <h1>{% if mode == "register" %}Create a local image vault{% else %}Unlock your vault{% endif %}</h1>
       <p>
-        Encrypt private photos with AES-GCM or RSA hybrid encryption, then decrypt
-        them only after authorization.
+        Photos are encrypted with a fresh AES-256-GCM data key before they ever
+        touch disk. Wrap that key with a passphrase or your account RSA key.
       </p>
 
       <form
@@ -18,9 +19,10 @@
         method="post"
         action="{% if mode == 'register' %}{{ url_for('register') }}{% else %}{{ url_for('login') }}{% endif %}"
       >
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <label>
           Username
-          <input name="username" type="text" autocomplete="username" required>
+          <input name="username" type="text" autocomplete="username" maxlength="64" required>
         </label>
         <label>
           Password
@@ -32,6 +34,9 @@
             required
           >
         </label>
+        {% if mode == "register" %}
+          <p class="field-note">Minimum 10 characters. This password also wraps your RSA private key.</p>
+        {% endif %}
         <button class="button button-primary" type="submit">
           {% if mode == "register" %}Create account{% else %}Sign in{% endif %}
         </button>
@@ -49,12 +54,12 @@
     <div class="security-panel" aria-label="Security summary">
       <h2>Protection model</h2>
       <ul>
-        <li>Per-image AES-256-GCM data keys</li>
-        <li>Passphrase or RSA-OAEP key wrapping</li>
-        <li>Encrypted private keys</li>
-        <li>Owner-only image access</li>
+        <li>Per-image AES-256-GCM data keys and unique nonces</li>
+        <li>Scrypt or RSA-OAEP wrapping of the data key</li>
+        <li>Private keys stored as password-encrypted PEM, mode 0600</li>
+        <li>Owner checks, CSRF on browser POSTs, login throttling</li>
+        <li>Decrypted bytes are streamed, never written back to disk</li>
       </ul>
     </div>
   </section>
 {% endblock %}
-
