@@ -1,15 +1,16 @@
-from pathlib import Path
 import os
 import sys
+from pathlib import Path
 
+from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env", override=False)
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from image_encryption_system.web import create_app
-
 
 app = create_app()
 

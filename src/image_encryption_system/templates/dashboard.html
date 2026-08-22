@@ -6,7 +6,7 @@
   <section class="dashboard-header">
     <div>
       <h1>Encrypted image vault</h1>
-      <p>Upload an image, choose a key protection mode, and store only ciphertext.</p>
+      <p>Seal private images with authenticated encryption, then control exactly when and how they are opened.</p>
     </div>
     <div class="metric-grid">
       <div class="metric">
@@ -30,6 +30,12 @@
         <small>vault health ({{ vault_health.grade }})</small>
       </div>
     </div>
+  </section>
+
+  <section class="trust-strip" aria-label="Vault guarantees">
+    <span><strong>Context sealed</strong> owner, format, dimensions, and time-lock</span>
+    <span><strong>Private responses</strong> decrypted bytes are never cacheable</span>
+    <span><strong>Audit v2</strong> activity is protected with a keyed chain</span>
   </section>
 
   <section class="workspace-grid">
@@ -65,7 +71,7 @@
           Time-lock (optional)
           <input name="unlock_after" type="datetime-local">
         </label>
-        <p class="field-note">Decrypt and preview stay blocked until this UTC-local timestamp.</p>
+        <p class="field-note">Times are interpreted in UTC. This is a server-side workflow lock, not a cryptographic time capsule.</p>
         <label id="passphrase-field">
           AES passphrase
           <input name="passphrase" type="password" autocomplete="off" placeholder="Required for AES-GCM mode">
@@ -169,7 +175,7 @@
         <form method="post" action="{{ url_for('bulk_update_tags') }}" id="bulk-tag-form">
           <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
         </form>
-        <form method="post" action="{{ url_for('bulk_delete_images') }}" id="bulk-form" onsubmit="return confirm('Delete selected encrypted images permanently?');">
+        <form method="post" action="{{ url_for('bulk_delete_images') }}" id="bulk-form" data-confirm="Delete selected encrypted images permanently?">
           <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
           <div class="bulk-actions">
             <label class="bulk-select-all">
@@ -186,7 +192,7 @@
           {% for asset in assets %}
             <article class="asset-card">
               <label class="asset-select">
-                <input type="checkbox" name="asset_ids" value="{{ asset.id }}" form="bulk-form bulk-tag-form">
+                <input type="checkbox" name="asset_ids" value="{{ asset.id }}" form="bulk-form">
               </label>
               <div class="asset-thumb" aria-hidden="true">
                 <span class="asset-thumb-lock">🔒</span>
@@ -198,13 +204,12 @@
                 <p>{{ asset.algorithm }} · {{ asset.image_format }} · {{ asset.width }}x{{ asset.height }}
                   {% if asset.metadata.get('entropy_bits') %} · {{ asset.metadata.entropy_bits }} bits entropy{% endif %}
                 </p>
-                {% if asset.metadata.get('unlock_after') %}
-                  <p class="timelock-chip" data-unlock="{{ asset.metadata.unlock_after }}">🔒 locked until {{ asset.metadata.unlock_after }}</p>
+                {% set unlock_after = asset_unlock_after(asset) %}
+                {% if unlock_after %}
+                  <p class="timelock-chip" data-unlock="{{ unlock_after }}">Locked until {{ unlock_after }}</p>
                 {% endif %}
                 {% if asset.metadata.get('entropy_bits') %}
-                  <div class="entropy-bar" style="--entropy: {{ (asset.metadata.entropy_bits / 8) if asset.metadata.entropy_bits <= 8 else 1 }}">
-                    <span></span>
-                  </div>
+                  <progress class="entropy-bar" max="8" value="{{ asset.metadata.entropy_bits }}" aria-label="Ciphertext entropy"></progress>
                 {% endif %}
                 {% if asset.tags %}
                   <p class="asset-tags">{% for tag in asset.tags.split(',') %}<span class="tag-chip">{{ tag }}</span>{% endfor %}</p>
@@ -245,7 +250,7 @@
                   {% endif %}
                   <button class="button button-secondary preview-button" type="submit">Preview in vault</button>
                 </form>
-                <form method="post" action="{{ url_for('delete_image', asset_id=asset.id) }}" onsubmit="return confirm('Delete this encrypted image permanently?');">
+                <form method="post" action="{{ url_for('delete_image', asset_id=asset.id) }}" data-confirm="Delete this encrypted image permanently?">
                   <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
                   <button class="button button-danger" type="submit">Delete</button>
                 </form>
@@ -269,107 +274,10 @@
       <button type="button" id="close-preview" class="button button-ghost">Close</button>
     </div>
     <img id="preview-image" alt="Decrypted preview">
+    <p id="preview-status" class="preview-status" role="status" aria-live="polite"></p>
   </dialog>
+{% endblock %}
 
-  <script>
-    const select = document.querySelector("#algorithm-select");
-    const passphrase = document.querySelector("#passphrase-field input");
-    const note = document.querySelector("#algorithm-note");
-    const dropTarget = document.querySelector("#drop-target");
-    const imageInput = document.querySelector("#image-input");
-    const uploadForm = document.querySelector("#upload-form");
-
-    function syncAlgorithmFields() {
-      if (select.value === "RSA-HYBRID") {
-        passphrase.required = false;
-        passphrase.disabled = true;
-        passphrase.value = "";
-        note.textContent = "RSA hybrid mode wraps the image data key with your account public key.";
-      } else {
-        passphrase.required = true;
-        passphrase.disabled = false;
-        note.textContent = "AES-GCM passphrase mode derives a key with Scrypt and wraps the image data key.";
-      }
-    }
-
-    select.addEventListener("change", syncAlgorithmFields);
-    syncAlgorithmFields();
-
-    ["dragenter", "dragover"].forEach((eventName) => {
-      dropTarget.addEventListener(eventName, (event) => {
-        event.preventDefault();
-        dropTarget.classList.add("dragover");
-      });
-    });
-
-    ["dragleave", "drop"].forEach((eventName) => {
-      dropTarget.addEventListener(eventName, (event) => {
-        event.preventDefault();
-        dropTarget.classList.remove("dragover");
-      });
-    });
-
-    dropTarget.addEventListener("drop", (event) => {
-      const files = event.dataTransfer?.files;
-      if (!files || files.length === 0) return;
-      imageInput.files = files;
-      dropTarget.querySelector(".drop-title").textContent = files[0].name;
-    });
-
-    imageInput.addEventListener("change", () => {
-      if (imageInput.files?.[0]) {
-        dropTarget.querySelector(".drop-title").textContent = imageInput.files[0].name;
-      }
-    });
-
-    const selectAll = document.querySelector("#select-all");
-    const assetChecks = () => Array.from(document.querySelectorAll('input[name="asset_ids"]'));
-    selectAll?.addEventListener("change", () => {
-      assetChecks().forEach((checkbox) => {
-        checkbox.checked = selectAll.checked;
-      });
-    });
-
-    document.querySelectorAll("[data-unlock]").forEach((node) => {
-      const unlockAt = new Date(node.dataset.unlock);
-      const tick = () => {
-        const remaining = unlockAt.getTime() - Date.now();
-        if (remaining <= 0) {
-          node.textContent = "🔓 unlock window open";
-          return;
-        }
-        const hours = Math.floor(remaining / 3600000);
-        const minutes = Math.floor((remaining % 3600000) / 60000);
-        const seconds = Math.floor((remaining % 60000) / 1000);
-        node.textContent = `🔒 unlock in ${hours}h ${minutes}m ${seconds}s`;
-        window.setTimeout(tick, 1000);
-      };
-      tick();
-    });
-
-    const previewModal = document.querySelector("#preview-modal");
-    const previewImage = document.querySelector("#preview-image");
-    document.querySelector("#close-preview")?.addEventListener("click", () => previewModal.close());
-    document.querySelectorAll(".preview-form").forEach((form) => {
-      form.addEventListener("submit", async (event) => {
-        event.preventDefault();
-        const assetId = form.dataset.assetId;
-        const response = await fetch(`/images/${assetId}/preview`, {
-          method: "POST",
-          body: new FormData(form),
-        });
-        if (!response.ok) {
-          alert("Unable to decrypt preview.");
-          return;
-        }
-        previewImage.src = URL.createObjectURL(await response.blob());
-        previewModal.showModal();
-        window.clearTimeout(window.previewBurnTimer);
-        window.previewBurnTimer = window.setTimeout(() => {
-          previewImage.removeAttribute("src");
-          previewModal.close();
-        }, 30000);
-      });
-    });
-  </script>
+{% block scripts %}
+  <script src="{{ url_for('static', filename='js/dashboard.js') }}" defer></script>
 {% endblock %}

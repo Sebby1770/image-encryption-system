@@ -7,6 +7,7 @@
 {% block content %}
   <section class="auth-grid" aria-label="Authentication">
     <div class="auth-panel">
+      <p class="eyebrow">Private by design</p>
       <h1>{% if mode == "register" %}Create a secure vault{% else %}Sign in to your vault{% endif %}</h1>
       <p>
         Encrypt private photos with AES-GCM or RSA hybrid encryption, then decrypt
@@ -33,10 +34,11 @@
             minlength="10"
             required
           >
+          <button class="password-toggle" type="button" data-password-toggle="password-input" aria-label="Show password">Show</button>
         </label>
         {% if mode == "register" %}
           <div class="password-meter" aria-live="polite">
-            <div id="password-meter-bar" class="password-meter-bar"></div>
+            <progress id="password-meter-bar" class="password-meter-bar" max="5" value="0" aria-label="Password strength"></progress>
             <span id="password-meter-label">Enter at least 10 characters</span>
           </div>
         {% endif %}
@@ -55,32 +57,18 @@
     </div>
 
     <div class="security-panel" aria-label="Security summary">
-      <h2>Protection model</h2>
-      <ul>
-        <li>Per-image AES-256-GCM data keys</li>
-        <li>Passphrase or RSA-OAEP key wrapping</li>
-        <li>Encrypted private keys</li>
-        <li>Owner-only image access</li>
-      </ul>
+      <p class="eyebrow">Protection model</p>
+      <h2>Your originals never enter the vault.</h2>
+      <div class="security-feature-list">
+        <div><strong>01</strong><span>Fresh AES-256-GCM data key for every image</span></div>
+        <div><strong>02</strong><span>Passphrase or RSA-OAEP key wrapping</span></div>
+        <div><strong>03</strong><span>Authenticated file context and owner checks</span></div>
+        <div><strong>04</strong><span>HMAC-sealed activity history</span></div>
+      </div>
     </div>
   </section>
-  {% if mode == "register" %}
-    <script>
-      const passwordInput = document.querySelector("#password-input");
-      const meterBar = document.querySelector("#password-meter-bar");
-      const meterLabel = document.querySelector("#password-meter-label");
-      passwordInput?.addEventListener("input", () => {
-        const value = passwordInput.value;
-        let score = 0;
-        if (value.length >= 10) score += 1;
-        if (value.length >= 14) score += 1;
-        if (/[A-Z]/.test(value) && /[a-z]/.test(value)) score += 1;
-        if (/\d/.test(value)) score += 1;
-        if (/[^A-Za-z0-9]/.test(value)) score += 1;
-        const labels = ["Too short", "Fair", "Good", "Strong", "Excellent"];
-        meterBar.style.width = `${Math.min(100, score * 20)}%`;
-        meterLabel.textContent = value.length < 10 ? "Enter at least 10 characters" : labels[Math.min(score, labels.length - 1)];
-      });
-    </script>
-  {% endif %}
+{% endblock %}
+
+{% block scripts %}
+  <script src="{{ url_for('static', filename='js/auth.js') }}" defer></script>
 {% endblock %}

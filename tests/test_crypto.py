@@ -1,3 +1,4 @@
+from copy import deepcopy
 from io import BytesIO
 
 import pytest
@@ -75,3 +76,53 @@ def test_rsa_hybrid_round_trip() -> None:
     assert decrypted == plaintext
     assert encrypted.metadata["key_wrap"]["type"] == "rsa-oaep-sha256"
 
+
+def test_envelope_rejects_unbounded_scrypt_parameters_before_derivation() -> None:
+    encrypted = encrypt_image_bytes(
+        sample_png(),
+        AES_GCM_PASSPHRASE,
+        passphrase="correct passphrase",
+    )
+    metadata = deepcopy(encrypted.metadata)
+    metadata["key_wrap"]["n"] = 2**30
+
+    with pytest.raises(CryptoError, match="outside the supported range"):
+        decrypt_image_bytes(
+            encrypted.ciphertext,
+            metadata,
+            passphrase="correct passphrase",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("image_nonce", "not base64!", "Encoded image nonce is invalid"),
+        ("image_nonce", "YQ==", "nonce has an invalid length"),
+    ],
+)
+def test_envelope_rejects_malformed_nonce(field: str, value: str, message: str) -> None:
+    encrypted = encrypt_image_bytes(
+        sample_png(),
+        AES_GCM_PASSPHRASE,
+        passphrase="correct passphrase",
+    )
+    metadata = deepcopy(encrypted.metadata)
+    metadata[field] = value
+
+    with pytest.raises(CryptoError, match=message):
+        decrypt_image_bytes(
+            encrypted.ciphertext,
+            metadata,
+            passphrase="correct passphrase",
+        )
+
+
+def test_new_envelopes_are_version_two() -> None:
+    encrypted = encrypt_image_bytes(
+        sample_png(),
+        AES_GCM_PASSPHRASE,
+        passphrase="correct passphrase",
+    )
+
+    assert encrypted.metadata["version"] == 2

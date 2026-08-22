@@ -1,61 +1,98 @@
-# Security Model
+# Security model
 
-## Goals
+## Protected assets
 
-The system protects image confidentiality at rest by encrypting uploaded image
-bytes before they are written to storage. It also restricts image access to the
-authenticated user who uploaded the file.
+The vault protects image confidentiality and integrity at rest, RSA private-key
+confidentiality, account-scoped authorization, and the integrity of recorded
+security events. Decrypted bytes exist in application and browser memory only
+for the duration of a request/preview and are returned with `no-store` headers.
 
-## Non-Goals
+## Trust boundaries
 
-- It does not provide production cloud security by default.
-- It does not scan uploaded files for malware.
-- It does not implement OAuth provider login out of the box.
-- It does not protect decrypted images after they are sent to the user's browser.
+- Browser to Flask: signed, HTTP-only, same-site sessions plus CSRF tokens.
+- API client to Flask: short-lived HS256 JWTs with required issuer, audience,
+  timestamps, subject, and credential-version claims.
+- Flask to SQLite and the local vault: ownership checks, restricted paths,
+  owner-only permissions, atomic blob writes, and authenticated encryption.
+- Password to RSA private key: PKCS#8 `BestAvailableEncryption`.
+- Image passphrase to wrapping key: bounded Scrypt parameters followed by
+  AES-GCM key wrapping.
+- Event writer to audit history: a per-deployment HMAC key protects the chain.
 
-## Trust Boundaries
+## Cryptographic envelope
 
-- Browser to Flask app: session cookies and optional JWT bearer tokens.
-- Flask app to local vault: encrypted files and SQLite metadata.
-- User password to RSA private key: private keys are encrypted at registration.
-- AES passphrase to AES data key: passphrases derive key-wrapping keys with
-  Scrypt.
+Each image receives a fresh 256-bit data key and 96-bit nonce. AES-256-GCM
+encrypts the untouched upload. Version 2 serializes these immutable values into
+associated data:
 
-## Encryption Design
+- owner id;
+- algorithm;
+- original upload filename;
+- detected MIME type and image format;
+- dimensions; and
+- optional time-lock value.
 
-Uploaded images are never stored as plaintext. The app generates a fresh
-256-bit random data key for each image. Image bytes are encrypted with
-AES-GCM using a unique 96-bit nonce.
+Changing ciphertext or any bound context makes decryption fail. Mutable labels
+such as display rename, tags, and notes are intentionally outside the envelope.
+Version 1 remains readable for migration compatibility.
 
-The data key is protected in one of two ways:
+Passphrase mode derives a 256-bit wrapping key with Scrypt and wraps the data key
+with a second AES-GCM operation. Metadata-supplied Scrypt cost, salt, nonce, and
+wrapped-key lengths are validated before expensive work. RSA mode uses a
+3072-bit account key and OAEP with SHA-256/MGF1-SHA256.
 
-- AES-GCM passphrase mode derives a 256-bit wrapping key from a passphrase using
-  Scrypt and uses that key to encrypt the data key.
-- RSA hybrid mode encrypts the data key with the user's RSA public key using
-  RSA-OAEP with SHA-256.
+## Authorization and credential lifecycle
 
-AES-GCM provides confidentiality and integrity. If ciphertext or metadata is
-modified, decryption fails.
+Every asset operation compares the authenticated user with the database owner;
+version 2 also binds that owner to the ciphertext. Password changes re-encrypt
+the private key, increment `auth_version`, preserve the initiating session, and
+invalidate older sessions and JWTs. Login, token issuance, decryption, and
+registration have bounded in-process throttles.
 
-## Access Control
+The in-memory throttles are suitable for a single-process demonstration. A
+multi-worker or distributed deployment must replace them with a shared limiter.
 
-The web dashboard requires login. Each encrypted image record is tied to a
-`user_id`. Decryption routes check ownership before reading encrypted bytes.
-API routes require a valid signed JWT.
+## Audit integrity
 
-## Local File Permissions
+Audit v2 uses HMAC-SHA256 over a canonical event payload and the previous event
+digest. Verification reads the complete per-user history rather than a truncated
+window. Legacy unkeyed chains are upgraded once on startup.
 
-On POSIX hosts, generated key and vault directories are restricted to the owning
-user. Per-user PEM files and encrypted vault blobs are written with owner-only
-read/write permissions.
+`AUDIT_HMAC_KEY` must be stable and secret. The chain detects database changes by
+an actor who lacks that key; it cannot provide non-repudiation against an actor
+who controls both the database and application secrets.
 
-## Recommended Production Hardening
+## Parser and storage controls
 
-- Use HTTPS everywhere.
-- Store secrets in a managed secret store.
-- Extend rate limiting to registration and decrypt endpoints.
-- Add audit logs for encryption, decryption, and failed access attempts.
-- Move encrypted objects to S3 with SSE-KMS or a similar managed storage layer.
-- Add malware and file-type scanning for uploads.
-- Consider envelope encryption with a managed KMS instead of local key files.
-- Add OAuth using a trusted identity provider if the app will be multi-user.
+- Requests are capped at 16 MiB and Pillow enforces a pixel ceiling.
+- Images are verified and decoded before encryption.
+- ZIP import inspection limits member count and expanded manifest bytes; archive
+  members are never extracted.
+- Bundle base64 and versions are strict; KDF cost is bounded.
+- Embedded CLI filenames are reduced to safe basenames and existing files are
+  not replaced without `--force`.
+- Database, key, ciphertext, bundle, and decrypted output files receive
+  owner-only permissions on POSIX.
+- Stored ciphertext filenames must match an internally generated UUID form.
+
+## Browser controls
+
+State-changing browser requests require CSRF tokens. Responses set a restrictive
+Content Security Policy, `nosniff`, clickjacking protection, a no-referrer policy,
+and a minimal permissions policy. Non-static responses are private and
+non-cacheable. Hosted environments should enable secure cookies and HSTS behind
+correct HTTPS termination.
+
+## Non-goals and residual risks
+
+- This project does not scan uploads for malware or protect a host already
+  compromised while plaintext is being decrypted.
+- It has no password/key recovery mechanism. Losing a passphrase or RSA password
+  can make data unrecoverable.
+- The workflow time-lock is server policy, not cryptographic trusted time.
+- Exported ciphertext can be copied, deleted, or attacked offline.
+- Local SQLite and filesystem storage are not a managed KMS, HSM, backup, or
+  disaster-recovery system.
+- Metadata such as filenames and dimensions is visible to a local operator.
+- A public deployment requires TLS, a production WSGI server, shared rate
+  limiting, secret management, backups, monitoring, and independent review.

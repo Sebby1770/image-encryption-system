@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.0.0 — 2026-08-22
+
+### Security
+- Added version 2 envelopes that authenticate ownership, algorithm, detected file
+  properties, and workflow time-locks alongside ciphertext.
+- Bounded and strictly validated Scrypt, nonce, key, base64, bundle, image, and
+  ZIP-manifest inputs before expensive processing.
+- Replaced the forgeable plain-hash event chain with HMAC-SHA256 and fixed
+  verification/export beyond 500 events.
+- Added password-change revocation for older sessions and JWTs, decryption and
+  registration throttles, no-store responses, and a restrictive CSP.
+- Made vault, CLI bundle, and decrypted-output writes atomic and owner-only;
+  embedded CLI filenames can no longer select an output path.
+
+### Experience
+- Redesigned the responsive vault and authentication views with clearer security
+  guarantees, accessible focus states, reduced-motion handling, stronger status
+  feedback, and CSP-compatible external JavaScript.
+- Added secure CLI prompting, passphrase-file support, overwrite protection, and
+  more actionable validation errors.
+
+### Quality
+- Added regression coverage for hostile KDF metadata, context tampering, archive
+  decompression, credential revocation, long audit chains, and CLI path safety.
+- Added Ruff configuration, expanded documentation, and a production-ready
+  environment template.
+
 ## 0.7.0 — 2026-07-07
 
 ### Added

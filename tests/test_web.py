@@ -1,7 +1,9 @@
-from io import BytesIO
+import json
 import os
 import re
 import stat
+import zipfile
+from io import BytesIO
 
 import pytest
 from PIL import Image
@@ -329,7 +331,11 @@ def test_vault_search_sort_and_bulk_delete(tmp_path) -> None:
     assert assets[0].original_filename == "beta.png"
 
     all_assets = store.list_assets(user.id, sort="name")
-    assert [asset.original_filename for asset in all_assets] == ["alpha.png", "beta.png", "gamma.png"]
+    assert [asset.original_filename for asset in all_assets] == [
+        "alpha.png",
+        "beta.png",
+        "gamma.png",
+    ]
 
     token = csrf_token(client, "/dashboard")
     ids = [asset.id for asset in store.list_assets(user.id)[:2]]
@@ -513,7 +519,7 @@ def test_v050_notes_bulk_tags_password_docs_and_duplicate(tmp_path) -> None:
     assert store.authenticate_user("alice", "new horse battery")
 
     docs = client.get("/api/docs").get_json()
-    assert docs["version"] == "0.7.0"
+    assert docs["version"] == "1.0.0"
     assert any(item["path"] == "/api/stats" for item in docs["endpoints"])
 
 
@@ -546,7 +552,8 @@ def test_v060_audit_chain_entropy_and_timelock(tmp_path) -> None:
     )
     asset = store.list_assets(user.id)[0]
     assert asset.metadata.get("entropy_bits", 0) > 0
-    assert asset.metadata.get("unlock_after") == future
+    assert asset.metadata.get("unlock_after") == "2099-12-31T23:59:00+00:00"
+    assert asset.metadata["aad"]["unlock_after"] == "2099-12-31T23:59:00+00:00"
 
     token = csrf_token(client, "/dashboard")
     locked = client.post(
@@ -605,7 +612,9 @@ def test_v070_vault_health_audit_export_and_decrypt_failures(tmp_path) -> None:
         f"/images/{asset.id}/preview",
         data={"passphrase": "wrong passphrase", "_csrf_token": token},
     )
-    failures = [event for event in store.list_audit_events(user.id) if event.action == "decrypt_failed"]
+    failures = [
+        event for event in store.list_audit_events(user.id) if event.action == "decrypt_failed"
+    ]
     assert failures
 
     response = client.post(
@@ -634,3 +643,176 @@ def test_production_requires_strong_secrets(tmp_path) -> None:
             SECRET_KEY="dev-secret-change-me-dev-secret-change-me",
             JWT_SECRET="jwt-secret-jwt-secret-jwt-secret",
         )
+
+
+def test_sensitive_responses_use_csp_and_never_cache(tmp_path) -> None:
+    client = make_app(tmp_path).test_client()
+
+    response = client.get("/register")
+
+    assert response.headers["Cache-Control"] == "no-store, private"
+    assert response.headers["Pragma"] == "no-cache"
+    policy = response.headers["Content-Security-Policy"]
+    assert "script-src 'self'" in policy
+    assert "'unsafe-inline'" not in policy
+    assert "frame-ancestors 'none'" in policy
+
+
+def test_password_change_revokes_existing_sessions_and_tokens(tmp_path) -> None:
+    app = make_app(tmp_path)
+    primary = app.test_client()
+    secondary = app.test_client()
+
+    token = csrf_token(primary, "/register")
+    primary.post(
+        "/register",
+        data={"username": "alice", "password": "correct horse battery", "_csrf_token": token},
+    )
+    token = csrf_token(secondary, "/")
+    secondary.post(
+        "/login",
+        data={"username": "alice", "password": "correct horse battery", "_csrf_token": token},
+    )
+    response = primary.post(
+        "/api/token",
+        json={"username": "alice", "password": "correct horse battery"},
+    )
+    old_jwt = response.get_json()["token"]
+
+    token = csrf_token(primary, "/dashboard")
+    response = primary.post(
+        "/account/password",
+        data={
+            "current_password": "correct horse battery",
+            "new_password": "new correct horse battery",
+            "confirm_password": "new correct horse battery",
+            "_csrf_token": token,
+        },
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+    assert primary.get("/dashboard").status_code == 200
+    assert secondary.get("/dashboard").status_code == 302
+    revoked = primary.get("/api/images", headers={"Authorization": f"Bearer {old_jwt}"})
+    assert revoked.status_code == 401
+
+
+def test_authenticated_context_detects_vault_record_tampering(tmp_path) -> None:
+    app = make_app(tmp_path)
+    client = app.test_client()
+    token = csrf_token(client, "/register")
+    client.post(
+        "/register",
+        data={"username": "alice", "password": "correct horse battery", "_csrf_token": token},
+    )
+    token = csrf_token(client, "/dashboard")
+    client.post(
+        "/images",
+        data={
+            "algorithm": AES_GCM_PASSPHRASE,
+            "passphrase": "image passphrase",
+            "image": (BytesIO(sample_png()), "secret.png"),
+            "_csrf_token": token,
+        },
+        content_type="multipart/form-data",
+    )
+    store = app.extensions["vault_store"]
+    user = store.get_user_by_username("alice")
+    asset = store.list_assets(user.id)[0]
+
+    with store._connect() as database:
+        database.execute(
+            "UPDATE encrypted_assets SET width = width + 1 WHERE id = ?",
+            (asset.id,),
+        )
+
+    token = csrf_token(client, "/dashboard")
+    response = client.post(
+        f"/images/{asset.id}/preview",
+        data={"passphrase": "image passphrase", "_csrf_token": token},
+    )
+    assert response.status_code == 400
+    assert b"context does not match" in response.data
+
+
+def test_vault_manifest_validation_bounds_decompression(tmp_path) -> None:
+    app = make_app(tmp_path, MAX_VAULT_MANIFEST_BYTES=64)
+    client = app.test_client()
+    token = csrf_token(client, "/register")
+    client.post(
+        "/register",
+        data={"username": "alice", "password": "correct horse battery", "_csrf_token": token},
+    )
+    archive = BytesIO()
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        bundle.writestr("manifest.json", json.dumps([{"notes": "x" * 2_000}]))
+    archive.seek(0)
+
+    token = csrf_token(client, "/dashboard")
+    response = client.post(
+        "/vault/import",
+        data={"archive": (archive, "export.zip"), "_csrf_token": token},
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+    assert b"manifest.json is too large" in response.data
+
+
+def test_audit_verification_checks_more_than_500_events(tmp_path) -> None:
+    app = make_app(tmp_path)
+    store = app.extensions["vault_store"]
+    user = store.create_user("alice", "correct horse battery")
+    for index in range(505):
+        store.record_audit(user.id, "test", f"event {index}")
+
+    result = store.verify_audit_chain(user.id)
+
+    assert result["valid"] is True
+    assert result["checked"] == 505
+
+
+def test_decryption_attempts_are_throttled(tmp_path) -> None:
+    app = make_app(
+        tmp_path,
+        DECRYPT_RATE_LIMIT_ATTEMPTS=1,
+        DECRYPT_RATE_LIMIT_WINDOW_SECONDS=300,
+        DECRYPT_RATE_LIMIT_LOCKOUT_SECONDS=300,
+    )
+    client = app.test_client()
+    token = csrf_token(client, "/register")
+    client.post(
+        "/register",
+        data={"username": "alice", "password": "correct horse battery", "_csrf_token": token},
+    )
+    token = csrf_token(client, "/dashboard")
+    client.post(
+        "/images",
+        data={
+            "algorithm": AES_GCM_PASSPHRASE,
+            "passphrase": "image passphrase",
+            "image": (BytesIO(sample_png()), "secret.png"),
+            "_csrf_token": token,
+        },
+        content_type="multipart/form-data",
+    )
+    store = app.extensions["vault_store"]
+    user = store.get_user_by_username("alice")
+    asset = store.list_assets(user.id)[0]
+
+    token = csrf_token(client, "/dashboard")
+    first = client.post(
+        f"/images/{asset.id}/preview",
+        data={"passphrase": "wrong passphrase", "_csrf_token": token},
+    )
+    token = csrf_token(client, "/dashboard")
+    second = client.post(
+        f"/images/{asset.id}/preview",
+        data={"passphrase": "image passphrase", "_csrf_token": token},
+    )
+
+    assert first.status_code == 400
+    assert second.status_code == 429
+    assert int(second.headers["Retry-After"]) > 0
