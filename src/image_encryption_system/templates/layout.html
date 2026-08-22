@@ -3,12 +3,18 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="A local-first encrypted image vault using authenticated encryption.">
     <title>{% block title %}Image Encryption System{% endblock %}</title>
+    <link rel="icon" href="{{ url_for('static', filename='favicon.svg') }}" type="image/svg+xml">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
   </head>
   <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
     <header class="topbar">
-      <a class="brand" href="{{ url_for('index') }}">Image Encryption System</a>
+      <a class="brand" href="{{ url_for('index') }}">
+        <span class="brand-mark" aria-hidden="true">IE</span>
+        <span>Image Encryption System</span>
+      </a>
       {% if current_user %}
         <nav class="nav-links" aria-label="Vault">
           <a href="{{ url_for('dashboard') }}">Vault</a>
@@ -24,7 +30,7 @@
       {% endif %}
     </header>
 
-    <main class="shell">
+    <main class="shell" id="main-content">
       {% with messages = get_flashed_messages(with_categories=true) %}
         {% if messages %}
           <div class="flash-stack" role="status">
@@ -37,5 +43,10 @@
 
       {% block content %}{% endblock %}
     </main>
+    <footer class="site-footer">
+      <span>Local-first encrypted storage</span>
+      <span>AES-256-GCM · RSA-OAEP · HMAC audit chain</span>
+    </footer>
+    {% block scripts %}{% endblock %}
   </body>
 </html>

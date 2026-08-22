@@ -1,13 +1,13 @@
-# Security Model
+# Security model
 
-## Goals
+## Protected assets
 
 The system protects image confidentiality at rest by encrypting uploaded image
 bytes before they are written to storage. Access is limited to the authenticated
 owner and to users the owner explicitly shares with. Sharing never writes
 plaintext and never hands the owner's passphrase to the recipient.
 
-## Non-Goals
+## Trust boundaries
 
 - It does not provide production cloud security by default.
 - It does not scan uploaded files for malware.
@@ -15,7 +15,7 @@ plaintext and never hands the owner's passphrase to the recipient.
 - It does not protect decrypted images after they are sent to the user's browser.
 - It does not hide metadata such as original filenames from the vault operator.
 
-## Trust Boundaries
+## Cryptographic envelope
 
 - Browser to Flask app: session cookies, CSRF tokens on HTML POSTs, and
   optional JWT bearer tokens.
@@ -29,18 +29,23 @@ plaintext and never hands the owner's passphrase to the recipient.
   Only the SHA-256 of the token is stored. Anyone who has the URL can decrypt
   until expiry, download cap, or revoke.
 
-## Encryption Design
+- owner id;
+- algorithm;
+- original upload filename;
+- detected MIME type and image format;
+- dimensions; and
+- optional time-lock value.
 
-Uploaded images are never stored as plaintext. The app generates a fresh
-256-bit random data key for each image. Image bytes are encrypted with
-AES-GCM using a unique 96-bit nonce.
+Changing ciphertext or any bound context makes decryption fail. Mutable labels
+such as display rename, tags, and notes are intentionally outside the envelope.
+Version 1 remains readable for migration compatibility.
 
-The data key is protected in one of two ways:
+Passphrase mode derives a 256-bit wrapping key with Scrypt and wraps the data key
+with a second AES-GCM operation. Metadata-supplied Scrypt cost, salt, nonce, and
+wrapped-key lengths are validated before expensive work. RSA mode uses a
+3072-bit account key and OAEP with SHA-256/MGF1-SHA256.
 
-- AES-GCM passphrase mode derives a 256-bit wrapping key from a passphrase using
-  Scrypt and uses that key to encrypt the data key.
-- RSA hybrid mode encrypts the data key with the user's RSA public key using
-  RSA-OAEP with SHA-256.
+## Authorization and credential lifecycle
 
 Sharing unwraps that data key in memory and wraps it again with RSA-OAEP for
 the recipient. Recipients always decrypt on the RSA path with their own
@@ -49,7 +54,8 @@ password-protected private key.
 AES-GCM provides confidentiality and integrity. If ciphertext or metadata is
 modified, decryption fails.
 
-## Access Control
+The in-memory throttles are suitable for a single-process demonstration. A
+multi-worker or distributed deployment must replace them with a shared limiter.
 
 The web dashboard requires login. Each encrypted image record is tied to a
 `user_id`. Decryption routes allow the owner or a non-expired row in `shares`.
@@ -74,7 +80,9 @@ API routes require a valid signed JWT whose `ver` claim matches
 - Passwords are compared with Werkzeug's constant-time `check_password_hash`.
 - Backups export ciphertext and wrap metadata only — never private keys.
 
-## Recommended Production Hardening
+Audit v2 uses HMAC-SHA256 over a canonical event payload and the previous event
+digest. Verification reads the complete per-user history rather than a truncated
+window. Legacy unkeyed chains are upgraded once on startup.
 
 - Use HTTPS everywhere.
 - Store secrets in a managed secret store.

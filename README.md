@@ -7,7 +7,10 @@ disk. Per-image data keys are wrapped with Scrypt+AES or RSA-OAEP. Version
 **2.3.0** adds capability link shares, notes/favorites, ciphertext integrity
 checks, session idle timeout, audit CSV, and CLI rewrap/hash.
 
-## Features
+Version 1.0 hardens the complete envelope: owner and file context are
+authenticated, hostile metadata is bounded before key derivation, decrypted
+responses are non-cacheable, audit history is HMAC-sealed, and password changes
+revoke older sessions and API tokens.
 
 - AES-256-GCM encryption for image bytes (cryptography.io / OpenSSL).
 - RSA-OAEP hybrid mode: RSA wraps a fresh 256-bit AES data key.
@@ -40,7 +43,16 @@ checks, session idle timeout, audit CSV, and CLI rewrap/hash.
 - JWT API for listing images and reading the audit trail (`ver` claim).
 - Tests for crypto, sharing, revoke, expiry, backup, CLI, CSRF, and lockout.
 
-## Tech Stack
+- AES-256-GCM encryption for PNG, JPEG, WEBP, GIF, BMP, and TIFF images.
+- Scrypt + AES-GCM passphrase wrapping or 3072-bit RSA-OAEP-SHA256 wrapping.
+- Authenticated owner, algorithm, MIME type, format, dimensions, filename, and
+  optional workflow time-lock.
+- Encrypted per-user RSA private keys and owner-only vault files.
+- Search, tags, notes, rename, duplicate detection, previews, bulk actions,
+  vault exports, and bounded import inspection.
+- HMAC-SHA256 audit chain with complete-chain verification and export.
+- JWT API with issuer, audience, expiry, and credential-version validation.
+- Portable, overwrite-safe `ies` CLI with secure prompting and passphrase files.
 
 - Python 3.10+
 - Flask
@@ -54,6 +66,7 @@ PyCrypto is intentionally not used because it is deprecated.
 ## Quick Start
 
 ```bash
+git clone https://github.com/Sebby1770/image-encryption-system.git
 cd image-encryption-system
 python3 -m venv .venv
 source .venv/bin/activate
@@ -61,7 +74,7 @@ pip install -e ".[dev]"
 python run.py
 ```
 
-Open `http://127.0.0.1:5000`, create an account, and upload an image.
+Open <http://127.0.0.1:5000>, create an account, and upload an image.
 
 ## CLI
 
@@ -128,7 +141,9 @@ account: vault blobs, shares, RSA keys, audit rows, and the user.
 ## Environment
 
 ```bash
-cp .env.example .env
+python -m pip install -e .
+ies encrypt photo.png -o photo.ies
+ies decrypt photo.ies -o recovered.png
 ```
 
 | Variable | Purpose |
@@ -160,19 +175,16 @@ trust boundaries, and production hardening notes.
 
 ## API
 
-Create a JWT:
-
 ```bash
 curl -X POST http://127.0.0.1:5000/api/token \
-  -H "Content-Type: application/json" \
+  -H 'Content-Type: application/json' \
   -d '{"username":"alice","password":"correct horse battery staple"}'
-```
 
 List encrypted images (owned + shared):
 
 ```bash
 curl http://127.0.0.1:5000/api/images \
-  -H "Authorization: Bearer <token>"
+  -H 'Authorization: Bearer <token>'
 ```
 
 Read your audit log:
@@ -185,6 +197,8 @@ curl http://127.0.0.1:5000/api/audit \
 ## Tests
 
 ```bash
+python -m pip install -e '.[dev]'
+ruff check src tests scripts run.py
 pytest
 ```
 
@@ -206,7 +220,7 @@ image-encryption-system/
   docs/                # Threat model
 ```
 
-## Security Notes
+## License
 
 This is a portfolio-ready educational project, not a complete production
 security product. Review the threat model before storing real sensitive photos.

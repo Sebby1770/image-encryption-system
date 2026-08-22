@@ -7,6 +7,7 @@
 {% block content %}
   <section class="auth-grid" aria-label="Authentication">
     <div class="auth-panel">
+      <p class="eyebrow">Private by design</p>
       <h1>{% if mode == "register" %}Create a secure vault{% else %}Sign in to your vault{% endif %}</h1>
       <p>
         Encrypt private photos with AES-GCM or RSA hybrid encryption, then decrypt
@@ -26,13 +27,21 @@
         <label>
           Password
           <input
+            id="password-input"
             name="password"
             type="password"
             autocomplete="{% if mode == 'register' %}new-password{% else %}current-password{% endif %}"
             minlength="10"
             required
           >
+          <button class="password-toggle" type="button" data-password-toggle="password-input" aria-label="Show password">Show</button>
         </label>
+        {% if mode == "register" %}
+          <div class="password-meter" aria-live="polite">
+            <progress id="password-meter-bar" class="password-meter-bar" max="5" value="0" aria-label="Password strength"></progress>
+            <span id="password-meter-label">Enter at least 10 characters</span>
+          </div>
+        {% endif %}
         <button class="button button-primary" type="submit">
           {% if mode == "register" %}Create account{% else %}Sign in{% endif %}
         </button>
@@ -60,3 +69,6 @@
   </section>
 {% endblock %}
 
+{% block scripts %}
+  <script src="{{ url_for('static', filename='js/auth.js') }}" defer></script>
+{% endblock %}

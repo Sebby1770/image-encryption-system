@@ -1,3 +1,4 @@
+from copy import deepcopy
 from io import BytesIO
 
 import pytest

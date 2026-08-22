@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json as json_module
+import secrets
+import time
+import zipfile
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from hashlib import sha256
 import hmac
 from io import BytesIO
+from math import ceil
 from pathlib import Path
 import secrets
 from sqlite3 import IntegrityError
@@ -30,7 +38,7 @@ from markupsafe import Markup, escape
 from PIL import Image, UnidentifiedImageError
 from werkzeug.exceptions import RequestEntityTooLarge
 
-from .config import Config
+from .config import APP_VERSION, Config
 from .crypto import (
     AES_GCM_PASSPHRASE,
     RSA_HYBRID,
@@ -47,6 +55,75 @@ from .storage import AssetShare, EncryptedAsset, LinkShare, User, VaultStore
 
 
 F = TypeVar("F", bound=Callable)
+
+
+class CredentialThrottle:
+    def __init__(
+        self,
+        *,
+        max_attempts: int,
+        window_seconds: int,
+        lockout_seconds: int,
+        max_keys: int = 10_000,
+    ):
+        self.max_attempts = max_attempts
+        self.window_seconds = window_seconds
+        self.lockout_seconds = lockout_seconds
+        self.max_keys = max_keys
+        self.failures: dict[str, list[float]] = {}
+        self.locked_until: dict[str, float] = {}
+        self._lock = Lock()
+
+    def is_limited(self, key: str) -> bool:
+        return self.retry_after(key) is not None
+
+    def retry_after(self, key: str) -> int | None:
+        with self._lock:
+            now = time.monotonic()
+            until = self.locked_until.get(key)
+            if until is None:
+                return None
+            if until <= now:
+                self.locked_until.pop(key, None)
+                return None
+            return max(1, ceil(until - now))
+
+    def record_failure(self, key: str) -> None:
+        with self._lock:
+            now = time.monotonic()
+            self._make_room(key, now)
+            window_start = now - self.window_seconds
+            attempts = [stamp for stamp in self.failures.get(key, []) if stamp >= window_start]
+            attempts.append(now)
+            if len(attempts) >= self.max_attempts:
+                self.locked_until[key] = now + self.lockout_seconds
+                self.failures[key] = []
+            else:
+                self.failures[key] = attempts
+
+    def reset(self, key: str) -> None:
+        with self._lock:
+            self.failures.pop(key, None)
+            self.locked_until.pop(key, None)
+
+    def _make_room(self, incoming_key: str, now: float) -> None:
+        known_keys = set(self.failures) | set(self.locked_until)
+        if incoming_key in known_keys or len(known_keys) < self.max_keys:
+            return
+        window_start = now - self.window_seconds
+        self.failures = {
+            key: [stamp for stamp in attempts if stamp >= window_start]
+            for key, attempts in self.failures.items()
+            if any(stamp >= window_start for stamp in attempts)
+        }
+        self.locked_until = {key: until for key, until in self.locked_until.items() if until > now}
+        while len(set(self.failures) | set(self.locked_until)) >= self.max_keys:
+            if self.failures:
+                self.failures.pop(next(iter(self.failures)))
+            elif self.locked_until:
+                self.locked_until.pop(next(iter(self.locked_until)))
+            else:
+                break
 
 
 def create_app(test_config: dict | None = None) -> Flask:
@@ -67,6 +144,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         database_path=app.config["DATABASE_PATH"],
         vault_dir=app.config["VAULT_DIR"],
         key_dir=app.config["KEY_DIR"],
+        audit_key=str(app.config["AUDIT_HMAC_KEY"]).encode("utf-8"),
     )
     store.init()
     app.extensions["vault_store"] = store
@@ -126,12 +204,22 @@ def create_app(test_config: dict | None = None) -> Flask:
     def register() -> Response:
         username = request.form.get("username", "")
         password = request.form.get("password", "")
+        throttle = app.extensions["register_throttle"]
+        throttle_key = f"register:{_remote_address()}"
+        retry_after = throttle.retry_after(throttle_key)
+        if retry_after is not None:
+            flash(
+                f"Account creation is temporarily limited. Try again in {retry_after} seconds.",
+                "error",
+            )
+            return redirect(url_for("register_form"))
+        throttle.record_failure(throttle_key)
         try:
             user = store.create_user(username, password)
         except IntegrityError:
             flash("That username is already registered.", "error")
             return redirect(url_for("register_form"))
-        except ValueError as exc:
+        except (CryptoError, ValueError) as exc:
             flash(str(exc), "error")
             return redirect(url_for("register_form"))
 
@@ -242,6 +330,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         upload = request.files.get("image")
         algorithm = request.form.get("algorithm", AES_GCM_PASSPHRASE)
         passphrase = request.form.get("passphrase", "")
+        tags = request.form.get("tags", "")
 
         if upload is None or not upload.filename:
             flash("Choose an image to encrypt.", "error")
@@ -257,12 +346,14 @@ def create_app(test_config: dict | None = None) -> Flask:
             image_info = _inspect_image(image_bytes)
             aad = _asset_aad(user.id, upload.filename, image_info["mime_type"])
             public_key = store.read_public_key(user.id) if algorithm == RSA_HYBRID else None
-            result = encrypt_image_bytes(
-                image_bytes,
-                algorithm,
+            ciphertext, metadata, image_info = encrypt_upload(
+                user_id=user.id,
+                filename=safe_filename,
+                image_bytes=image_bytes,
+                algorithm=algorithm,
                 passphrase=passphrase if algorithm == AES_GCM_PASSPHRASE else None,
                 public_key_pem=public_key,
-                aad=aad,
+                unlock_after=unlock_after,
             )
             metadata = {
                 **result.metadata,
@@ -274,14 +365,16 @@ def create_app(test_config: dict | None = None) -> Flask:
             }
             asset = store.save_asset(
                 user_id=user.id,
-                original_filename=upload.filename,
+                original_filename=safe_filename,
                 algorithm=algorithm,
-                mime_type=image_info["mime_type"],
-                image_format=image_info["format"],
-                width=image_info["width"],
-                height=image_info["height"],
+                mime_type=str(image_info["mime_type"]),
+                image_format=str(image_info["format"]),
+                width=int(image_info["width"]),
+                height=int(image_info["height"]),
                 metadata=metadata,
-                ciphertext=result.ciphertext,
+                ciphertext=ciphertext,
+                tags=tags,
+                notes=request.form.get("notes", ""),
             )
             _audit(store, user.id, "upload", asset.id)
         except (CryptoError, ValueError, UnidentifiedImageError) as exc:
@@ -291,10 +384,22 @@ def create_app(test_config: dict | None = None) -> Flask:
         flash("Image encrypted and stored in the vault.", "success")
         return redirect(url_for("dashboard"))
 
-    @app.post("/images/<int:asset_id>/decrypt")
+    @app.post("/images/<int:asset_id>/preview")
     @login_required(store)
-    def decrypt_image(asset_id: int) -> Response:
+    def preview_image(asset_id: int) -> Response:
         user = _current_user(store)
+        throttle = app.extensions["decrypt_throttle"]
+        throttle_key = _decrypt_throttle_key(user.id, asset_id)
+        retry_after = throttle.retry_after(throttle_key)
+        if retry_after is not None:
+            response = jsonify(
+                {
+                    "error": "too many failed decryption attempts",
+                    "retry_after_seconds": retry_after,
+                }
+            )
+            response.headers["Retry-After"] = str(retry_after)
+            return response, 429
         try:
             asset, share = _accessible_asset(store, asset_id, user)
             ciphertext = store.read_ciphertext(asset)
@@ -656,10 +761,13 @@ def create_app(test_config: dict | None = None) -> Flask:
 
         _login_success(app, store, user)
         now = datetime.now(timezone.utc)
+        lifetime_seconds = int(app.config["JWT_LIFETIME_SECONDS"])
         token = jwt.encode(
             {
                 "sub": str(user.id),
                 "iss": app.config["JWT_ISSUER"],
+                "aud": app.config["JWT_AUDIENCE"],
+                "ver": user.auth_version,
                 "iat": now,
                 "exp": now + timedelta(hours=2),
                 "ver": user.token_version,
@@ -667,12 +775,20 @@ def create_app(test_config: dict | None = None) -> Flask:
             app.config["JWT_SECRET"],
             algorithm="HS256",
         )
-        return jsonify({"token": token, "token_type": "Bearer", "expires_in": 7200})
+        return jsonify(
+            {
+                "token": token,
+                "token_type": "Bearer",
+                "expires_in": lifetime_seconds,
+            }
+        )
 
     @app.get("/api/images")
     @jwt_required(store)
     def api_images() -> Response:
         user = g.api_user
+        query = request.args.get("q", "")
+        tag = request.args.get("tag", "")
         return jsonify(
             {
                 "images": [_asset_payload(asset) for asset in store.list_assets(user.id)],
@@ -800,6 +916,8 @@ def jwt_required(store: VaultStore) -> Callable[[F], F]:
                     current_app.config["JWT_SECRET"],
                     algorithms=["HS256"],
                     issuer=current_app.config["JWT_ISSUER"],
+                    audience=current_app.config["JWT_AUDIENCE"],
+                    options={"require": ["aud", "exp", "iat", "iss", "sub", "ver"]},
                 )
                 user = store.get_user(int(payload["sub"]))
                 token_version = int(payload.get("ver", 1))
@@ -865,6 +983,54 @@ def _current_user(store: VaultStore) -> User | None:
             return None
         session["last_seen"] = now
     return user
+
+
+def _csrf_token() -> str:
+    token = session.get("_csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["_csrf_token"] = token
+    return str(token)
+
+
+def _valid_csrf_token(token: str) -> bool:
+    expected = session.get("_csrf_token")
+    return bool(expected and token and hmac.compare_digest(str(expected), str(token)))
+
+
+def _validate_runtime_secrets(app: Flask) -> None:
+    positive_integer_keys = (
+        "AUTH_RATE_LIMIT_ATTEMPTS",
+        "AUTH_RATE_LIMIT_WINDOW_SECONDS",
+        "AUTH_RATE_LIMIT_LOCKOUT_SECONDS",
+        "DECRYPT_RATE_LIMIT_ATTEMPTS",
+        "DECRYPT_RATE_LIMIT_WINDOW_SECONDS",
+        "DECRYPT_RATE_LIMIT_LOCKOUT_SECONDS",
+        "JWT_LIFETIME_SECONDS",
+        "MAX_IMAGE_PIXELS",
+        "MAX_VAULT_ARCHIVE_MEMBERS",
+        "MAX_VAULT_MANIFEST_BYTES",
+        "PERMANENT_SESSION_LIFETIME_SECONDS",
+        "REGISTER_RATE_LIMIT_ATTEMPTS",
+        "REGISTER_RATE_LIMIT_WINDOW_SECONDS",
+        "REGISTER_RATE_LIMIT_LOCKOUT_SECONDS",
+    )
+    for key in positive_integer_keys:
+        if int(app.config[key]) <= 0:
+            raise RuntimeError(f"{key} must be a positive integer.")
+
+    if not app.config.get("REQUIRE_STRONG_SECRETS"):
+        return
+
+    weak_values = {
+        "dev-secret-change-me-dev-secret-change-me",
+        "change-me-before-deploying-use-at-least-32-bytes",
+        "change-me-too-use-at-least-32-bytes",
+    }
+    for key in ("SECRET_KEY", "JWT_SECRET", "AUDIT_HMAC_KEY"):
+        value = str(app.config.get(key, ""))
+        if value in weak_values or len(value.encode("utf-8")) < 32:
+            raise RuntimeError(f"{key} must be set to a strong value before deployment.")
 
 
 def _owned_asset(store: VaultStore, asset_id: int, user: User) -> EncryptedAsset:
@@ -1064,20 +1230,10 @@ def _allowed_extension(filename: str, allowed_extensions: set[str]) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in allowed_extensions
 
 
-def _inspect_image(image_bytes: bytes) -> dict[str, int | str]:
-    with Image.open(BytesIO(image_bytes)) as image:
-        image.verify()
-
-    with Image.open(BytesIO(image_bytes)) as image:
-        image_format = image.format or "UNKNOWN"
-        mime_type = Image.MIME.get(image_format, "application/octet-stream")
-        width, height = image.size
-        return {
-            "format": image_format,
-            "mime_type": mime_type,
-            "width": width,
-            "height": height,
-        }
+def _credential_throttle_key(username: str) -> str:
+    normalized = username.strip().lower() or "anonymous"
+    identity_digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+    return f"{_remote_address()}:{identity_digest}"
 
 
 def _strip_image_exif(image_bytes: bytes) -> bytes:
@@ -1167,8 +1323,186 @@ def _asset_aad(user_id: int, original_filename: str, mime_type: str) -> bytes:
 
 def _aad_from_metadata(asset: EncryptedAsset) -> bytes:
     aad = asset.metadata.get("aad", {})
-    return _asset_aad(
-        int(aad.get("user_id", asset.user_id)),
-        str(aad.get("original_filename", asset.original_filename)),
-        str(aad.get("mime_type", asset.mime_type)),
+    if not isinstance(aad, dict):
+        raise CryptoError("Encrypted asset context is invalid.")
+    try:
+        version = int(aad.get("version", 1))
+        context_user_id = int(aad.get("user_id", asset.user_id))
+    except (TypeError, ValueError) as exc:
+        raise CryptoError("Encrypted asset context is invalid.") from exc
+    if context_user_id != asset.user_id:
+        raise CryptoError("Encrypted asset ownership context does not match its vault record.")
+
+    if version == 1:
+        return asset_aad(
+            context_user_id,
+            str(aad.get("original_filename", asset.original_filename)),
+            str(aad.get("mime_type", asset.mime_type)),
+            version=1,
+        )
+
+    algorithm = str(aad.get("algorithm", ""))
+    mime_type = str(aad.get("mime_type", ""))
+    image_format = str(aad.get("image_format", ""))
+    try:
+        width = int(aad.get("width", 0))
+        height = int(aad.get("height", 0))
+    except (TypeError, ValueError) as exc:
+        raise CryptoError("Encrypted asset dimensions are invalid.") from exc
+    if (
+        algorithm != asset.algorithm
+        or mime_type != asset.mime_type
+        or image_format != asset.image_format
+        or width != asset.width
+        or height != asset.height
+    ):
+        raise CryptoError("Encrypted asset context does not match its vault record.")
+    return asset_aad(
+        context_user_id,
+        str(aad.get("original_filename", "")),
+        mime_type,
+        version=version,
+        algorithm=algorithm,
+        image_format=image_format,
+        width=width,
+        height=height,
+        unlock_after=str(aad.get("unlock_after", "")) or None,
     )
+
+
+def _vault_health(store: VaultStore, user_id: int) -> dict[str, int | float | bool | str]:
+    stats = store.vault_stats(user_id)
+    chain = store.verify_audit_chain(user_id)
+    assets = store.list_assets(user_id)
+    entropies: list[float] = []
+    for asset in assets:
+        try:
+            entropy = float(asset.metadata.get("entropy_bits", 0) or 0)
+        except (TypeError, ValueError):
+            entropy = 0.0
+        entropies.append(max(0.0, min(8.0, entropy)))
+    average_entropy = sum(entropies) / len(entropies) if entropies else 0.0
+    locked_count = sum(1 for asset in assets if _asset_unlock_after(asset))
+    score = int(
+        min(
+            100,
+            (45 if chain["valid"] else 0)
+            + min(25, stats.asset_count * 4)
+            + min(20, average_entropy * 2.5)
+            + min(10, len(store.list_tags(user_id)) * 2),
+        )
+    )
+    grade = "A" if score >= 85 else "B" if score >= 70 else "C" if score >= 50 else "D"
+    return {
+        "score": score,
+        "grade": grade,
+        "chain_valid": chain["valid"],
+        "average_entropy": round(average_entropy, 3),
+        "locked_assets": locked_count,
+        "asset_count": stats.asset_count,
+    }
+
+
+def _assert_unlocked(asset: EncryptedAsset) -> None:
+    unlock_after = _asset_unlock_after(asset)
+    if not unlock_after:
+        return
+    try:
+        unlock_at = datetime.fromisoformat(str(unlock_after))
+        if unlock_at.tzinfo is None:
+            unlock_at = unlock_at.replace(tzinfo=timezone.utc)
+        unlock_at = unlock_at.astimezone(timezone.utc)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Time-lock metadata is invalid; decryption is blocked.") from exc
+    if datetime.now(timezone.utc) < unlock_at:
+        raise ValueError(f"Time-locked until {unlock_at.isoformat(timespec='seconds')}")
+
+
+def _asset_unlock_after(asset: EncryptedAsset) -> str | None:
+    aad = asset.metadata.get("aad")
+    try:
+        aad_version = int(aad.get("version", 1)) if isinstance(aad, dict) else 1
+    except (TypeError, ValueError):
+        return "invalid"
+    if isinstance(aad, dict) and aad_version >= AAD_VERSION:
+        authenticated_value = str(aad.get("unlock_after", "")).strip()
+        compatibility_value = str(asset.metadata.get("unlock_after", "")).strip()
+        if compatibility_value and compatibility_value != authenticated_value:
+            return "invalid"
+        return authenticated_value or None
+    value = str(asset.metadata.get("unlock_after", "")).strip()
+    return value or None
+
+
+def _normalize_unlock_after(value: str) -> str | None:
+    candidate = value.strip()
+    if not candidate:
+        return None
+    try:
+        unlock_at = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("Time-lock must be a valid ISO 8601 date and time.") from exc
+    if unlock_at.tzinfo is None:
+        unlock_at = unlock_at.replace(tzinfo=timezone.utc)
+    unlock_at = unlock_at.astimezone(timezone.utc)
+    if unlock_at <= datetime.now(timezone.utc):
+        raise ValueError("Time-lock must be in the future.")
+    return unlock_at.isoformat(timespec="seconds")
+
+
+def _read_bounded_vault_manifest(
+    archive_bytes: bytes,
+    *,
+    max_manifest_bytes: int,
+    max_members: int,
+) -> list[dict]:
+    with zipfile.ZipFile(BytesIO(archive_bytes)) as bundle:
+        members = bundle.infolist()
+        if len(members) > max_members:
+            raise ValueError("archive contains too many members")
+        manifests = [member for member in members if member.filename == "manifest.json"]
+        if len(manifests) != 1:
+            raise ValueError("archive must contain exactly one manifest.json")
+        manifest_info = manifests[0]
+        if manifest_info.file_size > max_manifest_bytes:
+            raise ValueError("manifest.json is too large")
+        with bundle.open(manifest_info) as handle:
+            manifest_bytes = handle.read(max_manifest_bytes + 1)
+        if len(manifest_bytes) > max_manifest_bytes:
+            raise ValueError("manifest.json is too large")
+    manifest = json_module.loads(manifest_bytes)
+    if not isinstance(manifest, list):
+        raise ValueError("manifest.json must contain an array")
+    if len(manifest) > max_members:
+        raise ValueError("manifest contains too many assets")
+    if any(not isinstance(item, dict) for item in manifest):
+        raise ValueError("manifest assets must be objects")
+    return manifest
+
+
+def _asset_payload(asset: EncryptedAsset) -> dict:
+    return {
+        "id": asset.id,
+        "filename": asset.original_filename,
+        "algorithm": asset.algorithm,
+        "format": asset.image_format,
+        "size": {"width": asset.width, "height": asset.height},
+        "tags": [tag for tag in asset.tags.split(",") if tag],
+        "notes": asset.notes,
+        "content_hash": asset.metadata.get("content_hash"),
+        "entropy_bits": asset.metadata.get("entropy_bits"),
+        "unlock_after": _asset_unlock_after(asset),
+        "created_at": asset.created_at,
+    }
+
+
+def _format_bytes(value: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB"]
+    size = float(value)
+    unit = 0
+    while size >= 1024 and unit < len(units) - 1:
+        size /= 1024
+        unit += 1
+    if unit == 0:
+        return f"{value} {units[unit]}"
+    return f"{size:.1f} {units[unit]}"
