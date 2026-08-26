@@ -1,5 +1,5 @@
-from io import BytesIO
 import secrets
+from io import BytesIO
 
 from PIL import Image
 

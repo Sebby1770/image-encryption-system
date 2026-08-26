@@ -14,3 +14,13 @@ dist/
 build/
 *.egg-info/
 .env
+
+# Build and tooling artifacts
+build/
+dist/
+*.egg-info/
+.coverage
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+instance/

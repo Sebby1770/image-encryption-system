@@ -1,9 +1,5 @@
 from io import BytesIO
 
-from image_encryption_system.crypto import AES_GCM_PASSPHRASE, RSA_HYBRID
-from image_encryption_system.security import LoginGuard
-from image_encryption_system.storage import VaultStore
-
 from helpers import (
     PASSWORD,
     encrypt_png,
@@ -15,6 +11,9 @@ from helpers import (
     with_csrf,
 )
 
+from image_encryption_system.crypto import AES_GCM_PASSPHRASE, RSA_HYBRID
+from image_encryption_system.security import LoginGuard
+from image_encryption_system.storage import VaultStore
 
 NEW_PASSWORD = "brand new vault password"
 

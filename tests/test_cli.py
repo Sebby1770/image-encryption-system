@@ -1,5 +1,6 @@
-from PIL import Image
 from io import BytesIO
+
+from PIL import Image
 
 from image_encryption_system.cli import main
 
@@ -17,12 +18,21 @@ def test_cli_encrypt_decrypt_with_passphrase(tmp_path) -> None:
     restored = tmp_path / "restored.png"
     _png(source)
 
-    assert main(["encrypt", str(source), "--passphrase", "cli-secret-pass", "--out", str(vault)]) == 0
+    encrypt_args = ["encrypt", str(source), "--passphrase", "cli-secret-pass", "--out", str(vault)]
+    assert main(encrypt_args) == 0
     assert vault.is_file()
     assert vault.read_bytes().startswith(b"IES1")
     assert vault.read_bytes() != source.read_bytes()
 
-    assert main(["decrypt", str(vault), "--passphrase", "cli-secret-pass", "--out", str(restored)]) == 0
+    decrypt_args = [
+        "decrypt",
+        str(vault),
+        "--passphrase",
+        "cli-secret-pass",
+        "--out",
+        str(restored),
+    ]
+    assert main(decrypt_args) == 0
     assert restored.read_bytes() == source.read_bytes()
 
 
@@ -76,10 +86,19 @@ def test_cli_decrypt_rejects_wrong_passphrase(tmp_path) -> None:
     restored = tmp_path / "nope.png"
     _png(source)
     assert main(["encrypt", str(source), "--passphrase", "right-secret", "--out", str(vault)]) == 0
-    assert main(["decrypt", str(vault), "--passphrase", "wrong-secret", "--out", str(restored)]) == 1
+    wrong_args = ["decrypt", str(vault), "--passphrase", "wrong-secret", "--out", str(restored)]
+    assert main(wrong_args) == 1
     assert not restored.exists()
 
 
 def test_cli_missing_input_fails(tmp_path) -> None:
     missing = tmp_path / "missing.png"
-    assert main(["encrypt", str(missing), "--passphrase", "x" * 12, "--out", str(tmp_path / "out.bin")]) == 1
+    missing_args = [
+        "encrypt",
+        str(missing),
+        "--passphrase",
+        "x" * 12,
+        "--out",
+        str(tmp_path / "out.bin"),
+    ]
+    assert main(missing_args) == 1

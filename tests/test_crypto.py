@@ -1,4 +1,3 @@
-from copy import deepcopy
 from io import BytesIO
 
 import pytest
@@ -166,15 +165,17 @@ def test_passphrase_wrap_rotation_round_trip() -> None:
         "key_wrap": wrap_data_key_passphrase(data_key, "new image passphrase"),
     }
 
-    assert decrypt_image_bytes(
-        encrypted.ciphertext,
-        rotated_meta,
-        passphrase="new image passphrase",
-    ) == plaintext
+    assert (
+        decrypt_image_bytes(
+            encrypted.ciphertext,
+            rotated_meta,
+            passphrase="new image passphrase",
+        )
+        == plaintext
+    )
     with pytest.raises(CryptoError):
         decrypt_image_bytes(
             encrypted.ciphertext,
             rotated_meta,
             passphrase="old image passphrase",
         )
-

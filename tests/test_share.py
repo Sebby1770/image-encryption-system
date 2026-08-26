@@ -1,5 +1,3 @@
-from image_encryption_system.crypto import AES_GCM_PASSPHRASE, RSA_HYBRID
-
 from helpers import (
     PASSWORD,
     encrypt_png,
@@ -9,6 +7,8 @@ from helpers import (
     register,
     sample_png,
 )
+
+from image_encryption_system.crypto import AES_GCM_PASSPHRASE, RSA_HYBRID
 
 
 def test_alice_shares_to_bob_and_eve_cannot(tmp_path) -> None:

@@ -1,6 +1,6 @@
-from image_encryption_system.config import Config
-
 from helpers import PASSWORD, login, make_app, register
+
+from image_encryption_system.config import Config
 
 
 def test_default_upload_limit_is_8mb() -> None:

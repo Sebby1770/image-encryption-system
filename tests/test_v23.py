@@ -1,11 +1,6 @@
 import time
 
-from image_encryption_system.cli import main
-from image_encryption_system.crypto import cli_aad, decrypt_image_bytes, unpack_ies
-from PIL import Image
-
 from helpers import (
-    PASSWORD,
     bearer_headers,
     encrypt_png,
     login,
@@ -14,6 +9,10 @@ from helpers import (
     sample_png,
     with_csrf,
 )
+from PIL import Image
+
+from image_encryption_system.cli import main
+from image_encryption_system.crypto import cli_aad, decrypt_image_bytes, unpack_ies
 
 
 def test_capability_link_decrypt_and_max_downloads(tmp_path) -> None:
@@ -133,23 +132,27 @@ def test_integrity_hash_and_cli_rewrap(tmp_path, capsys) -> None:
     rotated = tmp_path / "rotated.ies"
     Image.new("RGB", (16, 12), "#0f766e").save(source, format="PNG")
 
-    assert main(["encrypt", str(source), "--passphrase", "old-secret-pass", "--out", str(vault)]) == 0
+    encrypt_args = ["encrypt", str(source), "--passphrase", "old-secret-pass", "--out", str(vault)]
+    assert main(encrypt_args) == 0
     assert main(["hash", str(vault)]) == 0
     digest = capsys.readouterr().out.strip()
     assert len(digest) == 64
 
-    assert main(
-        [
-            "rewrap",
-            str(vault),
-            "--old-passphrase",
-            "old-secret-pass",
-            "--new-passphrase",
-            "new-secret-pass",
-            "--out",
-            str(rotated),
-        ]
-    ) == 0
+    assert (
+        main(
+            [
+                "rewrap",
+                str(vault),
+                "--old-passphrase",
+                "old-secret-pass",
+                "--new-passphrase",
+                "new-secret-pass",
+                "--out",
+                str(rotated),
+            ]
+        )
+        == 0
+    )
     ciphertext, metadata = unpack_ies(rotated.read_bytes())
     assert metadata["key_wrap"]["type"] == "scrypt-aes-gcm"
     restored = decrypt_image_bytes(

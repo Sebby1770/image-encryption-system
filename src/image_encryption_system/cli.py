@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import argparse
-from getpass import getpass
-from pathlib import Path
 import sys
-from typing import Sequence
-
+from collections.abc import Sequence
+from getpass import getpass
 from hashlib import sha256
+from pathlib import Path
 
 from .crypto import (
     AES_GCM_PASSPHRASE,
@@ -30,7 +29,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    encrypt_parser = subparsers.add_parser("encrypt", help="Encrypt a file into an .ies vault blob.")
+    encrypt_parser = subparsers.add_parser(
+        "encrypt", help="Encrypt a file into an .ies vault blob."
+    )
     encrypt_parser.add_argument("input", type=Path, help="Input file (for example IN.png)")
     encrypt_parser.add_argument("--out", "-o", type=Path, required=True, help="Output vault file")
     encrypt_parser.add_argument("--passphrase", "-p", help="AES passphrase (prompted if omitted)")
@@ -38,19 +39,27 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     decrypt_parser = subparsers.add_parser("decrypt", help="Decrypt an .ies vault blob.")
     decrypt_parser.add_argument("input", type=Path, help="Input vault file")
-    decrypt_parser.add_argument("--out", "-o", type=Path, required=True, help="Output plaintext file")
+    decrypt_parser.add_argument(
+        "--out", "-o", type=Path, required=True, help="Output plaintext file"
+    )
     decrypt_parser.add_argument("--passphrase", "-p", help="AES or private-key passphrase")
     decrypt_parser.add_argument("--private-key", type=Path, help="RSA private key (PEM)")
 
     keygen_parser = subparsers.add_parser("keygen", help="Generate an RSA-3072 key pair.")
-    keygen_parser.add_argument("--passphrase", "-p", help="Private key passphrase (prompted if omitted)")
+    keygen_parser.add_argument(
+        "--passphrase", "-p", help="Private key passphrase (prompted if omitted)"
+    )
     keygen_parser.add_argument("--out-private", type=Path, default=Path("ies-private.pem"))
     keygen_parser.add_argument("--out-public", type=Path, default=Path("ies-public.pem"))
 
-    inspect_parser = subparsers.add_parser("inspect", help="Print public .ies metadata (no secrets).")
+    inspect_parser = subparsers.add_parser(
+        "inspect", help="Print public .ies metadata (no secrets)."
+    )
     inspect_parser.add_argument("input", type=Path, help="Input vault file")
 
-    verify_parser = subparsers.add_parser("verify", help="Unwrap the data key only; exit 0 on success.")
+    verify_parser = subparsers.add_parser(
+        "verify", help="Unwrap the data key only; exit 0 on success."
+    )
     verify_parser.add_argument("input", type=Path, help="Input vault file")
     verify_parser.add_argument("--passphrase", "-p", help="AES or private-key passphrase")
     verify_parser.add_argument("--private-key", type=Path, help="RSA private key (PEM)")
@@ -131,10 +140,8 @@ def _decrypt(args: argparse.Namespace) -> int:
         raise ValueError(f"input file not found: {source}")
     ciphertext, metadata = unpack_ies(source.read_bytes())
     aad_info = metadata.get("aad") or {}
-    if aad_info.get("source") == "cli":
-        aad = cli_aad(str(aad_info.get("filename", "")))
-    else:
-        aad = b""
+    is_cli_context = aad_info.get("source") == "cli"
+    aad = cli_aad(str(aad_info.get("filename", ""))) if is_cli_context else b""
 
     passphrase = args.passphrase
     private_key = Path(args.private_key).read_bytes() if args.private_key else None

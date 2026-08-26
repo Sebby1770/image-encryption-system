@@ -1,44 +1,23 @@
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
-import os
-import re
 import sqlite3
-import tempfile
-from collections.abc import Iterator
-from contextlib import contextmanager, suppress
+import time
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
 from io import BytesIO
-import json
 from pathlib import Path, PurePosixPath
-import sqlite3
-import time
 from typing import Any
 from uuid import uuid4
-import zipfile
 
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
 from .crypto import generate_rsa_key_pair, reencrypt_private_key_pem
 
-
 MAX_BACKUP_UNCOMPRESSED = 64 * 1024 * 1024
-
-OWNER_ONLY_DIR_MODE = 0o700
-OWNER_ONLY_FILE_MODE = 0o600
-AUDIT_CHAIN_VERSION = 2
-MAX_USERNAME_LENGTH = 64
-MAX_PASSWORD_LENGTH = 1024
-MAX_FILENAME_LENGTH = 255
-MAX_TAGS_LENGTH = 512
-MAX_NOTES_LENGTH = 2_000
-_STORED_FILENAME_RE = re.compile(r"^[0-9a-f]{32}\.enc$")
-_USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
 
 
 @dataclass(frozen=True)
@@ -46,7 +25,6 @@ class User:
     id: int
     username: str
     password_hash: str
-    auth_version: int
     created_at: str
     token_version: int = 1
 
@@ -63,8 +41,6 @@ class EncryptedAsset:
     width: int
     height: int
     metadata: dict[str, Any]
-    tags: str
-    notes: str
     created_at: str
     notes: str = ""
     favorite: bool = False
@@ -148,47 +124,16 @@ class AuditEvent:
     created_at: str
 
 
-@dataclass(frozen=True)
-class AuditEvent:
-    id: int
-    user_id: int
-    action: str
-    detail: str
-    created_at: str
-    prev_hash: str
-    chain_hash: str
-
-
-@dataclass(frozen=True)
-class VaultStats:
-    asset_count: int
-    ciphertext_bytes: int
-    algorithms: dict[str, int]
-
-
 class VaultStore:
-    def __init__(
-        self,
-        database_path: Path,
-        vault_dir: Path,
-        key_dir: Path,
-        *,
-        audit_key: bytes,
-    ):
+    def __init__(self, database_path: Path, vault_dir: Path, key_dir: Path):
         self.database_path = Path(database_path)
         self.vault_dir = Path(vault_dir)
         self.key_dir = Path(key_dir)
-        if len(audit_key) < 32:
-            raise ValueError("Audit key must be at least 32 bytes.")
-        self.audit_key = hashlib.sha256(b"image-encryption-system.audit.v2\0" + audit_key).digest()
 
     def init(self) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.vault_dir.mkdir(parents=True, exist_ok=True)
         self.key_dir.mkdir(parents=True, exist_ok=True)
-        _restrict_owner_access(self.database_path.parent)
-        _restrict_owner_access(self.vault_dir)
-        _restrict_owner_access(self.key_dir)
         with self._connect() as db:
             db.executescript(
                 """
@@ -286,17 +231,8 @@ class VaultStore:
         username = username.strip().lower()
         if not username:
             raise ValueError("Username is required.")
-        if len(username) > MAX_USERNAME_LENGTH:
-            raise ValueError(f"Username must be {MAX_USERNAME_LENGTH} characters or fewer.")
-        if not _USERNAME_RE.fullmatch(username) or username[-1] in "_.-":
-            raise ValueError(
-                "Username may use lowercase letters, numbers, dots, underscores, and hyphens, "
-                "and must start and end with a letter or number."
-            )
         if len(password) < 10:
             raise ValueError("Password must be at least 10 characters.")
-        if len(password.encode("utf-8")) > MAX_PASSWORD_LENGTH:
-            raise ValueError(f"Password must be {MAX_PASSWORD_LENGTH} characters or fewer.")
 
         now = _utc_now()
         password_hash = generate_password_hash(password)
@@ -312,28 +248,8 @@ class VaultStore:
             user_id = int(cursor.lastrowid)
 
         private_pem, public_pem = generate_rsa_key_pair(password)
-        created_paths: list[Path] = []
-
-        try:
-            with self._connect() as db:
-                cursor = db.execute(
-                    """
-                    INSERT INTO users (username, password_hash, auth_version, created_at)
-                    VALUES (?, ?, 1, ?)
-                    """,
-                    (username, password_hash, now),
-                )
-                user_id = int(cursor.lastrowid)
-                private_path = self.private_key_path(user_id)
-                public_path = self.public_key_path(user_id)
-                _atomic_write_owner_only_file(private_path, private_pem)
-                created_paths.append(private_path)
-                _atomic_write_owner_only_file(public_path, public_pem)
-                created_paths.append(public_path)
-        except Exception:
-            for path in created_paths:
-                path.unlink(missing_ok=True)
-            raise
+        self.private_key_path(user_id).write_bytes(private_pem)
+        self.public_key_path(user_id).write_bytes(public_pem)
         return self.get_user(user_id)
 
     def authenticate_user(self, username: str, password: str) -> User | None:
@@ -460,13 +376,8 @@ class VaultStore:
         favorite: bool = False,
     ) -> EncryptedAsset:
         safe_name = secure_filename(original_filename) or "image"
-        if len(safe_name) > MAX_FILENAME_LENGTH:
-            raise ValueError(f"Filename must be {MAX_FILENAME_LENGTH} characters or fewer.")
-        normalized_tags = _normalize_tags(tags)
-        normalized_notes = _normalize_notes(notes)
         stored_filename = f"{uuid4().hex}.enc"
-        ciphertext_path = self._vault_path(stored_filename)
-        _atomic_write_owner_only_file(ciphertext_path, ciphertext)
+        (self.vault_dir / stored_filename).write_bytes(ciphertext)
         now = _utc_now()
         stored_meta = dict(metadata)
         stored_meta.setdefault("ciphertext_sha256", sha256(ciphertext).hexdigest())
@@ -1096,7 +1007,6 @@ def _user_from_row(row: sqlite3.Row) -> User:
         id=int(row["id"]),
         username=str(row["username"]),
         password_hash=str(row["password_hash"]),
-        auth_version=int(row["auth_version"]) if "auth_version" in keys else 1,
         created_at=str(row["created_at"]),
         token_version=token_version,
     )
@@ -1105,7 +1015,8 @@ def _user_from_row(row: sqlite3.Row) -> User:
 def _asset_from_row(row: sqlite3.Row) -> EncryptedAsset:
     keys = set(row.keys())
     notes = str(row["notes"]) if "notes" in keys and row["notes"] is not None else ""
-    favorite = bool(int(row["favorite"])) if "favorite" in keys and row["favorite"] is not None else False
+    has_favorite = "favorite" in keys and row["favorite"] is not None
+    favorite = bool(int(row["favorite"])) if has_favorite else False
     return EncryptedAsset(
         id=int(row["id"]),
         user_id=int(row["user_id"]),
@@ -1117,8 +1028,6 @@ def _asset_from_row(row: sqlite3.Row) -> EncryptedAsset:
         width=int(row["width"]),
         height=int(row["height"]),
         metadata=json.loads(str(row["metadata_json"])),
-        tags=str(row["tags"]) if "tags" in keys else "",
-        notes=str(row["notes"]) if "notes" in keys else "",
         created_at=str(row["created_at"]),
         notes=notes,
         favorite=favorite,

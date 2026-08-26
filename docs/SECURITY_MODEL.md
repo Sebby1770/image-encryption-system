@@ -92,3 +92,38 @@ window. Legacy unkeyed chains are upgraded once on startup.
 - Add malware and file-type scanning for uploads.
 - Consider envelope encryption with a managed KMS instead of local key files.
 - Add OAuth using a trusted identity provider if the app will be multi-user.
+
+## Untrusted key-wrap metadata
+
+Key-wrap metadata travels with the ciphertext: it is embedded in every `.ies`
+file and in every restored backup. Its Scrypt cost parameters (`n`, `r`, `p`)
+are therefore fully attacker-controlled on any blob the vault is asked to open
+via `ies decrypt`, `ies inspect`, `ies verify`, or `POST /restore`.
+
+`_validate_scrypt_parameters()` bounds them before the KDF is constructed:
+
+| Rule | Reason |
+| --- | --- |
+| `n` must be a power of two | Scrypt requires it, and it blocks odd-value probing |
+| `n >= SCRYPT_N` | A blob may not weaken the KDF below the vault's own baseline |
+| `n <= MAX_SCRYPT_WORK_FACTOR` | Bounds CPU cost |
+| `128 * n * r <= MAX_SCRYPT_MEMORY_BYTES` (256 MiB) | Bounds the allocation |
+| `1 <= r <= 32`, `1 <= p <= 16` | The memory ceiling is meaningless if `r` is unbounded |
+
+Salt, nonce, and wrapped-key lengths are checked before use, so a truncated or
+padded field is rejected rather than passed to the AEAD.
+
+## Upload limits
+
+`MAX_CONTENT_LENGTH` bounds the compressed upload, but a few megabytes of PNG
+can decode to gigabytes of pixels. EXIF stripping calls `Image.load()`, which is
+where such a bomb would actually allocate, so uploads are identified and bounded
+from their header **before** anything decodes them:
+
+- `ALLOWED_IMAGE_FORMATS` is matched against the format Pillow actually decoded,
+  not the filename, so a renamed file cannot reach an unexpected decoder.
+- `MAX_IMAGE_PIXELS` (default 64 MP, roughly 256 MB at RGBA) caps the decoded
+  size.
+
+The filename extension check remains as a first-pass rejection only; it is not
+relied on for safety.

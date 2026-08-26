@@ -1,6 +1,6 @@
-from io import BytesIO
 import json
 import zipfile
+from io import BytesIO
 
 from helpers import (
     bearer_headers,
@@ -77,7 +77,8 @@ def test_download_ciphertext_ies_and_delete(tmp_path) -> None:
 
     ciphertext, metadata = unpack_ies(download.data)
     aad = f"user={asset.user_id}|filename=secret.png|mime={asset.mime_type}".encode()
-    assert decrypt_image_bytes(ciphertext, metadata, passphrase="image passphrase", aad=aad) == sample_png()
+    restored = decrypt_image_bytes(ciphertext, metadata, passphrase="image passphrase", aad=aad)
+    assert restored == sample_png()
 
     deleted = client.post(f"/images/{asset.id}/delete", follow_redirects=True)
     assert deleted.status_code == 200

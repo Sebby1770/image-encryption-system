@@ -4,7 +4,6 @@ from threading import Lock
 from time import time
 from typing import TYPE_CHECKING
 
-
 if TYPE_CHECKING:
     from .storage import VaultStore
 

@@ -1,5 +1,48 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **Repaired a broken merge that left the package non-functional.** Commit
+  `4149200` spliced two independently-developed lineages (both branched from the
+  initial commit) whose modules were incompatible. The textual merge succeeded
+  while the result did not: 30 undefined names across `crypto.py`, `storage.py`,
+  and `web.py`, so `encrypt_image_bytes()` and `decrypt_image_bytes()` both
+  raised `NameError` on every call and the whole test suite failed to collect.
+  Restored the coherent module set and re-applied the hardening on top.
+- `pyproject.toml` declared `[project.scripts]` twice, which made the project
+  metadata unparseable and broke `pip install -e .` and `pytest` alike.
+- Removed `uploads.py`, an unreferenced 56-statement module left behind by the
+  same merge.
+
+### Security
+- **Bounded attacker-controlled Scrypt parameters.** `_unwrap_key_with_passphrase()`
+  read `n`, `r`, and `p` straight from key-wrap metadata and passed them to the
+  KDF unchecked. Because that metadata ships inside every `.ies` file and backup,
+  a crafted blob naming `n = 2**30` forced roughly a terabyte of allocation on
+  `ies decrypt`/`inspect`/`verify` and `POST /restore`. Parameters are now
+  validated against explicit CPU and memory ceilings, and may not be weakened
+  below the vault's own baseline. Salt, nonce, and wrapped-key lengths are
+  checked before use.
+- **Added decompression-bomb protection to uploads.** `MAX_CONTENT_LENGTH` only
+  bounds the compressed bytes, and EXIF stripping calls `Image.load()`, which
+  fully decodes. Uploads are now identified and bounded from their header
+  *before* any decode, capped by a configurable `MAX_IMAGE_PIXELS` (64 MP).
+- **Cross-checked the decoded image format** against `ALLOWED_IMAGE_FORMATS`
+  rather than trusting the filename extension, so a renamed file cannot reach an
+  unexpected Pillow decoder.
+
+### Added
+- `tests/test_crypto_hardening.py` (15 tests) covering oversized, downgraded,
+  non-power-of-two, and out-of-range KDF parameters plus truncated wrap fields.
+- `tests/test_upload_hardening.py` (7 tests) covering the pixel ceiling, the
+  format allow-list, and the check-before-decode ordering.
+- `SECURITY.md`, and a security model section documenting both trust boundaries.
+
+### Changed
+- CI now runs a 3.10-3.13 matrix, `ruff check`, `ruff format --check`, coverage
+  gated at 80%, and a `pip-audit` dependency scan.
+
 ## 2.3.0 - 2026-08-18
 
 ### Added

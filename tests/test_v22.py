@@ -3,11 +3,6 @@ from io import BytesIO
 
 import jwt
 import pytest
-from PIL import Image
-
-from image_encryption_system.cli import main
-from image_encryption_system.crypto import AES_GCM_PASSPHRASE
-
 from helpers import (
     PASSWORD,
     encrypt_png,
@@ -18,7 +13,10 @@ from helpers import (
     sample_png,
     with_csrf,
 )
+from PIL import Image
 
+from image_encryption_system.cli import main
+from image_encryption_system.crypto import AES_GCM_PASSPHRASE
 
 NEW_PASSWORD = "brand new vault password"
 
@@ -258,7 +256,8 @@ def test_cli_inspect_and_verify(tmp_path, capsys) -> None:
     vault = tmp_path / "photo.ies"
     Image.new("RGB", (16, 12), "#0f766e").save(source, format="PNG")
 
-    assert main(["encrypt", str(source), "--passphrase", "cli-secret-pass", "--out", str(vault)]) == 0
+    encrypt_args = ["encrypt", str(source), "--passphrase", "cli-secret-pass", "--out", str(vault)]
+    assert main(encrypt_args) == 0
     assert main(["inspect", str(vault)]) == 0
     printed = capsys.readouterr().out
     assert "AES-GCM" in printed

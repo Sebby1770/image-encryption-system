@@ -20,12 +20,6 @@
     </div>
   </section>
 
-  <section class="trust-strip" aria-label="Vault guarantees">
-    <span><strong>Context sealed</strong> owner, format, dimensions, and time-lock</span>
-    <span><strong>Private responses</strong> decrypted bytes are never cacheable</span>
-    <span><strong>Audit v2</strong> activity is protected with a keyed chain</span>
-  </section>
-
   <section class="workspace-grid">
     <div class="sidebar-stack">
       <form class="upload-panel" method="post" action="{{ url_for('upload_image') }}" enctype="multipart/form-data">
@@ -91,33 +85,9 @@
       </div>
 
       {% if assets %}
-        <form method="post" action="{{ url_for('bulk_update_tags') }}" id="bulk-tag-form">
-          <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-        </form>
-        <form method="post" action="{{ url_for('bulk_delete_images') }}" id="bulk-form" data-confirm="Delete selected encrypted images permanently?">
-          <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-          <div class="bulk-actions">
-            <label class="bulk-select-all">
-              <input type="checkbox" id="select-all">
-              <span>Select all</span>
-            </label>
-            <button class="button button-danger" type="submit">Delete selected</button>
-          </div>
-          <div class="bulk-tag-row">
-            <input name="tags" type="text" placeholder="Bulk tag selected assets" form="bulk-tag-form">
-            <button class="button button-secondary" type="submit" form="bulk-tag-form">Apply tags</button>
-          </div>
         <div class="asset-list">
           {% for asset in assets %}
             <article class="asset-card">
-              <label class="asset-select">
-                <input type="checkbox" name="asset_ids" value="{{ asset.id }}" form="bulk-form">
-              </label>
-              <div class="asset-thumb" aria-hidden="true">
-                <span class="asset-thumb-lock">🔒</span>
-                <span class="asset-thumb-meta">{{ asset.width }}×{{ asset.height }}</span>
-                <span class="asset-thumb-format">{{ asset.image_format }}</span>
-              </div>
               <div>
                 <h3>{{ asset.original_filename }}{% if asset.favorite %} ★{% endif %}</h3>
                 <p>{{ asset.algorithm }} · {{ asset.image_format }} · {{ asset.width }}x{{ asset.height }}</p>
@@ -241,7 +211,6 @@
             </article>
           {% endfor %}
         </div>
-        </form>
       {% else %}
         <div class="empty-state">
           <h3>No encrypted images match</h3>
