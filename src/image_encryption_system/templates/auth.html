@@ -26,13 +26,26 @@
         <label>
           Password
           <input
+            id="password-input"
             name="password"
             type="password"
             autocomplete="{% if mode == 'register' %}new-password{% else %}current-password{% endif %}"
-            minlength="10"
+            minlength="{{ min_password_length }}"
             required
           >
         </label>
+        <button
+          class="button button-ghost password-toggle"
+          type="button"
+          data-password-toggle="password-input"
+          aria-label="Show password"
+        >Show</button>
+        {% if mode == "register" %}
+          <div class="password-meter">
+            <progress id="password-meter-bar" max="5" value="0"></progress>
+            <small id="password-meter-label" role="status">Enter a password</small>
+          </div>
+        {% endif %}
         <button class="button button-primary" type="submit">
           {% if mode == "register" %}Create account{% else %}Sign in{% endif %}
         </button>
@@ -55,8 +68,12 @@
         <li>Share by re-wrapping the same data key</li>
         <li>Encrypted private keys and owner-only ciphertext</li>
         <li>Login rate limits, lockout, and an audit log</li>
+        <li>Strict CSP, no inline scripts, no framing</li>
       </ul>
     </div>
   </section>
 {% endblock %}
 
+{% block scripts %}
+  <script defer src="{{ url_for('static', filename='js/auth.js') }}"></script>
+{% endblock %}

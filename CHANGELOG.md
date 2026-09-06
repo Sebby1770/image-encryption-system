@@ -43,6 +43,73 @@
 - CI now runs a 3.10-3.13 matrix, `ruff check`, `ruff format --check`, coverage
   gated at 80%, and a `pip-audit` dependency scan.
 
+
+## 3.0.0 - 2026-09-07
+
+Hardens the HTTP surface around the envelope crypto. The cryptography was
+already strong; the browser-facing layer around it had no controls at all.
+
+### Added
+
+- Security response headers on every response: a strict Content-Security-Policy
+  (`script-src 'self'`, no inline allowance, no nonce), `frame-ancestors 'none'`,
+  `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy: no-referrer`,
+  `Permissions-Policy`, `Cross-Origin-Opener-Policy`, and
+  `Cross-Origin-Resource-Policy`. HSTS is asserted on HTTPS requests only, so a
+  plain-HTTP development run is unaffected.
+- `no-store` on every response carrying plaintext, ciphertext, key material, or
+  a backup archive. `send_file` otherwise labels these like static assets, so a
+  proxy or the browser's disk cache could retain a decrypted image.
+- Session cookie hardening: `HttpOnly`, `SameSite=Lax`, and `Secure` by default,
+  under a dedicated cookie name.
+- Throttles beyond the login form, for registration, decryption attempts, and
+  capability-link resolution. Registration matters most: it generates an
+  RSA-3072 key pair, so it was an unauthenticated CPU amplifier. Counters reuse
+  the existing SQLite guard table, so a restart does not reset them.
+- A password policy, enforced at the storage layer so registration, rotation,
+  and the CLI all clear the same bar, plus a client-side strength meter that
+  mirrors exactly the rules the server enforces.
+- `GET /healthz`, deliberately unauthenticated and deliberately free of detail.
+- A multi-stage `Dockerfile` and `compose.yaml`. The image runs as a non-root
+  user, carries a `HEALTHCHECK`, and the compose file sets a memory limit,
+  because Scrypt holds ~67 MB per in-flight decryption.
+
+### Changed
+
+- **Scrypt cost raised from N=2**14 to N=2**16**, and the accepted floor split
+  into its own constant (`MIN_SCRYPT_N`). The validator previously rejected
+  anything below the *current* default, which quietly made the default
+  un-raisable: bumping it would have made every existing vault file and `.ies`
+  blob undecryptable. 2**17 was measured and rejected — at ~611 ms and 134 MB per
+  derivation it would let a few concurrent decrypts exhaust a small host, and the
+  KDF runs on every decrypt rather than only at login.
+- `SECRET_KEY` no longer has a hardcoded fallback. With none configured the app
+  generates a random key and persists it to `$IES_INSTANCE_DIR/secret.key` with
+  owner-only permissions, so the quick start still works without any deployment
+  running on a key published in this repository. The app refuses to start on a
+  secret shorter than 32 characters or matching a previously published value.
+- The dashboard's inline `<script>` moved to `static/js/dashboard.js`, which is
+  what lets the CSP stay strict without `'unsafe-inline'` or nonce plumbing.
+  `static/js/auth.js` was orphaned dead code from an earlier lineage; it is now
+  rewritten against the real markup and actually loaded.
+
+### Fixed
+
+- `SUPPORTED_METADATA_VERSIONS` was declared but never consulted, so an envelope
+  claiming any version at all was decoded on the assumption that its fields meant
+  what this build expects. It is now enforced.
+- `_wrap_key_with_passphrase` derived the wrapping key from default arguments
+  while writing the cost parameters into the metadata as separate literals. The
+  two agreed by coincidence; they are now supplied once so the recorded cost
+  cannot drift from the cost actually spent.
+- The password policy was bypassable by registering with a strong password and
+  then rotating to a weak one.
+
+### Security
+
+Reported in the README before this release but never actually implemented:
+decrypted responses being non-cacheable. It is implemented now.
+
 ## 2.3.0 - 2026-08-18
 
 ### Added

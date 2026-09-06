@@ -21,9 +21,26 @@ AES_KEY_BYTES = 32
 GCM_NONCE_BYTES = 12
 GCM_TAG_BYTES = 16
 SCRYPT_SALT_BYTES = 16
-SCRYPT_N = 2**14
+# Cost this build writes into new wrappings. Raising it strengthens every key
+# minted from here on; existing files keep decrypting because the floor below is
+# a separate constant.
+#
+# 2**16 is four times the previous cost. It measures ~308 ms and 67 MB per
+# derivation, against ~611 ms and 134 MB at 2**17. The KDF runs on every decrypt
+# rather than only at login, so the higher setting would let a handful of
+# concurrent decrypts exhaust memory on a small host; the decrypt throttle bounds
+# that, but not enough to justify doubling the per-request cost.
+SCRYPT_N = 2**16
 SCRYPT_R = 8
 SCRYPT_P = 1
+# Weakest cost we are still willing to spend on an existing file.
+#
+# This used to be SCRYPT_N itself, which quietly made the default un-raisable:
+# bumping the cost would have rejected every vault file and .ies blob already
+# written at the old parameters. Keeping the floor separate lets the default
+# move forward while old wrappings stay readable, and `ies rewrap` upgrades
+# them in place.
+MIN_SCRYPT_N = 2**14
 # Wrap metadata travels with the ciphertext, so every parameter below is
 # attacker-controlled on any .ies file or restored backup. These ceilings keep a
 # hostile blob from steering Scrypt into a memory-exhaustion DoS.
@@ -103,6 +120,7 @@ def decrypt_image_bytes(
     private_key_passphrase: str | None = None,
     aad: bytes = b"",
 ) -> bytes:
+    _validate_metadata_version(metadata)
     try:
         image_nonce = _b64decode(metadata["image_nonce"])
         key_wrap = metadata["key_wrap"]
@@ -122,6 +140,23 @@ def decrypt_image_bytes(
         raise CryptoError(
             "Decryption failed. The key, passphrase, or ciphertext is invalid."
         ) from exc
+
+
+def _validate_metadata_version(metadata: dict[str, Any]) -> None:
+    """Reject envelope metadata this build does not know how to read.
+
+    ``SUPPORTED_METADATA_VERSIONS`` was declared from the beginning but never
+    consulted, so a blob claiming any version at all was decoded on the
+    assumption that its fields meant what this build expects. Checking it turns
+    a future format change into a clear refusal instead of a misparse.
+    """
+    raw = metadata.get("version", 1)
+    try:
+        version = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise CryptoError("Encrypted image metadata has an invalid version.") from exc
+    if version not in SUPPORTED_METADATA_VERSIONS:
+        raise CryptoError(f"Unsupported encrypted image metadata version: {version}")
 
 
 def unwrap_data_key(
@@ -204,12 +239,24 @@ def cli_aad(filename: str) -> bytes:
     return f"cli|filename={filename}".encode()
 
 
-def _wrap_key_with_passphrase(data_key: bytes, passphrase: str | None) -> dict[str, str | int]:
+def _wrap_key_with_passphrase(
+    data_key: bytes,
+    passphrase: str | None,
+    *,
+    n: int = SCRYPT_N,
+    r: int = SCRYPT_R,
+    p: int = SCRYPT_P,
+) -> dict[str, str | int]:
     if not passphrase:
         raise CryptoError("AES-GCM mode requires a passphrase.")
 
-    salt = os.urandom(16)
-    wrapping_key = _derive_passphrase_key(passphrase, salt)
+    salt = os.urandom(SCRYPT_SALT_BYTES)
+    # Derive with the same parameters that get written into the metadata. They
+    # used to be supplied twice — once implicitly through this function's default
+    # arguments and once as literals in the dict below — which meant the recorded
+    # cost could drift from the cost actually spent without anything failing
+    # until a decrypt.
+    wrapping_key = _derive_passphrase_key(passphrase, salt, n=n, r=r, p=p)
     wrapping_nonce = os.urandom(GCM_NONCE_BYTES)
     wrapped_key = AESGCM(wrapping_key).encrypt(wrapping_nonce, data_key, b"image-data-key")
 
@@ -218,9 +265,9 @@ def _wrap_key_with_passphrase(data_key: bytes, passphrase: str | None) -> dict[s
         "salt": _b64encode(salt),
         "nonce": _b64encode(wrapping_nonce),
         "wrapped_key": _b64encode(wrapped_key),
-        "n": SCRYPT_N,
-        "r": SCRYPT_R,
-        "p": SCRYPT_P,
+        "n": n,
+        "r": r,
+        "p": p,
     }
 
 
@@ -323,11 +370,13 @@ def _derive_passphrase_key(
 def _validate_scrypt_parameters(*, n: int, r: int, p: int) -> None:
     """Reject Scrypt costs outside the range this vault is willing to spend.
 
-    ``n`` must stay a power of two at or above the value we write ourselves, so
-    a hostile blob can neither weaken the KDF below our own baseline nor push it
-    into an allocation large enough to take the process down.
+    ``n`` must stay a power of two at or above ``MIN_SCRYPT_N``, so a hostile
+    blob can neither weaken the KDF below the supported baseline nor push it into
+    an allocation large enough to take the process down. The floor is
+    deliberately below the cost we write ourselves so the default can be raised
+    without stranding files wrapped by an earlier release.
     """
-    if n < SCRYPT_N or n > MAX_SCRYPT_WORK_FACTOR or n & (n - 1):
+    if n < MIN_SCRYPT_N or n > MAX_SCRYPT_WORK_FACTOR or n & (n - 1):
         raise CryptoError("Scrypt work factor is outside the supported range.")
     if not 1 <= r <= 32 or not 1 <= p <= 16:
         raise CryptoError("Scrypt parameters are outside the supported range.")
