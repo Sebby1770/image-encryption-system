@@ -31,7 +31,7 @@ from markupsafe import Markup, escape
 from PIL import Image, UnidentifiedImageError
 from werkzeug.exceptions import RequestEntityTooLarge
 
-from .config import Config
+from .config import KNOWN_INSECURE_SECRETS, Config
 from .crypto import (
     AES_GCM_PASSPHRASE,
     RSA_HYBRID,
@@ -43,7 +43,7 @@ from .crypto import (
     wrap_data_key_passphrase,
     wrap_data_key_rsa,
 )
-from .security import LoginGuard
+from .security import LoginGuard, PasswordPolicyError, RequestThrottle, validate_password
 from .storage import AssetShare, EncryptedAsset, LinkShare, User, VaultStore
 
 
@@ -72,6 +72,15 @@ def create_app(test_config: dict | None = None) -> Flask:
         app.config.get("MAX_IMAGE_PIXELS", Config.MAX_IMAGE_PIXELS)
     )
 
+    _assert_usable_secret(app)
+
+    # Serving the session cookie without Secure over plain HTTP silently drops
+    # it, which looks like a broken login rather than a misconfiguration. Fail
+    # loudly at boot instead, and make the testing default explicit.
+    if app.config.get("TESTING"):
+        app.config.setdefault("SESSION_COOKIE_SECURE", False)
+        app.config["SESSION_COOKIE_SECURE"] = False
+
     store = VaultStore(
         database_path=app.config["DATABASE_PATH"],
         vault_dir=app.config["VAULT_DIR"],
@@ -86,6 +95,21 @@ def create_app(test_config: dict | None = None) -> Flask:
         lockout_threshold=int(app.config.get("LOGIN_LOCKOUT_THRESHOLD", 8)),
         lockout_seconds=int(app.config.get("LOGIN_LOCKOUT_SECONDS", 900)),
     )
+    app.extensions["throttles"] = {
+        name: RequestThrottle(
+            store,
+            f"throttle:{name}",
+            limit=int(app.config.get(f"{name.upper()}_RATE_LIMIT", default_limit)),
+            window_seconds=int(
+                app.config.get(f"{name.upper()}_RATE_WINDOW_SECONDS", default_window)
+            ),
+        )
+        for name, default_limit, default_window in (
+            ("register", 5, 3600),
+            ("decrypt", 30, 300),
+            ("link", 20, 300),
+        )
+    }
 
     @app.context_processor
     def inject_globals() -> dict:
@@ -97,6 +121,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                 (AES_GCM_PASSPHRASE, "AES-GCM passphrase"),
                 (RSA_HYBRID, "RSA hybrid"),
             ],
+            "min_password_length": int(app.config.get("MIN_PASSWORD_LENGTH", 10)),
         }
 
     @app.before_request
@@ -113,6 +138,56 @@ def create_app(test_config: dict | None = None) -> Flask:
                 return jsonify({"error": "missing or invalid CSRF token"}), 400
             return ("Missing or invalid CSRF token.", 400)
 
+    @app.after_request
+    def security_headers(response: Response) -> Response:
+        """Apply the browser-side half of the vault's threat model.
+
+        The envelope crypto is only as good as the page that drives it: without
+        these, a single injected script or a framing page can exfiltrate a
+        decrypted image or a passphrase as the user types it. Every script and
+        style the app serves is a same-origin file, so the policy needs no
+        inline allowance and no nonce.
+        """
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; "
+            "script-src 'self'; "
+            "style-src 'self'; "
+            "img-src 'self' blob: data:; "
+            "font-src 'self'; "
+            "connect-src 'self'; "
+            "object-src 'none'; "
+            "base-uri 'none'; "
+            "form-action 'self'; "
+            "frame-ancestors 'none'",
+        )
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault(
+            "Permissions-Policy",
+            "camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()",
+        )
+        response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+        response.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+
+        # Only meaningful over TLS, and asserting it on a plain-HTTP development
+        # run would pin the browser to a scheme that host does not serve.
+        hsts = int(current_app.config.get("HSTS_SECONDS", 0) or 0)
+        if hsts > 0 and request.is_secure:
+            response.headers.setdefault(
+                "Strict-Transport-Security", f"max-age={hsts}; includeSubDomains"
+            )
+
+        # Anything that carries plaintext, key material, or vault contents must
+        # not be written to a shared cache or a browser's disk cache.
+        if getattr(g, "sensitive_response", False):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+
+        return response
+
     @app.errorhandler(RequestEntityTooLarge)
     def too_large(_error: RequestEntityTooLarge):
         limit_mb = int(app.config["MAX_CONTENT_LENGTH"]) // (1024 * 1024)
@@ -120,6 +195,20 @@ def create_app(test_config: dict | None = None) -> Flask:
             return jsonify({"error": f"upload exceeds the {limit_mb} MB limit"}), 413
         flash(f"File exceeds the {limit_mb} MB upload limit.", "error")
         return redirect(url_for("dashboard")), 413
+
+    @app.get("/healthz")
+    def healthz() -> Response:
+        """Liveness and readiness for a container orchestrator or uptime check.
+
+        Deliberately unauthenticated but deliberately empty of detail: it
+        confirms the process is up and the vault database answers, and reveals
+        nothing about accounts, assets, or configuration.
+        """
+        try:
+            store.count_users()
+        except Exception:
+            return jsonify({"status": "unavailable"}), 503
+        return jsonify({"status": "ok"})
 
     @app.get("/")
     def index() -> str | Response:
@@ -135,12 +224,25 @@ def create_app(test_config: dict | None = None) -> Flask:
     def register() -> Response:
         username = request.form.get("username", "")
         password = request.form.get("password", "")
+
+        # Registration generates an RSA-3072 key pair, so an unauthenticated
+        # caller could otherwise burn CPU indefinitely without ever holding an
+        # account.
+        if not _throttle(app, "register", request.remote_addr or "-"):
+            flash("Too many accounts created from this address. Try again later.", "error")
+            return redirect(url_for("register_form")), 429
+
         try:
+            validate_password(
+                password,
+                username=username,
+                min_length=int(app.config.get("MIN_PASSWORD_LENGTH", 10)),
+            )
             user = store.create_user(username, password)
         except IntegrityError:
             flash("That username is already registered.", "error")
             return redirect(url_for("register_form"))
-        except ValueError as exc:
+        except (PasswordPolicyError, ValueError) as exc:
             flash(str(exc), "error")
             return redirect(url_for("register_form"))
 
@@ -187,8 +289,13 @@ def create_app(test_config: dict | None = None) -> Flask:
             flash("New password and confirmation do not match.", "error")
             return redirect(url_for("password_form"))
         try:
+            validate_password(
+                new_password,
+                username=user.username,
+                min_length=int(app.config.get("MIN_PASSWORD_LENGTH", 10)),
+            )
             store.change_password(user.id, old_password, new_password)
-        except (ValueError, CryptoError) as exc:
+        except (PasswordPolicyError, ValueError, CryptoError) as exc:
             flash(str(exc), "error")
             return redirect(url_for("password_form"))
         refreshed = store.get_user(user.id)
@@ -312,6 +419,17 @@ def create_app(test_config: dict | None = None) -> Flask:
     @login_required(store)
     def decrypt_image(asset_id: int) -> Response:
         user = _current_user(store)
+
+        # Each attempt tests a passphrase or a private-key password against real
+        # ciphertext, so cap the rate per account rather than per asset: keying
+        # on the asset would let one user throttle another's shared image.
+        if not _throttle(app, "decrypt", f"user:{user.id}"):
+            message = "Too many decryption attempts. Wait a few minutes and try again."
+            if _wants_json():
+                return jsonify({"error": message}), 429
+            flash(message, "error")
+            return redirect(url_for("dashboard")), 429
+
         try:
             asset, share = _accessible_asset(store, asset_id, user)
             ciphertext = store.read_ciphertext(asset)
@@ -353,6 +471,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             flash(str(exc), "error")
             return redirect(url_for("dashboard"))
 
+        _mark_sensitive()
         return send_file(
             BytesIO(plaintext),
             mimetype=asset.mime_type,
@@ -509,6 +628,16 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.get("/l/<token>")
     def open_link_share(token: str):
+        # Capability links are unauthenticated and bypass CSRF by design, so the
+        # bearer token is the only secret. Throttle per caller address to bound
+        # token guessing, and to stop a public link from being used to hammer
+        # the vault.
+        if not _throttle(app, "link", f"ip:{request.remote_addr or '-'}"):
+            message = "Too many link requests. Try again shortly."
+            if _wants_json():
+                return jsonify({"error": message}), 429
+            return (message, 429)
+
         store.sweep_expired_shares()
         try:
             link, asset = _resolve_link(store, token)
@@ -520,6 +649,16 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.post("/l/<token>/decrypt")
     def decrypt_link_share(token: str):
+        # Capability links are unauthenticated and bypass CSRF by design, so the
+        # bearer token is the only secret. Throttle per caller address to bound
+        # token guessing, and to stop a public link from being used to hammer
+        # the vault.
+        if not _throttle(app, "link", f"ip:{request.remote_addr or '-'}"):
+            message = "Too many link requests. Try again shortly."
+            if _wants_json():
+                return jsonify({"error": message}), 429
+            return (message, 429)
+
         try:
             plaintext, asset = _decrypt_link(store, token, count=True)
         except PermissionError as exc:
@@ -528,6 +667,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             return jsonify({"error": str(exc)}), 404
         except (CryptoError, ValueError) as exc:
             return jsonify({"error": str(exc)}), 400
+        _mark_sensitive()
         return send_file(
             BytesIO(plaintext),
             mimetype=asset.mime_type,
@@ -537,6 +677,16 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.get("/l/<token>/blob")
     def download_link_blob(token: str):
+        # Capability links are unauthenticated and bypass CSRF by design, so the
+        # bearer token is the only secret. Throttle per caller address to bound
+        # token guessing, and to stop a public link from being used to hammer
+        # the vault.
+        if not _throttle(app, "link", f"ip:{request.remote_addr or '-'}"):
+            message = "Too many link requests. Try again shortly."
+            if _wants_json():
+                return jsonify({"error": message}), 429
+            return (message, 429)
+
         try:
             link, asset = _resolve_link(store, token)
             store.ciphertext_sha256(asset)
@@ -550,6 +700,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             return jsonify({"error": str(exc)}), 404
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
+        _mark_sensitive()
         return send_file(
             BytesIO(blob),
             mimetype="application/octet-stream",
@@ -581,6 +732,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             return redirect(url_for("dashboard"))
         blob = pack_ies(store.read_ciphertext(asset), asset.metadata)
         download_name = f"{asset.original_filename}.ies"
+        _mark_sensitive()
         return send_file(
             BytesIO(blob),
             mimetype="application/octet-stream",
@@ -606,6 +758,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             ip = (event.ip or "").replace('"', '""')
             lines.append(f'{event.id},{event.action},{asset},"{ip}",{event.created_at}')
         payload = "\n".join(lines) + "\n"
+        _mark_sensitive()
         return Response(
             payload,
             mimetype="text/csv",
@@ -618,6 +771,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     @login_required(store)
     def download_public_key() -> Response:
         user = _current_user(store)
+        _mark_sensitive()
         return send_file(
             BytesIO(store.read_public_key(user.id)),
             mimetype="application/x-pem-file",
@@ -632,6 +786,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         archive = store.export_backup(user.id)
         _audit(store, user.id, "backup")
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        _mark_sensitive()
         return send_file(
             BytesIO(archive),
             mimetype="application/zip",
@@ -828,6 +983,50 @@ def jwt_required(store: VaultStore) -> Callable[[F], F]:
         return wrapped  # type: ignore[return-value]
 
     return decorator
+
+
+def _assert_usable_secret(app: Flask) -> None:
+    """Refuse to serve with a secret an attacker could already know.
+
+    The signing key authenticates both the session cookie and API tokens, so a
+    published value means anyone can mint either. Earlier releases shipped a
+    constant fallback and started happily with it.
+    """
+    if app.config.get("TESTING"):
+        return
+
+    secret = str(app.config.get("SECRET_KEY") or "")
+    if not secret:
+        raise RuntimeError("SECRET_KEY is not configured.")
+    if secret in KNOWN_INSECURE_SECRETS:
+        raise RuntimeError(
+            "SECRET_KEY is set to a publicly known development value. "
+            "Unset it to have a random key generated, or supply your own."
+        )
+    if len(secret) < 32:
+        raise RuntimeError("SECRET_KEY must be at least 32 characters.")
+
+    jwt_secret = str(app.config.get("JWT_SECRET") or "")
+    if jwt_secret in KNOWN_INSECURE_SECRETS:
+        raise RuntimeError("JWT_SECRET is set to a publicly known development value.")
+
+
+def _throttle(app: Flask, name: str, key: str) -> bool:
+    """Record one attempt against a named throttle. False when it is full."""
+    throttle: RequestThrottle | None = app.extensions.get("throttles", {}).get(name)
+    if throttle is None:
+        return True
+    return throttle.allow(key)
+
+
+def _mark_sensitive() -> None:
+    """Flag the in-flight response as never-cacheable.
+
+    Plaintext images, ciphertext downloads, key material, and backups all pass
+    through ``send_file``, which sets caching headers appropriate for static
+    assets. `security_headers` reads this flag and overrides them.
+    """
+    g.sensitive_response = True
 
 
 def _ensure_csrf_token() -> str:

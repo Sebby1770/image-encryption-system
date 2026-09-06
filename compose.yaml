@@ -1,0 +1,17 @@
+services:
+  vault:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Leave SECRET_KEY unset to have a random one generated and persisted
+      # into the mounted volume on first run.
+      IES_SESSION_COOKIE_SECURE: "1"
+    volumes:
+      - vault-data:/data
+    restart: unless-stopped
+    # Bounds the memory a burst of concurrent Scrypt derivations can claim.
+    mem_limit: 1g
+
+volumes:
+  vault-data:

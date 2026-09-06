@@ -1,157 +1,79 @@
-const algorithmSelect = document.querySelector("#algorithm-select");
-const passphraseInput = document.querySelector("#passphrase-field input");
-const algorithmNote = document.querySelector("#algorithm-note");
-const dropTarget = document.querySelector("#drop-target");
-const imageInput = document.querySelector("#image-input");
+/**
+ * Dashboard behaviour.
+ *
+ * This lives in a file rather than inline in the template so the app can serve
+ * a Content-Security-Policy of `script-src 'self'` with no inline allowance and
+ * no per-request nonce. An inline block would have required either
+ * 'unsafe-inline', which defeats the policy, or nonce plumbing through every
+ * render.
+ */
+const select = document.querySelector("#algorithm-select");
+const passphrase = document.querySelector("#passphrase-field input");
+const note = document.querySelector("#algorithm-note");
+const modal = document.querySelector("#share-modal");
+const shareForm = document.querySelector("#share-form");
+const sharePassField = document.querySelector("#share-passphrase-field");
+const shareRsaField = document.querySelector("#share-rsa-field");
+const shareFilename = document.querySelector("#share-filename");
 
 function syncAlgorithmFields() {
-  if (!algorithmSelect || !passphraseInput || !algorithmNote) return;
-  const rsaMode = algorithmSelect.value === "RSA-HYBRID";
-  passphraseInput.required = !rsaMode;
-  passphraseInput.disabled = rsaMode;
-  if (rsaMode) passphraseInput.value = "";
-  algorithmNote.textContent = rsaMode
-    ? "RSA hybrid mode wraps the image data key with your account public key."
-    : "AES-GCM passphrase mode derives a wrapping key with Scrypt.";
+  if (select.value === "RSA-HYBRID") {
+    passphrase.required = false;
+    passphrase.disabled = true;
+    passphrase.value = "";
+    note.textContent = "RSA hybrid mode wraps the image data key with your account public key.";
+  } else {
+    passphrase.required = true;
+    passphrase.disabled = false;
+    note.textContent = "AES-GCM passphrase mode derives a key with Scrypt and wraps the image data key.";
+  }
 }
 
-algorithmSelect?.addEventListener("change", syncAlgorithmFields);
+function openShareModal(button) {
+  const assetId = button.dataset.assetId;
+  const algorithm = button.dataset.algorithm;
+  shareForm.action = `/images/${assetId}/share`;
+  shareFilename.textContent = button.dataset.filename;
+  const useRsa = algorithm === "RSA-HYBRID";
+  sharePassField.hidden = useRsa;
+  shareRsaField.hidden = !useRsa;
+  sharePassField.querySelector("input").required = !useRsa;
+  shareRsaField.querySelector("input").required = useRsa;
+  sharePassField.querySelector("input").value = "";
+  shareRsaField.querySelector("input").value = "";
+  modal.showModal();
+}
+
+select.addEventListener("change", syncAlgorithmFields);
 syncAlgorithmFields();
 
-["dragenter", "dragover"].forEach((eventName) => {
-  dropTarget?.addEventListener(eventName, (event) => {
-    event.preventDefault();
-    dropTarget.classList.add("dragover");
-  });
+document.querySelectorAll(".share-open").forEach((button) => {
+  button.addEventListener("click", () => openShareModal(button));
 });
+document.querySelector("#share-cancel").addEventListener("click", () => modal.close());
 
-["dragleave", "drop"].forEach((eventName) => {
-  dropTarget?.addEventListener(eventName, (event) => {
-    event.preventDefault();
-    dropTarget.classList.remove("dragover");
-  });
-});
+const linkModal = document.querySelector("#link-modal");
+const linkForm = document.querySelector("#link-form");
+const linkPassField = document.querySelector("#link-passphrase-field");
+const linkRsaField = document.querySelector("#link-rsa-field");
+const linkFilename = document.querySelector("#link-filename");
 
-dropTarget?.addEventListener("drop", (event) => {
-  const files = event.dataTransfer?.files;
-  if (!files?.length || !imageInput) return;
-  imageInput.files = files;
-  const title = dropTarget.querySelector(".drop-title");
-  if (title) title.textContent = files[0].name;
-});
-
-imageInput?.addEventListener("change", () => {
-  const file = imageInput.files?.[0];
-  const title = dropTarget?.querySelector(".drop-title");
-  if (file && title) title.textContent = file.name;
-});
-
-const assetChecks = () =>
-  Array.from(document.querySelectorAll('#bulk-form input[name="asset_ids"]'));
-
-document.querySelector("#select-all")?.addEventListener("change", (event) => {
-  assetChecks().forEach((checkbox) => {
-    checkbox.checked = event.currentTarget.checked;
-  });
-});
-
-document.querySelector("#bulk-tag-form")?.addEventListener("submit", (event) => {
-  const form = event.currentTarget;
-  form.querySelectorAll('input[data-selected-id="true"]').forEach((input) => input.remove());
-  assetChecks()
-    .filter((checkbox) => checkbox.checked)
-    .forEach((checkbox) => {
-      const input = document.createElement("input");
-      input.type = "hidden";
-      input.name = "asset_ids";
-      input.value = checkbox.value;
-      input.dataset.selectedId = "true";
-      form.appendChild(input);
-    });
-});
-
-document.querySelectorAll("[data-confirm]").forEach((form) => {
-  form.addEventListener("submit", (event) => {
-    if (!window.confirm(form.dataset.confirm)) event.preventDefault();
-  });
-});
-
-document.querySelectorAll("[data-unlock]").forEach((node) => {
-  const unlockAt = new Date(node.dataset.unlock);
-  const tick = () => {
-    const remaining = unlockAt.getTime() - Date.now();
-    if (!Number.isFinite(remaining)) {
-      node.textContent = "Lock metadata needs attention";
-      return;
-    }
-    if (remaining <= 0) {
-      node.textContent = "Unlock window open";
-      return;
-    }
-    const hours = Math.floor(remaining / 3_600_000);
-    const minutes = Math.floor((remaining % 3_600_000) / 60_000);
-    const seconds = Math.floor((remaining % 60_000) / 1_000);
-    node.textContent = `Locked · ${hours}h ${minutes}m ${seconds}s remaining`;
-    window.setTimeout(tick, 1_000);
-  };
-  tick();
-});
-
-const previewModal = document.querySelector("#preview-modal");
-const previewImage = document.querySelector("#preview-image");
-const previewStatus = document.querySelector("#preview-status");
-let previewUrl = null;
-let previewBurnTimer = null;
-
-function clearPreview() {
-  if (previewBurnTimer) window.clearTimeout(previewBurnTimer);
-  if (previewUrl) URL.revokeObjectURL(previewUrl);
-  previewUrl = null;
-  previewImage?.removeAttribute("src");
-  if (previewStatus) previewStatus.textContent = "Preview cleared from this page.";
+function openLinkModal(button) {
+  const assetId = button.dataset.assetId;
+  const algorithm = button.dataset.algorithm;
+  linkForm.action = `/images/${assetId}/link`;
+  linkFilename.textContent = button.dataset.filename;
+  const useRsa = algorithm === "RSA-HYBRID";
+  linkPassField.hidden = useRsa;
+  linkRsaField.hidden = !useRsa;
+  linkPassField.querySelector("input").required = !useRsa;
+  linkRsaField.querySelector("input").required = useRsa;
+  linkPassField.querySelector("input").value = "";
+  linkRsaField.querySelector("input").value = "";
+  linkModal.showModal();
 }
 
-document.querySelector("#close-preview")?.addEventListener("click", () => {
-  clearPreview();
-  previewModal?.close();
+document.querySelectorAll(".link-open").forEach((button) => {
+  button.addEventListener("click", () => openLinkModal(button));
 });
-
-previewModal?.addEventListener("close", clearPreview);
-
-document.querySelectorAll(".preview-form").forEach((form) => {
-  form.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const button = form.querySelector(".preview-button");
-    if (button) {
-      button.disabled = true;
-      button.textContent = "Decrypting…";
-    }
-    try {
-      const response = await fetch(`/images/${form.dataset.assetId}/preview`, {
-        method: "POST",
-        body: new FormData(form),
-      });
-      if (!response.ok) {
-        const payload = await response.json().catch(() => ({}));
-        throw new Error(payload.error || "Unable to decrypt preview.");
-      }
-      clearPreview();
-      previewUrl = URL.createObjectURL(await response.blob());
-      previewImage.src = previewUrl;
-      if (previewStatus) previewStatus.textContent = "This preview clears automatically in 30 seconds.";
-      previewModal.showModal();
-      previewBurnTimer = window.setTimeout(() => {
-        clearPreview();
-        previewModal.close();
-      }, 30_000);
-    } catch (error) {
-      window.alert(error.message);
-    } finally {
-      if (button) {
-        button.disabled = false;
-        button.textContent = "Preview in vault";
-      }
-      form.reset();
-    }
-  });
-});
+document.querySelector("#link-cancel").addEventListener("click", () => linkModal.close());

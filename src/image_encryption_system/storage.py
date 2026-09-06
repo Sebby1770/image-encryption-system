@@ -16,6 +16,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
 from .crypto import generate_rsa_key_pair, reencrypt_private_key_pem
+from .security import validate_password
 
 MAX_BACKUP_UNCOMPRESSED = 64 * 1024 * 1024
 
@@ -227,12 +228,21 @@ class VaultStore:
                 "favorite INTEGER NOT NULL DEFAULT 0",
             )
 
+    def count_users(self) -> int:
+        """Cheap query used by the health check to prove the database answers."""
+        with self._connect() as db:
+            row = db.execute("SELECT COUNT(*) AS total FROM users").fetchone()
+        return int(row["total"]) if row else 0
+
     def create_user(self, username: str, password: str) -> User:
         username = username.strip().lower()
         if not username:
             raise ValueError("Username is required.")
-        if len(password) < 10:
-            raise ValueError("Password must be at least 10 characters.")
+        # Enforced here rather than only in the view so every path that can mint
+        # an account — routes, CLI, future callers — gets the same floor. The
+        # account password also wraps the user's RSA private key, so a weak
+        # choice weakens every image ever shared to them.
+        validate_password(password, username=username)
 
         now = _utc_now()
         password_hash = generate_password_hash(password)
@@ -281,8 +291,9 @@ class VaultStore:
         user = self.get_user(user_id)
         if not check_password_hash(user.password_hash, old_password):
             raise ValueError("Current password is incorrect.")
-        if len(new_password) < 10:
-            raise ValueError("Password must be at least 10 characters.")
+        # Rotation has to clear the same bar as registration, or the policy is
+        # one password change away from being bypassed.
+        validate_password(new_password, username=user.username)
 
         new_pem = reencrypt_private_key_pem(
             self.read_private_key(user_id),

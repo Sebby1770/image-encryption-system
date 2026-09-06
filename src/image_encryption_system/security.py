@@ -75,5 +75,110 @@ class LoginGuard:
             return locked_until is not None and now < locked_until
 
 
+class RequestThrottle:
+    """Fixed-window throttle for surfaces outside the login flow.
+
+    Reuses the ``login_guard`` table rather than introducing a second store, so
+    counters survive a restart exactly as the login limiter's do. Each throttle
+    gets its own ``kind`` so windows never share a bucket.
+
+    The login limiter locks an *account* after repeated failures. This one only
+    limits request rate against a caller-supplied key, because the endpoints it
+    protects either have no account yet (registration) or would let an attacker
+    lock out a victim by hammering their asset (decrypt, capability links).
+    """
+
+    def __init__(self, store: VaultStore, kind: str, *, limit: int, window_seconds: int) -> None:
+        self.store = store
+        self.kind = kind
+        self.limit = limit
+        self.window_seconds = window_seconds
+        self._lock = Lock()
+
+    def allow(self, key: str) -> bool:
+        """Record an attempt against ``key``. False once the window is full."""
+        if self.limit <= 0:
+            return True
+
+        now = time()
+        bucket = _normalize(key) or "-"
+        with self._lock:
+            cutoff = now - self.window_seconds
+            self.store.login_guard_prune(self.kind, bucket, before=cutoff)
+            recent = self.store.login_guard_stamps(self.kind, bucket, since=cutoff)
+            if len(recent) >= self.limit:
+                return False
+            self.store.login_guard_add(self.kind, bucket, created_at=now)
+        return True
+
+    def reset(self, key: str) -> None:
+        bucket = _normalize(key) or "-"
+        with self._lock:
+            self.store.login_guard_prune(self.kind, bucket, before=time() + 1)
+
+
+class PasswordPolicyError(ValueError):
+    """Raised when a chosen password does not meet the configured policy."""
+
+
+def validate_password(password: str, *, username: str = "", min_length: int = 10) -> None:
+    """Reject passwords that would undermine the vault they protect.
+
+    The account password does more work here than in a typical application: it
+    also wraps the user's RSA private key, so a weak choice weakens every image
+    shared to that account, not just the session.
+
+    The rules stay deliberately structural — length, some variety, and no reuse
+    of the username or an obvious keyboard pattern. Anything stricter pushes
+    people toward writing passwords down without measurably raising the bar.
+    """
+    if not isinstance(password, str) or not password:
+        raise PasswordPolicyError("A password is required.")
+
+    if len(password) < min_length:
+        raise PasswordPolicyError(f"Password must be at least {min_length} characters.")
+
+    if len(password.encode("utf-8")) > 1024:
+        raise PasswordPolicyError("Password is too long.")
+
+    normalized = password.strip().lower()
+
+    if username and _normalize(username) and _normalize(username) in normalized:
+        raise PasswordPolicyError("Password must not contain your username.")
+
+    if len(set(password)) < 5:
+        raise PasswordPolicyError("Password must use at least five different characters.")
+
+    if normalized in _COMMON_PASSWORDS:
+        raise PasswordPolicyError("That password is too common. Choose something else.")
+
+
+# A short, deliberately non-exhaustive list. A real deployment should pair this
+# with a breach-corpus check; the point here is to refuse the handful of choices
+# that show up first in any credential-stuffing list.
+_COMMON_PASSWORDS = frozenset(
+    {
+        "password",
+        "password1",
+        "password123",
+        "passw0rd123",
+        "1234567890",
+        "12345678901",
+        "123456789012",
+        "qwertyuiop",
+        "qwerty12345",
+        "letmein123",
+        "iloveyou123",
+        "administrator",
+        "changeme123",
+        "welcome123",
+        "abc123456789",
+        "trustno1234",
+        "monkey123456",
+        "dragon123456",
+    }
+)
+
+
 def _normalize(username: str) -> str:
     return username.strip().lower()

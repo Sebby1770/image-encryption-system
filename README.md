@@ -3,14 +3,21 @@
 **Live site:** [https://sebby1770.github.io/image-encryption-system/](https://sebby1770.github.io/image-encryption-system/)
 
 A Flask image vault that encrypts photos with **AES-256-GCM** before they touch
-disk. Per-image data keys are wrapped with Scrypt+AES or RSA-OAEP. Version
-**2.3.0** adds capability link shares, notes/favorites, ciphertext integrity
-checks, session idle timeout, audit CSV, and CLI rewrap/hash.
+disk. Per-image data keys are wrapped with Scrypt+AES or RSA-OAEP.
 
-Version 1.0 hardens the complete envelope: owner and file context are
-authenticated, hostile metadata is bounded before key derivation, decrypted
-responses are non-cacheable, audit history is HMAC-sealed, and password changes
-revoke older sessions and API tokens.
+Version **3.0.0** hardens the HTTP surface around that envelope: a strict
+Content-Security-Policy with no inline scripts, `no-store` on every response
+carrying plaintext or key material, hardened session cookies, a refusal to boot
+on a publicly known signing secret, enforced envelope-metadata versioning, a
+Scrypt cost floor decoupled from the current default, throttling beyond the
+login form, a password policy that rotation cannot bypass, and a container
+image.
+
+Version 1.0 hardened the envelope itself: owner and file context are
+authenticated, hostile metadata is bounded before key derivation, audit history
+is HMAC-sealed, and password changes revoke older sessions and API tokens.
+(Its notes also claimed decrypted responses were non-cacheable; no such header
+was ever sent. 3.0.0 makes it true.)
 
 - AES-256-GCM encryption for image bytes (cryptography.io / OpenSSL).
 - RSA-OAEP hybrid mode: RSA wraps a fresh 256-bit AES data key.
@@ -39,6 +46,20 @@ revoke older sessions and API tokens.
 - `ies` CLI for offline encrypt / decrypt / keygen / inspect / verify / rewrap / hash.
 - Login rate limit (5 / 10 minutes, IP+user) and lockout after 8 failures,
   persisted in SQLite so a restart does not reset the counter.
+- Throttles beyond the login form: registration (which mints an RSA-3072 key
+  pair, so it is a CPU amplifier reachable without an account), decryption
+  attempts, and capability-link resolution.
+- Strict CSP (`script-src 'self'`, no inline, no nonce), `frame-ancestors
+  'none'`, nosniff, `Referrer-Policy: no-referrer`, Permissions-Policy, COOP,
+  CORP, and HSTS on HTTPS requests.
+- `no-store` on every response carrying plaintext, ciphertext, key material, or
+  a backup archive.
+- Session cookies are HttpOnly, SameSite=Lax, and Secure by default.
+- Refuses to start on a short or publicly known `SECRET_KEY`; generates and
+  persists a random one when none is configured.
+- Password policy enforced in storage, so rotation cannot bypass it, with a
+  client-side meter that mirrors the same rules.
+- `GET /healthz` for container and uptime probes.
 - 8 MB default upload limit; download ciphertext as `.ies`.
 - JWT API for listing images and reading the audit trail (`ver` claim).
 - Tests for crypto, sharing, revoke, expiry, backup, CLI, CSRF, and lockout.
@@ -63,6 +84,39 @@ revoke older sessions and API tokens.
 
 PyCrypto is intentionally not used because it is deprecated.
 
+## Security posture
+
+| Control | Where |
+| --- | --- |
+| AES-256-GCM per image, authenticated owner/file context | `crypto.py` |
+| Scrypt N=2**16 for new wrappings, N=2**14 accepted floor | `crypto.py` |
+| Envelope metadata version enforced against an allow-list | `crypto.py` |
+| Strict CSP, frame-ancestors, nosniff, HSTS, COOP/CORP | `web.py` |
+| `no-store` on plaintext, ciphertext, keys, and backups | `web.py` |
+| Secure/HttpOnly/SameSite session cookie | `config.py` |
+| Boot-time refusal of a weak or published signing secret | `web.py` |
+| Login throttle, lockout, and three further throttles | `security.py` |
+| Password policy enforced at the storage layer | `security.py`, `storage.py` |
+
+Raising the Scrypt default was only possible because the *accepted* floor is now
+a separate constant. Previously the validator rejected anything below the
+current default, which meant bumping the cost would have made every existing
+vault file and `.ies` blob undecryptable.
+
+## Docker
+
+```bash
+docker compose up --build
+```
+
+The vault database, ciphertext, encrypted private keys, and the generated
+signing secret all live in the `vault-data` volume mounted at `/data`. The image
+runs as a non-root user and ships a `HEALTHCHECK` against `/healthz`.
+
+Scrypt holds roughly 67 MB per in-flight decryption, so the compose file sets a
+memory limit and a modest worker count rather than letting a burst of concurrent
+decrypts claim the host.
+
 ## Quick Start
 
 ```bash
@@ -71,10 +125,18 @@ cd image-encryption-system
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
-python run.py
+IES_SESSION_COOKIE_SECURE=0 python run.py
 ```
 
 Open <http://127.0.0.1:5000>, create an account, and upload an image.
+
+`IES_SESSION_COOKIE_SECURE=0` is needed for local **HTTP** development only: a
+`Secure` cookie is silently dropped over plain HTTP, which presents as a login
+that never sticks. Leave it at its secure default everywhere else.
+
+No `SECRET_KEY` is required to start. One is generated and persisted to
+`instance/secret.key` on first run, so sessions survive a restart without any
+deployment ever running on a key published in this repository.
 
 ## CLI
 
