@@ -2,6 +2,75 @@
 
 ## [Unreleased]
 
+### Security (phase 1 adversarial review)
+Each item has a regression test in `tests/test_security_review.py` that failed
+before the fix.
+
+- **Stored XSS through backup restore (high).** Restore accepted any
+  `mime_type`, and decrypt served plaintext inline with that type, so a
+  crafted backup could plant HTML that ran on this origin when a share
+  recipient opened it. Restore now accepts only allow-listed image types. The
+  served `Content-Type` comes from the allow-list, the bytes must parse as that
+  format, and responses are sandboxed with a CSP.
+- **Published default secrets were live (high).** With `SECRET_KEY`/`JWT_SECRET`
+  unset, the app signed sessions and JWTs with the default string in
+  `config.py`, so anyone could forge an API token. Unset or placeholder secrets
+  are now replaced with a generated key persisted under the instance
+  directory, and the JWT key is derived separately.
+- **AAD did not bind file identity, algorithm, format, or dimensions
+  (medium).** Ciphertext and metadata could be swapped between records, and a
+  row's type or size edited, without detection. New **envelope version 3**
+  seals owner, asset id, algorithm, wrap type, MIME type, format, and
+  dimensions, and the web app checks the row against that sealed context
+  before unwrapping. Version 1 files still decrypt (fixtures in
+  `tests/fixtures/`).
+- **Capability-link download cap raced (medium).** Check-then-increment let
+  concurrent requests exceed `max_downloads`. The download is now reserved
+  with one atomic `UPDATE` before decryption, and handed back if decryption
+  fails.
+- **Location metadata survived stripping (medium).** GPS in XMP (JPEG, PNG),
+  PNG text chunks, and JPEG/GIF comments all passed through. Stripping now
+  covers every metadata container, re-encodes TIFF and GIF always, keeps
+  animation frames, and applies EXIF orientation.
+- **Backup restore amplification (medium).** One blob could be referenced many
+  times, turning a 64 MiB zip into unbounded disk writes. Each blob may now be
+  referenced once, a restore is capped at 1000 assets, and every entry is
+  validated before anything is written.
+- **The documented HMAC audit chain did not exist (medium).** The README and
+  security model promised it, but the code wrote plain rows. Events are now
+  HMAC-chained per account, verified on `/audit` and `/api/audit`, and legacy
+  rows are sealed once on upgrade.
+- **Logout did not end the session (low).** Sessions lived only in the signed
+  cookie, so a copied cookie kept working after logout. Sessions are now bound
+  to a server-side row that logout and password changes delete, with a 7-day
+  absolute lifetime.
+- **Hostile image headers caused HTTP 500 (low).** Pillow's
+  `DecompressionBombError` and truncated-file errors escaped the upload
+  handler. They are now clean rejections, and only allow-listed decoders run.
+- **Login timing revealed whether a username exists (low).** Unknown users now
+  get a dummy hash check.
+- **Malformed envelope fields crashed the CLI (low).** A non-string nonce or a
+  non-dict wrap raised `AttributeError`. `validate_envelope()` now checks every
+  field (strict base64, bounded sizes) first.
+- **JWTs without a `ver` claim were accepted (low, hardening).** `ver`
+  defaulted to 1. `exp`, `iat`, `iss`, `sub`, and an integer `ver` are now
+  required.
+
+### Changed
+- Every HTML page sends a strict CSP (no inline script), `X-Frame-Options:
+  DENY`, and `Referrer-Policy: no-referrer`. Session cookies are `SameSite=Lax`,
+  plus `Secure` with `IES_SECURE_COOKIES=1`. The dashboard script moved to
+  `static/js/`.
+- Restoring the same backup twice no longer duplicates images. Version 3
+  images can only be restored into the account that exported them.
+- `ies inspect` prints the sealed context.
+- `JWT_SECRET` now defaults to a key derived from `SECRET_KEY` rather than the
+  same value, so JWTs issued before upgrading (2-hour lifetime) stop working
+  once.
+- Existing browser sessions sign in again once after upgrading (they have no
+  server-side session row).
+- `docs/SECURITY_MODEL.md` was rewritten to match the code claim for claim.
+
 ### Fixed
 - **`ies decrypt` could not open a `.ies` file downloaded from the web vault.**
   The CLI only rebuilt the AAD for files it had written itself and used empty

@@ -23,14 +23,24 @@ checks, session idle timeout, audit CSV, and CLI rewrap/hash.
 - Change password: new hash, RSA private key re-encrypted, `token_version`
   bumped so other sessions and JWTs stop working.
 - Delete account (`POST /account/delete`) with password confirmation.
-- EXIF is stripped before encryption.
+- Envelope version 3 seals the image's owner, asset id, algorithm, wrap type,
+  MIME type, format, and dimensions into the AES-GCM AAD, so ciphertext cannot
+  be swapped between records or accounts. Version 1 files stay decryptable.
+- Capture metadata is stripped before encryption: EXIF (including GPS), XMP,
+  IPTC, PNG text chunks, and JPEG/GIF comments.
 - Uploads are identified from their header and bounded (format allow-list,
-  64 MP pixel ceiling, 8 MB byte limit) before anything decodes them.
+  64 MP pixel ceiling across all frames, 8 MB byte limit) before anything
+  decodes them.
+- Decrypted images are served only as the allow-listed type they parse as,
+  with `no-store`, `nosniff`, and a sandboxing CSP.
 - Ciphertext SHA-256 recorded at save time and checked before decrypt.
-- CSRF tokens on every HTML POST form; session idle timeout (30 minutes).
+- CSRF tokens on every HTML POST form; strict CSP (no inline script).
+- Server-side session registry: logout and password changes really end
+  sessions; 30-minute idle and 7-day absolute timeouts.
 - Login rate limit (5 / 10 minutes per IP+username) and lockout after 8
   failures, persisted in SQLite.
-- Owner-only audit log (web, CSV export, and `GET /api/audit`).
+- Owner-only audit log, HMAC-chained and verified on every view (web, CSV
+  export, and `GET /api/audit`).
 - Encrypted backup zip (ciphertext + metadata, never private keys) and restore.
 - Rename, notes, and favorites on vault items.
 - JWT API for listing images, sharing, links, and the audit trail.
@@ -113,6 +123,10 @@ account: vault blobs, shares, RSA keys, audit rows, and the user.
 
 - `GET /backup` downloads a zip of your encrypted blobs plus `manifest.json`.
 - `POST /restore` (dashboard form) imports that zip into the current account.
+  Every entry is validated first, so a bad backup restores nothing. Restoring
+  the same backup twice does not duplicate images. Images in the current
+  (version 3) format can only be restored into the account that exported
+  them; version 1 images can be restored anywhere.
 - Private keys and password hashes are never included.
 - Each vault item can also be downloaded as a portable `.ies` file.
 
@@ -120,8 +134,10 @@ account: vault blobs, shares, RSA keys, audit rows, and the user.
 
 | Variable | Purpose |
 | --- | --- |
-| `SECRET_KEY` | Flask session signing |
-| `JWT_SECRET` | JWT HMAC secret |
+| `SECRET_KEY` | Flask session signing (generated and persisted in the instance dir if unset) |
+| `JWT_SECRET` | JWT HMAC secret (derived from `SECRET_KEY` if unset) |
+| `AUDIT_HMAC_KEY` | Audit chain key; keep it off the database host (generated if unset) |
+| `IES_SECURE_COOKIES` | `1` behind HTTPS to mark the session cookie `Secure` |
 | `IES_INSTANCE_DIR` | SQLite, vault blobs, and RSA keys |
 | `IES_MAX_UPLOAD_BYTES` | Upload cap (default 8 MiB) |
 
@@ -129,8 +145,9 @@ Use strong secrets for any shared deployment.
 
 ## How Encryption Works
 
-Uploaded images are re-saved without EXIF when metadata is present, then
-encrypted with a random 256-bit data key using AES-GCM.
+Uploaded images are re-encoded without capture metadata when any is present,
+then encrypted with a random 256-bit data key using AES-GCM. The AAD seals the
+image's context (owner, asset id, type, and size).
 The selected algorithm controls how that data key is protected:
 
 - `AES-GCM passphrase`: Scrypt derives a wrapping key, then AES-GCM wraps the

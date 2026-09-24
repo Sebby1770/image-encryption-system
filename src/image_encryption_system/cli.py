@@ -11,14 +11,13 @@ from .crypto import (
     AES_GCM_PASSPHRASE,
     RSA_HYBRID,
     CryptoError,
-    aad_from_metadata,
-    cli_aad,
     decrypt_image_bytes,
     encrypt_image_bytes,
     generate_rsa_key_pair,
     pack_ies,
     unpack_ies,
     unwrap_data_key,
+    validate_envelope,
     wrap_data_key_passphrase,
 )
 
@@ -107,14 +106,14 @@ def _encrypt(args: argparse.Namespace) -> int:
     if not plaintext:
         raise ValueError("refusing to encrypt an empty file")
 
-    aad = cli_aad(source.name)
+    context = {"filename": source.name[:255], "source": "cli"}
     if args.public_key is not None:
         public_key = Path(args.public_key).read_bytes()
         result = encrypt_image_bytes(
             plaintext,
             RSA_HYBRID,
             public_key_pem=public_key,
-            aad=aad,
+            context=context,
         )
     else:
         passphrase = args.passphrase or getpass("AES passphrase: ")
@@ -122,12 +121,11 @@ def _encrypt(args: argparse.Namespace) -> int:
             plaintext,
             AES_GCM_PASSPHRASE,
             passphrase=passphrase,
-            aad=aad,
+            context=context,
         )
 
     metadata = {
         **result.metadata,
-        "aad": {"source": "cli", "filename": source.name},
         "original_filename": source.name,
         "ciphertext_sha256": sha256(result.ciphertext).hexdigest(),
     }
@@ -140,7 +138,7 @@ def _decrypt(args: argparse.Namespace) -> int:
     if not source.is_file():
         raise ValueError(f"input file not found: {source}")
     ciphertext, metadata = unpack_ies(source.read_bytes())
-    aad = aad_from_metadata(metadata)
+    validate_envelope(metadata)
 
     passphrase = args.passphrase
     private_key = Path(args.private_key).read_bytes() if args.private_key else None
@@ -155,7 +153,6 @@ def _decrypt(args: argparse.Namespace) -> int:
         passphrase=None if private_key is not None else passphrase,
         private_key_pem=private_key,
         private_key_passphrase=passphrase if private_key is not None else None,
-        aad=aad,
     )
     args.out.write_bytes(plaintext)
     return 0
@@ -184,6 +181,10 @@ def _inspect(args: argparse.Namespace) -> int:
         print(f"wrap: {wrap_type}")
     if original:
         print(f"original_filename: {original}")
+    context = metadata.get("context")
+    if isinstance(context, dict):
+        for key in sorted(context):
+            print(f"context.{key}: {context[key]}")
     print(f"ciphertext_sha256: {digest}")
     stored = metadata.get("ciphertext_sha256")
     if stored:
@@ -197,9 +198,8 @@ def _verify(args: argparse.Namespace) -> int:
     if not source.is_file():
         raise ValueError(f"input file not found: {source}")
     _ciphertext, metadata = unpack_ies(source.read_bytes())
-    key_wrap = metadata.get("key_wrap")
-    if not isinstance(key_wrap, dict):
-        raise CryptoError("Encrypted image metadata is incomplete.")
+    validate_envelope(metadata)
+    key_wrap = metadata["key_wrap"]
 
     passphrase = args.passphrase
     private_key = Path(args.private_key).read_bytes() if args.private_key else None
@@ -223,9 +223,8 @@ def _rewrap(args: argparse.Namespace) -> int:
     if not source.is_file():
         raise ValueError(f"input file not found: {source}")
     ciphertext, metadata = unpack_ies(source.read_bytes())
-    key_wrap = metadata.get("key_wrap")
-    if not isinstance(key_wrap, dict):
-        raise CryptoError("Encrypted image metadata is incomplete.")
+    validate_envelope(metadata)
+    key_wrap = metadata["key_wrap"]
     old_passphrase = args.old_passphrase or getpass("Current AES passphrase: ")
     new_passphrase = args.new_passphrase or getpass("New AES passphrase: ")
     data_key = unwrap_data_key(key_wrap, passphrase=old_passphrase)

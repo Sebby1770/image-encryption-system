@@ -28,19 +28,17 @@ def sample_png() -> bytes:
 
 def test_aes_gcm_round_trip() -> None:
     plaintext = sample_png()
-    aad = b"user=1|filename=sample.png|mime=image/png"
 
     encrypted = encrypt_image_bytes(
         plaintext,
         AES_GCM_PASSPHRASE,
         passphrase="a very strong passphrase",
-        aad=aad,
+        context={"owner": 1, "filename": "sample.png", "mime": "image/png"},
     )
     decrypted = decrypt_image_bytes(
         encrypted.ciphertext,
         encrypted.metadata,
         passphrase="a very strong passphrase",
-        aad=aad,
     )
 
     assert decrypted == plaintext

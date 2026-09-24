@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import binascii
 import json
 import os
+import re
 import struct
 from base64 import b64decode, b64encode
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
 from cryptography.exceptions import InvalidTag, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
@@ -33,6 +37,21 @@ MAX_SCRYPT_WORK_FACTOR = 2**22
 IES_MAGIC = b"IES1"
 WRAP_SCRYPT = "scrypt-aes-gcm"
 WRAP_RSA = "rsa-oaep-sha256"
+WRAP_TYPES = (WRAP_SCRYPT, WRAP_RSA)
+
+# Envelope versions this code can open. Version 1 is the original format whose
+# AAD is rebuilt from the legacy ``aad`` dict. Version 3 seals a structured
+# ``context``. Version 2 is deliberately skipped: the discarded v1.0 lineage of
+# this project wrote ``"version": 2`` with an incompatible layout.
+ENVELOPE_V1 = 1
+ENVELOPE_V3 = 3
+CURRENT_ENVELOPE_VERSION = ENVELOPE_V3
+SUPPORTED_ENVELOPE_VERSIONS = frozenset({ENVELOPE_V1, ENVELOPE_V3})
+CONTEXT_AAD_PREFIX = b"IES-CONTEXT-V3\x00"
+MAX_METADATA_BYTES = 64 * 1024
+MAX_CONTEXT_BYTES = 4096
+CONTEXT_SOURCES = frozenset({"web", "cli", "browser"})
+_ASSET_ID = re.compile(r"[0-9a-f]{32}")
 
 
 class CryptoError(Exception):
@@ -62,34 +81,52 @@ def generate_rsa_key_pair(passphrase: str) -> tuple[bytes, bytes]:
     return private_pem, public_pem
 
 
+def new_asset_id() -> str:
+    """Random identifier sealed into every version 3 envelope."""
+    return uuid4().hex
+
+
 def encrypt_image_bytes(
     image_bytes: bytes,
     algorithm: str,
     *,
     passphrase: str | None = None,
     public_key_pem: bytes | None = None,
-    aad: bytes = b"",
+    context: Mapping[str, Any] | None = None,
 ) -> EncryptionResult:
+    """Encrypt into a version 3 envelope whose AAD is the sealed ``context``.
+
+    ``context`` may carry ``asset``, ``owner``, ``filename``, ``mime``,
+    ``format``, ``width``, ``height`` and ``source``. ``algorithm`` and ``wrap``
+    are always filled in here, and ``asset`` defaults to a fresh random id.
+    """
     if algorithm not in SUPPORTED_ALGORITHMS:
         raise CryptoError(f"Unsupported algorithm: {algorithm}")
     if not image_bytes:
         raise CryptoError("Image bytes cannot be empty.")
 
+    sealed = dict(context or {})
+    sealed.setdefault("asset", new_asset_id())
+    sealed["algorithm"] = algorithm
+    sealed["wrap"] = WRAP_SCRYPT if algorithm == AES_GCM_PASSPHRASE else WRAP_RSA
+    _validate_context(sealed, algorithm=algorithm)
+
     data_key = os.urandom(AES_KEY_BYTES)
     image_nonce = os.urandom(GCM_NONCE_BYTES)
-    ciphertext = AESGCM(data_key).encrypt(image_nonce, image_bytes, aad)
+    key_wrap: dict[str, Any]
+    if algorithm == AES_GCM_PASSPHRASE:
+        key_wrap = _wrap_key_with_passphrase(data_key, passphrase)
+    else:
+        key_wrap = _wrap_key_with_rsa(data_key, public_key_pem)
+    ciphertext = AESGCM(data_key).encrypt(image_nonce, image_bytes, context_aad(sealed))
 
     metadata: dict[str, Any] = {
-        "version": 1,
+        "version": CURRENT_ENVELOPE_VERSION,
         "algorithm": algorithm,
         "image_nonce": _b64encode(image_nonce),
+        "key_wrap": key_wrap,
+        "context": sealed,
     }
-
-    if algorithm == AES_GCM_PASSPHRASE:
-        metadata["key_wrap"] = _wrap_key_with_passphrase(data_key, passphrase)
-    elif algorithm == RSA_HYBRID:
-        metadata["key_wrap"] = _wrap_key_with_rsa(data_key, public_key_pem)
-
     return EncryptionResult(ciphertext=ciphertext, metadata=metadata)
 
 
@@ -100,27 +137,117 @@ def decrypt_image_bytes(
     passphrase: str | None = None,
     private_key_pem: bytes | None = None,
     private_key_passphrase: str | None = None,
-    aad: bytes = b"",
+    aad: bytes | None = None,
 ) -> bytes:
-    try:
-        image_nonce = _b64decode(metadata["image_nonce"])
-        key_wrap = metadata["key_wrap"]
-    except KeyError as exc:
-        raise CryptoError("Encrypted image metadata is incomplete.") from exc
+    """Decrypt an envelope of any supported version.
+
+    The AAD is rebuilt from the envelope itself. ``aad`` is only for version 1
+    callers that know the context out of band; for version 3 the sealed context
+    is authoritative and a conflicting ``aad`` is refused.
+    """
+    version = validate_envelope(metadata)
+    derived = aad_from_metadata(metadata)
+    if aad is None or aad == derived:
+        effective_aad = derived
+    elif version == ENVELOPE_V1:
+        effective_aad = aad
+    else:
+        raise CryptoError("Supplied AAD conflicts with the sealed envelope context.")
+    if not isinstance(ciphertext, bytes) or len(ciphertext) < GCM_TAG_BYTES:
+        raise CryptoError("Encrypted image ciphertext is truncated.")
 
     data_key = unwrap_data_key(
-        key_wrap,
+        metadata["key_wrap"],
         passphrase=passphrase,
         private_key_pem=private_key_pem,
         private_key_passphrase=private_key_passphrase,
     )
 
     try:
-        return AESGCM(data_key).decrypt(image_nonce, ciphertext, aad)
+        return AESGCM(data_key).decrypt(
+            _b64decode(metadata["image_nonce"]), ciphertext, effective_aad
+        )
     except InvalidTag as exc:
         raise CryptoError(
             "Decryption failed. The key, passphrase, or ciphertext is invalid."
         ) from exc
+
+
+def validate_envelope(metadata: Any) -> int:
+    """Check every envelope field's type and size before anything uses it.
+
+    Returns the envelope version. Raises ``CryptoError`` for anything malformed,
+    so hostile ``.ies`` files and backups fail cleanly instead of crashing.
+    """
+    if not isinstance(metadata, dict):
+        raise CryptoError("Encrypted image metadata must be an object.")
+    version = metadata.get("version", ENVELOPE_V1)
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise CryptoError("Encrypted image metadata version is invalid.")
+    if version not in SUPPORTED_ENVELOPE_VERSIONS:
+        raise CryptoError(f"Unsupported encrypted image envelope version: {version}")
+    algorithm = metadata.get("algorithm")
+    if algorithm not in SUPPORTED_ALGORITHMS:
+        raise CryptoError("Encrypted image algorithm is not supported.")
+    if len(_b64decode(metadata.get("image_nonce"))) != GCM_NONCE_BYTES:
+        raise CryptoError("Encrypted image nonce has an invalid length.")
+    key_wrap = metadata.get("key_wrap")
+    if not isinstance(key_wrap, dict) or key_wrap.get("type") not in WRAP_TYPES:
+        raise CryptoError("Encrypted image key wrapping metadata is invalid.")
+    if version == ENVELOPE_V3:
+        _validate_context(metadata.get("context"), algorithm=algorithm)
+    else:
+        legacy = metadata.get("aad")
+        if legacy is not None and not isinstance(legacy, dict):
+            raise CryptoError("Encrypted image context is invalid.")
+    return int(version)
+
+
+def context_aad(context: Mapping[str, Any]) -> bytes:
+    """Canonical AAD bytes for a version 3 context.
+
+    Sorted keys, no whitespace, UTF-8 (not ASCII-escaped), so a browser's
+    ``JSON.stringify`` over the same sorted object produces identical bytes.
+    """
+    body = json.dumps(dict(context), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return CONTEXT_AAD_PREFIX + body.encode("utf-8")
+
+
+def _validate_context(context: Any, *, algorithm: str) -> None:
+    if not isinstance(context, dict):
+        raise CryptoError("Encrypted image context is missing.")
+    allowed = {
+        "asset",
+        "algorithm",
+        "wrap",
+        "owner",
+        "filename",
+        "mime",
+        "format",
+        "width",
+        "height",
+        "source",
+    }
+    if not set(context) <= allowed:
+        raise CryptoError("Encrypted image context has unexpected fields.")
+    if not isinstance(context.get("asset"), str) or not _ASSET_ID.fullmatch(context["asset"]):
+        raise CryptoError("Encrypted image context has an invalid asset id.")
+    if context.get("algorithm") != algorithm:
+        raise CryptoError("Encrypted image context does not match its algorithm.")
+    if context.get("wrap") not in WRAP_TYPES:
+        raise CryptoError("Encrypted image context has an invalid wrap type.")
+    for key in ("owner", "width", "height"):
+        if key in context:
+            value = context[key]
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value < 2**31:
+                raise CryptoError(f"Encrypted image context has an invalid {key}.")
+    for key, limit in (("filename", 255), ("mime", 100), ("format", 16)):
+        if key in context and (not isinstance(context[key], str) or len(context[key]) > limit):
+            raise CryptoError(f"Encrypted image context has an invalid {key}.")
+    if "source" in context and context["source"] not in CONTEXT_SOURCES:
+        raise CryptoError("Encrypted image context has an invalid source.")
+    if len(context_aad(context)) > MAX_CONTEXT_BYTES:
+        raise CryptoError("Encrypted image context is too large.")
 
 
 def unwrap_data_key(
@@ -131,6 +258,8 @@ def unwrap_data_key(
     private_key_passphrase: str | None = None,
 ) -> bytes:
     """Recover the AES data key from passphrase or RSA wrapping metadata."""
+    if not isinstance(key_wrap, dict):
+        raise CryptoError("Unsupported key wrapping metadata.")
     wrap_type = key_wrap.get("type")
     if wrap_type == WRAP_SCRYPT:
         return _unwrap_key_with_passphrase(key_wrap, passphrase)
@@ -190,6 +319,8 @@ def unpack_ies(blob: bytes) -> tuple[bytes, dict[str, Any]]:
     meta_len = struct.unpack(">I", blob[4:8])[0]
     start = 8
     end = start + meta_len
+    if meta_len > MAX_METADATA_BYTES:
+        raise CryptoError("IES vault file metadata is too large.")
     if meta_len < 2 or end > len(blob):
         raise CryptoError("IES vault file metadata is truncated.")
     try:
@@ -210,12 +341,15 @@ def web_aad(user_id: int, original_filename: str, mime_type: str) -> bytes:
 
 
 def aad_from_metadata(metadata: dict[str, Any]) -> bytes:
-    """Rebuild the AAD an envelope was sealed with from its own ``aad`` context.
+    """Rebuild the AAD an envelope was sealed with from the envelope itself.
 
-    Web uploads record ``user_id``/``original_filename``/``mime_type``; CLI
-    encryptions record ``source="cli"`` and ``filename``. Anything else was
-    sealed without associated data.
+    Version 3 seals the canonical ``context``. Version 1 web uploads recorded
+    ``user_id``/``original_filename``/``mime_type`` under ``aad``; version 1 CLI
+    encryptions recorded ``source="cli"`` and ``filename``. Any other version 1
+    envelope was sealed without associated data.
     """
+    if validate_envelope(metadata) == ENVELOPE_V3:
+        return context_aad(metadata["context"])
     context = metadata.get("aad")
     if not isinstance(context, dict):
         return b""
@@ -392,5 +526,10 @@ def _b64encode(value: bytes) -> str:
     return b64encode(value).decode("ascii")
 
 
-def _b64decode(value: str) -> bytes:
-    return b64decode(value.encode("ascii"))
+def _b64decode(value: Any) -> bytes:
+    if not isinstance(value, str):
+        raise CryptoError("Encrypted image metadata field must be base64 text.")
+    try:
+        return b64decode(value.encode("ascii"), validate=True)
+    except (UnicodeEncodeError, binascii.Error) as exc:
+        raise CryptoError("Encrypted image metadata field is not valid base64.") from exc

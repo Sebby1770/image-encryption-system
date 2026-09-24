@@ -50,9 +50,9 @@ def test_pixel_ceiling_is_checked_before_any_decode(monkeypatch):
     import image_encryption_system.web as web
 
     def explode(*_args, **_kwargs):
-        raise AssertionError("EXIF stripping ran before the size check")
+        raise AssertionError("Metadata stripping ran before the size check")
 
-    monkeypatch.setattr(web, "_strip_image_exif", explode)
+    monkeypatch.setattr(web, "_strip_image_metadata", explode)
 
     with pytest.raises(UnsupportedImageError):
         _inspect_image(_png(400, 400), allowed_formats={"PNG"}, max_pixels=1000)

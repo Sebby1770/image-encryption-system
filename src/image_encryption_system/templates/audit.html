@@ -7,6 +7,13 @@
     <div>
       <h1>Audit log</h1>
       <p>Your vault activity only: sign-in, upload, decrypt, share, revoke, rotate, password change, delete, and backup.</p>
+      <p class="flash {% if chain.ok %}flash-success{% else %}flash-error{% endif %}" id="audit-chain-status">
+        {% if chain.ok %}
+          Audit chain verified: {{ chain.events }} event(s), HMAC-sealed and unbroken.
+        {% else %}
+          Audit chain broken at event #{{ chain.first_bad_id }}: the log was edited, reordered, or had events removed.
+        {% endif %}
+      </p>
       <p><a class="button button-ghost" href="{{ url_for('audit_csv') }}">Export CSV</a></p>
     </div>
   </section>

@@ -1,23 +1,42 @@
 from __future__ import annotations
 
+import hmac
 import json
+import os
+import secrets
 import sqlite3
 import time
 import zipfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any
-from uuid import uuid4
 
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
-from .crypto import generate_rsa_key_pair, reencrypt_private_key_pem
+from .config import IMAGE_MIME_TYPES
+from .crypto import (
+    ENVELOPE_V3,
+    GCM_TAG_BYTES,
+    SUPPORTED_ALGORITHMS,
+    CryptoError,
+    generate_rsa_key_pair,
+    new_asset_id,
+    reencrypt_private_key_pem,
+    validate_envelope,
+)
 
 MAX_BACKUP_UNCOMPRESSED = 64 * 1024 * 1024
+MAX_BACKUP_ASSETS = 1000
+MAX_IMAGE_DIMENSION = 1_000_000
+AUDIT_GENESIS = "GENESIS"
+AUDIT_KEY_FILENAME = "audit-hmac.key"
 
 
 @dataclass(frozen=True)
@@ -108,11 +127,37 @@ class AuditEvent:
     created_at: str
 
 
+@dataclass(frozen=True)
+class AuditChainReport:
+    ok: bool
+    events: int
+    first_bad_id: int | None = None
+
+
 class VaultStore:
-    def __init__(self, database_path: Path, vault_dir: Path, key_dir: Path):
+    def __init__(
+        self,
+        database_path: Path,
+        vault_dir: Path,
+        key_dir: Path,
+        *,
+        audit_key: bytes | None = None,
+    ):
         self.database_path = Path(database_path)
         self.vault_dir = Path(vault_dir)
         self.key_dir = Path(key_dir)
+        self._audit_key_override = audit_key
+        self._audit_key: bytes | None = None
+
+    @property
+    def audit_key(self) -> bytes:
+        if self._audit_key is None:
+            raw = self._audit_key_override or load_or_create_secret(
+                self.key_dir / AUDIT_KEY_FILENAME
+            ).encode("utf-8")
+            # Domain-separate so the same operator secret is never used raw.
+            self._audit_key = hmac.new(raw, b"ies/audit-chain/v1", sha256).digest()
+        return self._audit_key
 
     def init(self) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -179,6 +224,13 @@ class VaultStore:
                     FOREIGN KEY (user_id) REFERENCES users (id)
                 );
 
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+                );
+
                 CREATE TABLE IF NOT EXISTS login_guard (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     kind TEXT NOT NULL,
@@ -192,6 +244,7 @@ class VaultStore:
                 CREATE INDEX IF NOT EXISTS idx_shares_recipient ON shares (recipient_user_id);
                 CREATE INDEX IF NOT EXISTS idx_link_shares_asset ON link_shares (asset_id);
                 CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_events (user_id, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions (user_id);
                 CREATE INDEX IF NOT EXISTS idx_login_guard_lookup
                     ON login_guard (kind, username, ip, created_at);
                 """
@@ -210,6 +263,9 @@ class VaultStore:
                 "favorite",
                 "favorite INTEGER NOT NULL DEFAULT 0",
             )
+            _ensure_column(db, "audit_events", "prev_hash", "prev_hash TEXT")
+            _ensure_column(db, "audit_events", "chain_hash", "chain_hash TEXT")
+        self._seal_unchained_audit_events()
 
     def create_user(self, username: str, password: str) -> User:
         username = username.strip().lower()
@@ -238,7 +294,12 @@ class VaultStore:
 
     def authenticate_user(self, username: str, password: str) -> User | None:
         user = self.get_user_by_username(username)
-        if user and check_password_hash(user.password_hash, password):
+        if user is None:
+            # Spend the same hashing work as a real check, so response timing
+            # does not reveal whether the username exists.
+            check_password_hash(_dummy_password_hash(), password)
+            return None
+        if check_password_hash(user.password_hash, password):
             return user
         return None
 
@@ -337,6 +398,7 @@ class VaultStore:
             db.execute("DELETE FROM encrypted_assets WHERE user_id = ?", (user_id,))
             db.execute("DELETE FROM audit_events WHERE user_id = ?", (user_id,))
             db.execute("DELETE FROM login_guard WHERE username = ?", (user.username,))
+            db.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
             db.execute("DELETE FROM users WHERE id = ?", (user_id,))
 
         for path in ciphertext_paths + key_paths:
@@ -358,9 +420,10 @@ class VaultStore:
         ciphertext: bytes,
         notes: str = "",
         favorite: bool = False,
+        asset_uuid: str | None = None,
     ) -> EncryptedAsset:
         safe_name = secure_filename(original_filename) or "image"
-        stored_filename = f"{uuid4().hex}.enc"
+        stored_filename = f"{asset_uuid or new_asset_id()}.enc"
         (self.vault_dir / stored_filename).write_bytes(ciphertext)
         now = _utc_now()
         stored_meta = dict(metadata)
@@ -439,6 +502,14 @@ class VaultStore:
         if path.exists():
             path.unlink()
         return asset
+
+    def find_asset_by_uuid(self, asset_uuid: str) -> EncryptedAsset | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM encrypted_assets WHERE stored_filename = ?",
+                (f"{asset_uuid}.enc",),
+            ).fetchone()
+        return _asset_from_row(row) if row else None
 
     def read_ciphertext(self, asset: EncryptedAsset) -> bytes:
         return (self.vault_dir / asset.stored_filename).read_bytes()
@@ -700,6 +771,36 @@ class VaultStore:
             raise LookupError("Link share not found.")
         return link
 
+    def reserve_link_download(self, link_id: int) -> bool:
+        """Atomically claim one download. False if the cap is already used up.
+
+        The check and the increment are one UPDATE, so concurrent requests can
+        never both slip under ``max_downloads``.
+        """
+        with self._connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE link_shares
+                SET download_count = download_count + 1
+                WHERE id = ?
+                  AND (max_downloads IS NULL OR download_count < max_downloads)
+                """,
+                (link_id,),
+            )
+            return cursor.rowcount == 1
+
+    def release_link_download(self, link_id: int) -> None:
+        """Give back a reserved download whose decryption did not complete."""
+        with self._connect() as db:
+            db.execute(
+                """
+                UPDATE link_shares
+                SET download_count = download_count - 1
+                WHERE id = ? AND download_count > 0
+                """,
+                (link_id,),
+            )
+
     def delete_link_share(self, link_id: int, owner_user_id: int) -> LinkShare:
         with self._connect() as db:
             row = db.execute(
@@ -847,6 +948,55 @@ class VaultStore:
         with self._connect() as db:
             db.execute(sql, params)
 
+    def create_session(self, user_id: int) -> str:
+        """Register a server-side session and return its secret id."""
+        sid = secrets.token_urlsafe(32)
+        with self._connect() as db:
+            db.execute(
+                "INSERT INTO sessions (id, user_id, created_at) VALUES (?, ?, ?)",
+                (_session_key(sid), user_id, _utc_now()),
+            )
+        return sid
+
+    def session_is_active(self, sid: str, user_id: int, *, max_age_seconds: int) -> bool:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT user_id, created_at FROM sessions WHERE id = ?",
+                (_session_key(sid),),
+            ).fetchone()
+        if row is None or int(row["user_id"]) != user_id:
+            return False
+        if max_age_seconds > 0:
+            created = datetime.fromisoformat(str(row["created_at"]))
+            if datetime.now(timezone.utc) - created > timedelta(seconds=max_age_seconds):
+                self.delete_session(sid)
+                return False
+        return True
+
+    def delete_session(self, sid: str) -> None:
+        with self._connect() as db:
+            db.execute("DELETE FROM sessions WHERE id = ?", (_session_key(sid),))
+
+    def delete_user_sessions(self, user_id: int, *, keep_sid: str | None = None) -> None:
+        with self._connect() as db:
+            if keep_sid:
+                db.execute(
+                    "DELETE FROM sessions WHERE user_id = ? AND id != ?",
+                    (user_id, _session_key(keep_sid)),
+                )
+            else:
+                db.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+
+    def prune_sessions(self, *, max_age_seconds: int) -> None:
+        if max_age_seconds <= 0:
+            return
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)
+        with self._connect() as db:
+            db.execute(
+                "DELETE FROM sessions WHERE created_at < ?",
+                (cutoff.isoformat(timespec="seconds"),),
+            )
+
     def add_audit_event(
         self,
         user_id: int | None,
@@ -855,19 +1005,102 @@ class VaultStore:
         asset_id: int | None = None,
         ip: str | None = None,
     ) -> AuditEvent:
+        """Append an event to the user's HMAC chain.
+
+        ``BEGIN IMMEDIATE`` takes the write lock before reading the chain head,
+        so two concurrent events can never both link to the same predecessor.
+        """
         now = _utc_now()
-        with self._connect() as db:
+        with self._transaction() as db:
+            prev_hash = self._audit_head(db, user_id)
             cursor = db.execute(
                 """
-                INSERT INTO audit_events (user_id, action, asset_id, ip, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO audit_events (user_id, action, asset_id, ip, created_at, prev_hash)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (user_id, action, asset_id, ip, now),
+                (user_id, action, asset_id, ip, now, prev_hash),
             )
             event_id = _last_row_id(cursor)
             row = db.execute("SELECT * FROM audit_events WHERE id = ?", (event_id,)).fetchone()
-        assert row is not None
+            db.execute(
+                "UPDATE audit_events SET chain_hash = ? WHERE id = ?",
+                (self._audit_digest(row, prev_hash), event_id),
+            )
         return _audit_from_row(row)
+
+    def verify_audit_chain(self, user_id: int) -> AuditChainReport:
+        """Recompute the user's whole chain; report the first event that fails.
+
+        Edits, insertions, reordering, and deletions anywhere except the very
+        end are detected. Truncating the newest events is not, because nothing
+        outside the database records the chain head.
+        """
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM audit_events WHERE user_id IS ? ORDER BY id",
+                (user_id,),
+            ).fetchall()
+        expected_prev = AUDIT_GENESIS
+        for row in rows:
+            stored_prev = row["prev_hash"]
+            stored_hash = row["chain_hash"] or ""
+            digest = self._audit_digest(row, expected_prev)
+            if stored_prev != expected_prev or not hmac.compare_digest(stored_hash, digest):
+                return AuditChainReport(ok=False, events=len(rows), first_bad_id=int(row["id"]))
+            expected_prev = stored_hash
+        return AuditChainReport(ok=True, events=len(rows))
+
+    def _audit_head(self, db: sqlite3.Connection, user_id: int | None) -> str:
+        row = db.execute(
+            """
+            SELECT chain_hash FROM audit_events
+            WHERE user_id IS ? ORDER BY id DESC LIMIT 1
+            """,
+            (user_id,),
+        ).fetchone()
+        return str(row["chain_hash"]) if row and row["chain_hash"] else AUDIT_GENESIS
+
+    def _audit_digest(self, row: sqlite3.Row, prev_hash: str) -> str:
+        payload = json.dumps(
+            [
+                int(row["id"]),
+                row["user_id"],
+                str(row["action"]),
+                row["asset_id"],
+                row["ip"],
+                str(row["created_at"]),
+                prev_hash,
+            ],
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hmac.new(self.audit_key, payload, sha256).hexdigest()
+
+    def _seal_unchained_audit_events(self) -> None:
+        """Chain events written before the audit chain existed (one-time upgrade).
+
+        This vouches for history only from the moment of the upgrade: events
+        that were edited before sealing cannot be detected retroactively.
+        """
+        with self._transaction() as db:
+            pending = db.execute(
+                "SELECT DISTINCT user_id FROM audit_events WHERE chain_hash IS NULL"
+            ).fetchall()
+            for (user_id,) in pending:
+                prev_hash = AUDIT_GENESIS
+                rows = db.execute(
+                    "SELECT * FROM audit_events WHERE user_id IS ? ORDER BY id",
+                    (user_id,),
+                ).fetchall()
+                for row in rows:
+                    if row["chain_hash"]:
+                        prev_hash = str(row["chain_hash"])
+                        continue
+                    digest = self._audit_digest(row, prev_hash)
+                    db.execute(
+                        "UPDATE audit_events SET prev_hash = ?, chain_hash = ? WHERE id = ?",
+                        (prev_hash, digest, int(row["id"])),
+                    )
+                    prev_hash = digest
 
     def list_audit_events(self, user_id: int, *, limit: int = 200) -> list[AuditEvent]:
         with self._connect() as db:
@@ -916,11 +1149,19 @@ class VaultStore:
         return buffer.getvalue()
 
     def import_backup(self, user_id: int, archive_bytes: bytes) -> int:
+        """Restore a backup zip into ``user_id``'s vault.
+
+        Every entry is validated before anything is written, so a bad backup
+        restores nothing. Entries must be allow-listed images with a well-formed
+        envelope; each blob may be referenced once; version 3 envelopes must be
+        sealed to this account. Re-restoring an asset already in this vault is
+        skipped rather than duplicated.
+        """
         buffer = BytesIO(archive_bytes)
         if not zipfile.is_zipfile(buffer):
             raise ValueError("Backup file is not a valid zip archive.")
         buffer.seek(0)
-        restored = 0
+        pending: list[dict[str, Any]] = []
         with zipfile.ZipFile(buffer, "r") as archive:
             uncompressed = sum(info.file_size for info in archive.infolist())
             if uncompressed > MAX_BACKUP_UNCOMPRESSED:
@@ -932,40 +1173,136 @@ class VaultStore:
                 manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise ValueError("Backup manifest is not valid JSON.") from exc
-            assets = manifest.get("assets")
+            assets = manifest.get("assets") if isinstance(manifest, dict) else None
             if not isinstance(assets, list):
                 raise ValueError("Backup manifest does not list assets.")
+            if len(assets) > MAX_BACKUP_ASSETS:
+                raise ValueError(f"Backup lists more than {MAX_BACKUP_ASSETS} assets.")
+            seen_blobs: set[str] = set()
             for item in assets:
                 if not isinstance(item, dict):
                     raise ValueError("Backup asset entry is invalid.")
                 blob_name = _safe_zip_member(str(item.get("blob", "")))
+                if blob_name in seen_blobs:
+                    raise ValueError("Backup references the same ciphertext more than once.")
+                seen_blobs.add(blob_name)
                 if blob_name not in names:
                     raise ValueError(f"Backup is missing ciphertext {blob_name}.")
-                ciphertext = archive.read(blob_name)
-                metadata = item.get("metadata")
-                if not isinstance(metadata, dict):
-                    raise ValueError("Backup asset is missing encryption metadata.")
-                self.save_asset(
-                    user_id=user_id,
-                    original_filename=str(item.get("original_filename") or "image"),
-                    algorithm=str(item.get("algorithm") or ""),
-                    mime_type=str(item.get("mime_type") or "application/octet-stream"),
-                    image_format=str(item.get("image_format") or "UNKNOWN"),
-                    width=int(item.get("width") or 0),
-                    height=int(item.get("height") or 0),
-                    metadata=metadata,
-                    ciphertext=ciphertext,
-                    notes=str(item.get("notes") or ""),
-                    favorite=bool(item.get("favorite")),
-                )
-                restored += 1
+                entry = self._validated_backup_entry(user_id, item)
+                entry["ciphertext"] = archive.read(blob_name)
+                if len(entry["ciphertext"]) < GCM_TAG_BYTES:
+                    raise ValueError("Backup ciphertext is truncated.")
+                pending.append(entry)
+
+        restored = 0
+        for entry in pending:
+            asset_uuid = entry.pop("asset_uuid")
+            if asset_uuid is not None and self.find_asset_by_uuid(asset_uuid) is not None:
+                continue
+            self.save_asset(user_id=user_id, asset_uuid=asset_uuid, **entry)
+            restored += 1
         return restored
+
+    def _validated_backup_entry(self, user_id: int, item: dict[str, Any]) -> dict[str, Any]:
+        metadata = item.get("metadata")
+        try:
+            version = validate_envelope(metadata)
+        except CryptoError as exc:
+            raise ValueError(f"Backup asset has an invalid envelope: {exc}") from exc
+        assert isinstance(metadata, dict)
+        algorithm = str(item.get("algorithm") or "")
+        image_format = str(item.get("image_format") or "")
+        mime_type = str(item.get("mime_type") or "")
+        try:
+            width = int(item.get("width") or 0)
+            height = int(item.get("height") or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Backup asset dimensions are invalid.") from exc
+        if algorithm not in SUPPORTED_ALGORITHMS or algorithm != metadata["algorithm"]:
+            raise ValueError("Backup asset algorithm is not supported.")
+        if IMAGE_MIME_TYPES.get(image_format) != mime_type:
+            raise ValueError("Backup asset is not an allow-listed image type.")
+        if not (1 <= width <= MAX_IMAGE_DIMENSION and 1 <= height <= MAX_IMAGE_DIMENSION):
+            raise ValueError("Backup asset dimensions are invalid.")
+
+        asset_uuid: str | None = None
+        if version == ENVELOPE_V3:
+            context = metadata["context"]
+            if context.get("owner") != user_id:
+                raise ValueError(
+                    "Backup contains images sealed to a different account; "
+                    "restore it into the account that exported it."
+                )
+            sealed = (
+                context.get("mime"),
+                context.get("format"),
+                context.get("width"),
+                context.get("height"),
+            )
+            if sealed != (mime_type, image_format, width, height):
+                raise ValueError("Backup asset does not match its sealed context.")
+            asset_uuid = str(context["asset"])
+            existing = self.find_asset_by_uuid(asset_uuid)
+            if existing is not None and existing.user_id != user_id:
+                raise ValueError("Backup asset id collides with another account's image.")
+        return {
+            "asset_uuid": asset_uuid,
+            "original_filename": str(item.get("original_filename") or "image"),
+            "algorithm": algorithm,
+            "mime_type": mime_type,
+            "image_format": image_format,
+            "width": width,
+            "height": height,
+            "metadata": metadata,
+            "notes": str(item.get("notes") or ""),
+            "favorite": bool(item.get("favorite")),
+        }
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
+
+    @contextmanager
+    def _transaction(self) -> Iterator[sqlite3.Connection]:
+        """A connection holding the database write lock until commit."""
+        connection = self._connect()
+        connection.isolation_level = None
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield connection
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+            connection.execute("COMMIT")
+        finally:
+            connection.close()
+
+
+def load_or_create_secret(path: Path) -> str:
+    """Read a persisted random secret, creating it (mode 0600) on first use."""
+    path = Path(path)
+    if path.exists():
+        value = path.read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    path.parent.mkdir(parents=True, exist_ok=True)
+    value = secrets.token_urlsafe(48)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(value)
+    return value
+
+
+@lru_cache(maxsize=1)
+def _dummy_password_hash() -> str:
+    return generate_password_hash(secrets.token_urlsafe(32))
+
+
+def _session_key(sid: str) -> str:
+    return sha256(sid.encode("utf-8")).hexdigest()
 
 
 def _deadline_passed(expires_at: str | None, now: datetime | None = None) -> bool:

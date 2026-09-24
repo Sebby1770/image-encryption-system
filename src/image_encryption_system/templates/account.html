@@ -41,7 +41,7 @@
         class="form-stack"
         method="post"
         action="{{ url_for('delete_account') }}"
-        onsubmit="return confirm('Permanently delete this account, keys, and encrypted images?');"
+        data-confirm="Permanently delete this account, keys, and encrypted images?"
       >
         {{ csrf_field }}
         <h2>Delete account</h2>
