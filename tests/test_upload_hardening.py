@@ -31,8 +31,8 @@ def _tiff() -> bytes:
 
 def test_inspect_accepts_an_ordinary_png():
     info = _inspect_image(_png(80, 48), allowed_formats={"PNG"}, max_pixels=10_000)
-    assert info["format"] == "PNG"
-    assert (info["width"], info["height"]) == (80, 48)
+    assert info.format == "PNG"
+    assert (info.width, info.height) == (80, 48)
 
 
 def test_inspect_refuses_images_over_the_pixel_ceiling():

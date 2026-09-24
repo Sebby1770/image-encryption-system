@@ -4,6 +4,7 @@ import hmac
 import secrets
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from hashlib import sha256
@@ -27,6 +28,7 @@ from flask import (
     session,
     url_for,
 )
+from flask.typing import ResponseReturnValue
 from markupsafe import Markup, escape
 from PIL import Image, UnidentifiedImageError
 from werkzeug.exceptions import RequestEntityTooLarge
@@ -36,10 +38,12 @@ from .crypto import (
     AES_GCM_PASSPHRASE,
     RSA_HYBRID,
     CryptoError,
+    aad_from_metadata,
     decrypt_image_bytes,
     encrypt_image_bytes,
     pack_ies,
     unwrap_data_key,
+    web_aad,
     wrap_data_key_passphrase,
     wrap_data_key_rsa,
 )
@@ -49,6 +53,14 @@ from .storage import AssetShare, EncryptedAsset, LinkShare, User, VaultStore
 
 class UnsupportedImageError(ValueError):
     """Raised when an upload decodes to a format or size the vault refuses."""
+
+
+@dataclass(frozen=True)
+class ImageInfo:
+    format: str
+    mime_type: str
+    width: int
+    height: int
 
 
 F = TypeVar("F", bound=Callable)
@@ -88,7 +100,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     )
 
     @app.context_processor
-    def inject_globals() -> dict:
+    def inject_globals() -> dict[str, object]:
         return {
             "current_user": _current_user(store),
             "csrf_token": _ensure_csrf_token(),
@@ -100,7 +112,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         }
 
     @app.before_request
-    def csrf_protect():
+    def csrf_protect() -> ResponseReturnValue | None:
         _ensure_csrf_token()
         if request.method != "POST" or not current_app.config.get("CSRF_ENABLED"):
             return None
@@ -112,9 +124,10 @@ def create_app(test_config: dict | None = None) -> Flask:
             if _wants_json():
                 return jsonify({"error": "missing or invalid CSRF token"}), 400
             return ("Missing or invalid CSRF token.", 400)
+        return None
 
     @app.errorhandler(RequestEntityTooLarge)
-    def too_large(_error: RequestEntityTooLarge):
+    def too_large(_error: RequestEntityTooLarge) -> ResponseReturnValue:
         limit_mb = int(app.config["MAX_CONTENT_LENGTH"]) // (1024 * 1024)
         if _wants_json():
             return jsonify({"error": f"upload exceeds the {limit_mb} MB limit"}), 413
@@ -122,17 +135,17 @@ def create_app(test_config: dict | None = None) -> Flask:
         return redirect(url_for("dashboard")), 413
 
     @app.get("/")
-    def index() -> str | Response:
+    def index() -> ResponseReturnValue:
         if session.get("user_id"):
             return redirect(url_for("dashboard"))
         return render_template("auth.html", mode="login")
 
     @app.get("/register")
-    def register_form() -> str:
+    def register_form() -> ResponseReturnValue:
         return render_template("auth.html", mode="register")
 
     @app.post("/register")
-    def register() -> Response:
+    def register() -> ResponseReturnValue:
         username = request.form.get("username", "")
         password = request.form.get("password", "")
         try:
@@ -149,7 +162,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         return redirect(url_for("dashboard"))
 
     @app.post("/login")
-    def login():
+    def login() -> ResponseReturnValue:
         username = request.form.get("username", "")
         password = request.form.get("password", "")
         blocked = _guard_login(app, username, json_mode=False)
@@ -166,20 +179,20 @@ def create_app(test_config: dict | None = None) -> Flask:
         return redirect(url_for("dashboard"))
 
     @app.post("/logout")
-    def logout() -> Response:
+    def logout() -> ResponseReturnValue:
         session.clear()
         flash("Signed out.", "success")
         return redirect(url_for("index"))
 
     @app.get("/account/password")
     @login_required(store)
-    def password_form() -> str:
+    def password_form() -> ResponseReturnValue:
         return render_template("account.html")
 
     @app.post("/account/password")
     @login_required(store)
-    def change_password() -> Response:
-        user = _current_user(store)
+    def change_password() -> ResponseReturnValue:
+        user = _require_user(store)
         old_password = request.form.get("old_password") or ""
         new_password = request.form.get("new_password") or ""
         confirm_password = request.form.get("confirm_password") or ""
@@ -203,8 +216,8 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.post("/account/delete")
     @login_required(store)
-    def delete_account() -> Response:
-        user = _current_user(store)
+    def delete_account() -> ResponseReturnValue:
+        user = _require_user(store)
         password = request.form.get("password") or ""
         try:
             store.delete_account(user.id, password)
@@ -217,8 +230,8 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.get("/dashboard")
     @login_required(store)
-    def dashboard() -> str:
-        user = _current_user(store)
+    def dashboard() -> ResponseReturnValue:
+        user = _require_user(store)
         store.sweep_expired_shares()
         query = (request.args.get("q") or "").strip()
         algorithm = (request.args.get("algorithm") or "").strip() or None
@@ -247,8 +260,8 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.post("/images")
     @login_required(store)
-    def upload_image() -> Response:
-        user = _current_user(store)
+    def upload_image() -> ResponseReturnValue:
+        user = _require_user(store)
         upload = request.files.get("image")
         algorithm = request.form.get("algorithm", AES_GCM_PASSPHRASE)
         passphrase = request.form.get("passphrase", "")
@@ -272,7 +285,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                 max_pixels=app.config["MAX_IMAGE_PIXELS"],
             )
             image_bytes = _strip_image_exif(image_bytes)
-            aad = _asset_aad(user.id, upload.filename, image_info["mime_type"])
+            aad = web_aad(user.id, upload.filename, image_info.mime_type)
             public_key = store.read_public_key(user.id) if algorithm == RSA_HYBRID else None
             result = encrypt_image_bytes(
                 image_bytes,
@@ -286,17 +299,17 @@ def create_app(test_config: dict | None = None) -> Flask:
                 "aad": {
                     "user_id": user.id,
                     "original_filename": upload.filename,
-                    "mime_type": image_info["mime_type"],
+                    "mime_type": image_info.mime_type,
                 },
             }
             asset = store.save_asset(
                 user_id=user.id,
                 original_filename=upload.filename,
                 algorithm=algorithm,
-                mime_type=image_info["mime_type"],
-                image_format=image_info["format"],
-                width=image_info["width"],
-                height=image_info["height"],
+                mime_type=image_info.mime_type,
+                image_format=image_info.format,
+                width=image_info.width,
+                height=image_info.height,
                 metadata=metadata,
                 ciphertext=result.ciphertext,
             )
@@ -310,8 +323,8 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.post("/images/<int:asset_id>/decrypt")
     @login_required(store)
-    def decrypt_image(asset_id: int) -> Response:
-        user = _current_user(store)
+    def decrypt_image(asset_id: int) -> ResponseReturnValue:
+        user = _require_user(store)
         try:
             asset, share = _accessible_asset(store, asset_id, user)
             ciphertext = store.read_ciphertext(asset)
@@ -362,8 +375,8 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.post("/images/<int:asset_id>/share")
     @login_required(store)
-    def share_image(asset_id: int) -> Response:
-        user = _current_user(store)
+    def share_image(asset_id: int) -> ResponseReturnValue:
+        user = _require_user(store)
         recipient_name = request.form.get("username", "")
         try:
             share = _share_asset(
@@ -391,8 +404,8 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.post("/share/<int:share_id>/revoke")
     @login_required(store)
-    def revoke_share(share_id: int) -> Response:
-        user = _current_user(store)
+    def revoke_share(share_id: int) -> ResponseReturnValue:
+        user = _require_user(store)
         try:
             share = store.delete_share(share_id, user.id)
             _audit(store, user.id, "revoke", share.asset_id)
@@ -404,8 +417,8 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.post("/images/<int:asset_id>/rotate-passphrase")
     @login_required(store)
-    def rotate_passphrase(asset_id: int) -> Response:
-        user = _current_user(store)
+    def rotate_passphrase(asset_id: int) -> ResponseReturnValue:
+        user = _require_user(store)
         old_passphrase = request.form.get("old_passphrase") or ""
         new_passphrase = request.form.get("new_passphrase") or ""
         try:
@@ -425,8 +438,8 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.post("/images/<int:asset_id>/meta")
     @login_required(store)
-    def update_image_meta(asset_id: int) -> Response:
-        user = _current_user(store)
+    def update_image_meta(asset_id: int) -> ResponseReturnValue:
+        user = _require_user(store)
         favorite = str(request.form.get("favorite") or "").strip() in {"1", "true", "on", "yes"}
         try:
             asset = store.update_asset_details(
@@ -445,8 +458,8 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.post("/images/delete-many")
     @login_required(store)
-    def delete_many_images() -> Response:
-        user = _current_user(store)
+    def delete_many_images() -> ResponseReturnValue:
+        user = _require_user(store)
         raw_ids = request.form.getlist("asset_id")
         ids: list[int] = []
         for value in raw_ids:
@@ -467,8 +480,8 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.post("/images/<int:asset_id>/link")
     @login_required(store)
-    def create_link_share(asset_id: int) -> Response:
-        user = _current_user(store)
+    def create_link_share(asset_id: int) -> ResponseReturnValue:
+        user = _require_user(store)
         try:
             token, link = _create_link_share(
                 store,
@@ -496,8 +509,8 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.post("/link/<int:link_id>/revoke")
     @login_required(store)
-    def revoke_link_share(link_id: int) -> Response:
-        user = _current_user(store)
+    def revoke_link_share(link_id: int) -> ResponseReturnValue:
+        user = _require_user(store)
         try:
             link = store.delete_link_share(link_id, user.id)
             _audit(store, user.id, "revoke_link", link.asset_id)
@@ -508,7 +521,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         return redirect(url_for("dashboard"))
 
     @app.get("/l/<token>")
-    def open_link_share(token: str):
+    def open_link_share(token: str) -> ResponseReturnValue:
         store.sweep_expired_shares()
         try:
             link, asset = _resolve_link(store, token)
@@ -519,7 +532,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         return render_template("link.html", asset=asset, link=link, token=token)
 
     @app.post("/l/<token>/decrypt")
-    def decrypt_link_share(token: str):
+    def decrypt_link_share(token: str) -> ResponseReturnValue:
         try:
             plaintext, asset = _decrypt_link(store, token, count=True)
         except PermissionError as exc:
@@ -536,7 +549,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         )
 
     @app.get("/l/<token>/blob")
-    def download_link_blob(token: str):
+    def download_link_blob(token: str) -> ResponseReturnValue:
         try:
             link, asset = _resolve_link(store, token)
             store.ciphertext_sha256(asset)
@@ -559,8 +572,8 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.post("/images/<int:asset_id>/delete")
     @login_required(store)
-    def delete_image(asset_id: int) -> Response:
-        user = _current_user(store)
+    def delete_image(asset_id: int) -> ResponseReturnValue:
+        user = _require_user(store)
         try:
             asset = store.delete_asset(asset_id, user.id)
             _audit(store, user.id, "delete", asset.id)
@@ -572,8 +585,8 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.get("/images/<int:asset_id>/download")
     @login_required(store)
-    def download_ciphertext(asset_id: int) -> Response:
-        user = _current_user(store)
+    def download_ciphertext(asset_id: int) -> ResponseReturnValue:
+        user = _require_user(store)
         try:
             asset = _owned_asset(store, asset_id, user)
         except (LookupError, PermissionError) as exc:
@@ -590,15 +603,15 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.get("/audit")
     @login_required(store)
-    def audit() -> str:
-        user = _current_user(store)
+    def audit() -> ResponseReturnValue:
+        user = _require_user(store)
         events = store.list_audit_events(user.id)
         return render_template("audit.html", events=events)
 
     @app.get("/audit.csv")
     @login_required(store)
-    def audit_csv() -> Response:
-        user = _current_user(store)
+    def audit_csv() -> ResponseReturnValue:
+        user = _require_user(store)
         events = store.list_audit_events(user.id, limit=2000)
         lines = ["id,action,asset_id,ip,created_at"]
         for event in events:
@@ -616,8 +629,8 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.get("/account/public-key")
     @login_required(store)
-    def download_public_key() -> Response:
-        user = _current_user(store)
+    def download_public_key() -> ResponseReturnValue:
+        user = _require_user(store)
         return send_file(
             BytesIO(store.read_public_key(user.id)),
             mimetype="application/x-pem-file",
@@ -627,8 +640,8 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.get("/backup")
     @login_required(store)
-    def download_backup() -> Response:
-        user = _current_user(store)
+    def download_backup() -> ResponseReturnValue:
+        user = _require_user(store)
         archive = store.export_backup(user.id)
         _audit(store, user.id, "backup")
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -641,8 +654,8 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.post("/restore")
     @login_required(store)
-    def restore_backup() -> Response:
-        user = _current_user(store)
+    def restore_backup() -> ResponseReturnValue:
+        user = _require_user(store)
         upload = request.files.get("backup")
         if upload is None or not upload.filename:
             flash("Choose a backup zip to restore.", "error")
@@ -657,7 +670,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         return redirect(url_for("dashboard"))
 
     @app.post("/api/token")
-    def api_token() -> Response:
+    def api_token() -> ResponseReturnValue:
         payload = request.get_json(silent=True) or {}
         username = str(payload.get("username", ""))
         password = str(payload.get("password", ""))
@@ -686,7 +699,7 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.get("/api/images")
     @jwt_required(store)
-    def api_images() -> Response:
+    def api_images() -> ResponseReturnValue:
         user = g.api_user
         return jsonify(
             {
@@ -706,7 +719,7 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.post("/api/images/<int:asset_id>/share")
     @jwt_required(store)
-    def api_share_image(asset_id: int) -> Response:
+    def api_share_image(asset_id: int) -> ResponseReturnValue:
         user = g.api_user
         payload = request.get_json(silent=True) or {}
         try:
@@ -735,7 +748,7 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.post("/api/images/<int:asset_id>/link")
     @jwt_required(store)
-    def api_create_link(asset_id: int) -> Response:
+    def api_create_link(asset_id: int) -> ResponseReturnValue:
         user = g.api_user
         payload = request.get_json(silent=True) or {}
         try:
@@ -767,7 +780,7 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.get("/api/audit")
     @jwt_required(store)
-    def api_audit() -> Response:
+    def api_audit() -> ResponseReturnValue:
         user = g.api_user
         return jsonify(
             {
@@ -879,6 +892,14 @@ def _current_user(store: VaultStore) -> User | None:
             session.clear()
             return None
         session["last_seen"] = now
+    return user
+
+
+def _require_user(store: VaultStore) -> User:
+    """Return the signed-in user inside a view already guarded by login_required."""
+    user = _current_user(store)
+    if user is None:
+        raise RuntimeError("login_required did not run before this view.")
     return user
 
 
@@ -1082,7 +1103,7 @@ def _inspect_image(
     *,
     allowed_formats: set[str] | None = None,
     max_pixels: int | None = None,
-) -> dict[str, int | str]:
+) -> ImageInfo:
     """Identify an upload and refuse anything we are not willing to decode.
 
     ``Image.open`` only reads the header, so the pixel-count ceiling is applied
@@ -1106,12 +1127,7 @@ def _inspect_image(
             f"Image is too large to process ({width}x{height} exceeds {max_pixels:,} pixels)."
         )
 
-    return {
-        "format": image_format,
-        "mime_type": mime_type,
-        "width": width,
-        "height": height,
-    }
+    return ImageInfo(format=image_format, mime_type=mime_type, width=width, height=height)
 
 
 def _strip_image_exif(image_bytes: bytes) -> bytes:
@@ -1132,11 +1148,10 @@ def _strip_image_exif(image_bytes: bytes) -> bytes:
             cleaned = cleaned.convert("RGB")
 
         output = BytesIO()
-        save_kwargs: dict[str, object] = {"format": image_format}
         if image_format == "JPEG":
-            save_kwargs["quality"] = 95
-            save_kwargs["exif"] = b""
-        cleaned.save(output, **save_kwargs)
+            cleaned.save(output, format=image_format, quality=95, exif=b"")
+        else:
+            cleaned.save(output, format=image_format)
         return output.getvalue()
 
 
@@ -1195,14 +1210,7 @@ def _parse_share_expiry(raw_hours: object, raw_days: object) -> str | None:
     return (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat(timespec="seconds")
 
 
-def _asset_aad(user_id: int, original_filename: str, mime_type: str) -> bytes:
-    return f"user={user_id}|filename={original_filename}|mime={mime_type}".encode()
-
-
 def _aad_from_metadata(asset: EncryptedAsset) -> bytes:
-    aad = asset.metadata.get("aad", {})
-    return _asset_aad(
-        int(aad.get("user_id", asset.user_id)),
-        str(aad.get("original_filename", asset.original_filename)),
-        str(aad.get("mime_type", asset.mime_type)),
-    )
+    if isinstance(asset.metadata.get("aad"), dict):
+        return aad_from_metadata(asset.metadata)
+    return web_aad(asset.user_id, asset.original_filename, asset.mime_type)

@@ -11,6 +11,7 @@ from .crypto import (
     AES_GCM_PASSPHRASE,
     RSA_HYBRID,
     CryptoError,
+    aad_from_metadata,
     cli_aad,
     decrypt_image_bytes,
     encrypt_image_bytes,
@@ -139,9 +140,7 @@ def _decrypt(args: argparse.Namespace) -> int:
     if not source.is_file():
         raise ValueError(f"input file not found: {source}")
     ciphertext, metadata = unpack_ies(source.read_bytes())
-    aad_info = metadata.get("aad") or {}
-    is_cli_context = aad_info.get("source") == "cli"
-    aad = cli_aad(str(aad_info.get("filename", ""))) if is_cli_context else b""
+    aad = aad_from_metadata(metadata)
 
     passphrase = args.passphrase
     private_key = Path(args.private_key).read_bytes() if args.private_key else None

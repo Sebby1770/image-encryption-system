@@ -56,15 +56,7 @@ class AssetShare:
     expires_at: str | None = None
 
     def is_expired(self, now: datetime | None = None) -> bool:
-        if not self.expires_at:
-            return False
-        moment = now or datetime.now(timezone.utc)
-        expires = datetime.fromisoformat(self.expires_at)
-        if expires.tzinfo is None:
-            expires = expires.replace(tzinfo=timezone.utc)
-        if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=timezone.utc)
-        return moment >= expires
+        return _deadline_passed(self.expires_at, now)
 
 
 @dataclass(frozen=True)
@@ -94,15 +86,7 @@ class LinkShare:
     label: str = ""
 
     def is_expired(self, now: datetime | None = None) -> bool:
-        if not self.expires_at:
-            return False
-        moment = now or datetime.now(timezone.utc)
-        expires = datetime.fromisoformat(self.expires_at)
-        if expires.tzinfo is None:
-            expires = expires.replace(tzinfo=timezone.utc)
-        if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=timezone.utc)
-        return moment >= expires
+        return _deadline_passed(self.expires_at, now)
 
     def remaining_downloads(self) -> int | None:
         if self.max_downloads is None:
@@ -245,7 +229,7 @@ class VaultStore:
                 """,
                 (username, password_hash, now),
             )
-            user_id = int(cursor.lastrowid)
+            user_id = _last_row_id(cursor)
 
         private_pem, public_pem = generate_rsa_key_pair(password)
         self.private_key_path(user_id).write_bytes(private_pem)
@@ -406,7 +390,7 @@ class VaultStore:
                     1 if favorite else 0,
                 ),
             )
-            asset_id = int(cursor.lastrowid)
+            asset_id = _last_row_id(cursor)
         return self.get_asset(asset_id)
 
     def get_asset(self, asset_id: int) -> EncryptedAsset:
@@ -490,12 +474,6 @@ class VaultStore:
                 (next_name, next_notes, 1 if next_favorite else 0, asset_id, user_id),
             )
         return self.get_asset(asset_id)
-
-    def delete_assets(self, asset_ids: list[int], user_id: int) -> list[EncryptedAsset]:
-        deleted: list[EncryptedAsset] = []
-        for asset_id in asset_ids:
-            deleted.append(self.delete_asset(int(asset_id), user_id))
-        return deleted
 
     def ciphertext_sha256(self, asset: EncryptedAsset) -> str:
         digest = sha256(self.read_ciphertext(asset)).hexdigest()
@@ -685,7 +663,7 @@ class VaultStore:
                     label or "",
                 ),
             )
-            link_id = int(cursor.lastrowid)
+            link_id = _last_row_id(cursor)
         link = self.get_link_share(link_id)
         if link is None:
             raise RuntimeError("Link share was not persisted.")
@@ -886,7 +864,7 @@ class VaultStore:
                 """,
                 (user_id, action, asset_id, ip, now),
             )
-            event_id = int(cursor.lastrowid)
+            event_id = _last_row_id(cursor)
             row = db.execute("SELECT * FROM audit_events WHERE id = ?", (event_id,)).fetchone()
         assert row is not None
         return _audit_from_row(row)
@@ -907,18 +885,19 @@ class VaultStore:
     def export_backup(self, user_id: int) -> bytes:
         user = self.get_user(user_id)
         assets = self.list_assets(user_id)
+        manifest_assets: list[dict[str, Any]] = []
         manifest = {
             "version": 2,
             "exported_at": _utc_now(),
             "username": user.username,
-            "assets": [],
+            "assets": manifest_assets,
         }
         buffer = BytesIO()
         with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for asset in assets:
                 blob_name = f"assets/{asset.stored_filename}"
                 archive.writestr(blob_name, self.read_ciphertext(asset))
-                manifest["assets"].append(
+                manifest_assets.append(
                     {
                         "original_filename": asset.original_filename,
                         "algorithm": asset.algorithm,
@@ -987,6 +966,18 @@ class VaultStore:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
+
+
+def _deadline_passed(expires_at: str | None, now: datetime | None = None) -> bool:
+    if not expires_at:
+        return False
+    moment = now or datetime.now(timezone.utc)
+    expires = datetime.fromisoformat(expires_at)
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment >= expires
 
 
 def _utc_now() -> str:
@@ -1063,6 +1054,12 @@ def _share_from_row(row: sqlite3.Row) -> AssetShare:
         created_at=str(row["created_at"]),
         expires_at=expires_at,
     )
+
+
+def _last_row_id(cursor: sqlite3.Cursor) -> int:
+    if cursor.lastrowid is None:
+        raise RuntimeError("SQLite did not report the inserted row id.")
+    return int(cursor.lastrowid)
 
 
 def _optional_text(value: Any) -> str | None:

@@ -3,6 +3,19 @@
 ## [Unreleased]
 
 ### Fixed
+- **`ies decrypt` could not open a `.ies` file downloaded from the web vault.**
+  The CLI only rebuilt the AAD for files it had written itself and used empty
+  AAD for everything else, so every web download and capability-link blob failed
+  authentication. AAD reconstruction now lives in `crypto.aad_from_metadata()`
+  and is shared by the CLI and the web app.
+- Passing a non-RSA PEM to `ies encrypt --public-key` (or storing one as a
+  user key) crashed with `AttributeError`; it is now a clean `CryptoError`.
+- Removed `static/js/auth.js` and `static/js/dashboard.js`, orphaned by the
+  merge: no template loaded them and they targeted elements that do not exist.
+- README listed features from the discarded v1.0 lineage (tags, time-locks, an
+  HMAC audit chain, JWT audience checks) that this codebase does not have; the
+  feature list now matches the code. `SECURITY.md` claimed new assets use a
+  "version 2" envelope; they use version 1.
 - **Repaired a broken merge that left the package non-functional.** Commit
   `4149200` spliced two independently-developed lineages (both branched from the
   initial commit) whose modules were incompatible. The textual merge succeeded
@@ -40,6 +53,14 @@
 - `SECURITY.md`, and a security model section documenting both trust boundaries.
 
 ### Changed
+- mypy now runs in CI and is clean; fixing it surfaced the RSA key-type bug
+  above. `hypothesis` and `mypy` join the `dev` extra.
+- The `pip-audit` CI job could never pass: with `--strict` it tried to audit
+  this package itself, which is not on PyPI. It now audits `requirements.txt`.
+- Added a Claude Code SessionStart hook (`.claude/settings.json`,
+  `scripts/session-start.sh`) that builds a project venv with Pillow and the
+  dev tools in cloud sessions, and a `CLAUDE.md` describing the layout,
+  commands, and envelope format.
 - CI now runs a 3.10-3.13 matrix, `ruff check`, `ruff format --check`, coverage
   gated at 80%, and a `pip-audit` dependency scan.
 

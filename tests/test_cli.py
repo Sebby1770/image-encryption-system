@@ -1,4 +1,5 @@
 from io import BytesIO
+from pathlib import Path
 
 from PIL import Image
 
@@ -102,3 +103,51 @@ def test_cli_missing_input_fails(tmp_path) -> None:
         str(tmp_path / "out.bin"),
     ]
     assert main(missing_args) == 1
+
+
+def test_cli_rejects_non_rsa_public_key_cleanly(tmp_path, capsys) -> None:
+    """A non-RSA PEM used to crash with AttributeError instead of a clean error."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    source = tmp_path / "photo.png"
+    _png(source)
+    ec_public = tmp_path / "ec-public.pem"
+    ec_public.write_bytes(
+        ec.generate_private_key(ec.SECP256R1())
+        .public_key()
+        .public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+
+    code = main(
+        ["encrypt", str(source), "--public-key", str(ec_public), "--out", str(tmp_path / "x")]
+    )
+
+    assert code == 1
+    assert "RSA" in capsys.readouterr().err
+
+
+def test_cli_decrypts_a_web_download(tmp_path) -> None:
+    """A .ies file downloaded from the web vault must open with `ies decrypt`."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from helpers import encrypt_png, make_app, register, sample_png
+
+    app = make_app(tmp_path / "instance")
+    client = app.test_client()
+    register(client, "alice")
+    encrypt_png(client, filename="holiday.png", passphrase="web passphrase 1")
+    response = client.get("/images/1/download")
+    assert response.status_code == 200
+
+    vault = tmp_path / "holiday.png.ies"
+    vault.write_bytes(response.data)
+    restored = tmp_path / "restored.png"
+    code = main(["decrypt", str(vault), "--passphrase", "web passphrase 1", "--out", str(restored)])
+
+    assert code == 0
+    assert restored.read_bytes() == sample_png()

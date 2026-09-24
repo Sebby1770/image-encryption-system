@@ -7,7 +7,7 @@ from base64 import b64decode, b64encode
 from dataclasses import dataclass
 from typing import Any
 
-from cryptography.exceptions import InvalidTag
+from cryptography.exceptions import InvalidTag, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -30,7 +30,6 @@ SCRYPT_P = 1
 MAX_PASSPHRASE_BYTES = 1024
 MAX_SCRYPT_MEMORY_BYTES = 256 * 1024 * 1024
 MAX_SCRYPT_WORK_FACTOR = 2**22
-SUPPORTED_METADATA_VERSIONS = frozenset({1, 2})
 IES_MAGIC = b"IES1"
 WRAP_SCRYPT = "scrypt-aes-gcm"
 WRAP_RSA = "rsa-oaep-sha256"
@@ -167,8 +166,10 @@ def reencrypt_private_key_pem(
             private_pem,
             password=old_passphrase.encode("utf-8") if old_passphrase else None,
         )
-    except (ValueError, TypeError) as exc:
+    except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
         raise CryptoError("Current password is invalid.") from exc
+    if not isinstance(private_key, rsa.RSAPrivateKey):
+        raise CryptoError("The stored private key is not an RSA private key.")
     return private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
@@ -204,11 +205,40 @@ def cli_aad(filename: str) -> bytes:
     return f"cli|filename={filename}".encode()
 
 
+def web_aad(user_id: int, original_filename: str, mime_type: str) -> bytes:
+    return f"user={user_id}|filename={original_filename}|mime={mime_type}".encode()
+
+
+def aad_from_metadata(metadata: dict[str, Any]) -> bytes:
+    """Rebuild the AAD an envelope was sealed with from its own ``aad`` context.
+
+    Web uploads record ``user_id``/``original_filename``/``mime_type``; CLI
+    encryptions record ``source="cli"`` and ``filename``. Anything else was
+    sealed without associated data.
+    """
+    context = metadata.get("aad")
+    if not isinstance(context, dict):
+        return b""
+    if context.get("source") == "cli":
+        return cli_aad(str(context.get("filename", "")))
+    if "user_id" in context:
+        try:
+            user_id = int(context["user_id"])
+        except (TypeError, ValueError) as exc:
+            raise CryptoError("Encrypted image context is invalid.") from exc
+        return web_aad(
+            user_id,
+            str(context.get("original_filename", "")),
+            str(context.get("mime_type", "")),
+        )
+    return b""
+
+
 def _wrap_key_with_passphrase(data_key: bytes, passphrase: str | None) -> dict[str, str | int]:
     if not passphrase:
         raise CryptoError("AES-GCM mode requires a passphrase.")
 
-    salt = os.urandom(16)
+    salt = os.urandom(SCRYPT_SALT_BYTES)
     wrapping_key = _derive_passphrase_key(passphrase, salt)
     wrapping_nonce = os.urandom(GCM_NONCE_BYTES)
     wrapped_key = AESGCM(wrapping_key).encrypt(wrapping_nonce, data_key, b"image-data-key")
@@ -262,7 +292,12 @@ def _wrap_key_with_rsa(data_key: bytes, public_key_pem: bytes | None) -> dict[st
     if not public_key_pem:
         raise CryptoError("RSA hybrid mode requires a public key.")
 
-    public_key = serialization.load_pem_public_key(public_key_pem)
+    try:
+        public_key = serialization.load_pem_public_key(public_key_pem)
+    except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
+        raise CryptoError("RSA public key could not be parsed.") from exc
+    if not isinstance(public_key, rsa.RSAPublicKey):
+        raise CryptoError("RSA hybrid mode requires an RSA public key.")
     wrapped_key = public_key.encrypt(
         data_key,
         padding.OAEP(
@@ -295,6 +330,13 @@ def _unwrap_key_with_rsa(
             private_key_pem,
             password=private_key_passphrase.encode("utf-8"),
         )
+    except KeyError as exc:
+        raise CryptoError("RSA key wrapping metadata is incomplete.") from exc
+    except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
+        raise CryptoError("Private key passphrase is invalid.") from exc
+    if not isinstance(private_key, rsa.RSAPrivateKey):
+        raise CryptoError("RSA hybrid decryption requires an RSA private key.")
+    try:
         return private_key.decrypt(
             wrapped_key,
             padding.OAEP(
@@ -303,8 +345,8 @@ def _unwrap_key_with_rsa(
                 label=None,
             ),
         )
-    except (ValueError, TypeError) as exc:
-        raise CryptoError("Private key passphrase is invalid.") from exc
+    except ValueError as exc:
+        raise CryptoError("RSA key unwrap failed.") from exc
 
 
 def _derive_passphrase_key(
