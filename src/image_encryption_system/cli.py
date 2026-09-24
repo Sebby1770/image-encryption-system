@@ -126,7 +126,6 @@ def _encrypt(args: argparse.Namespace) -> int:
 
     metadata = {
         **result.metadata,
-        "original_filename": source.name,
         "ciphertext_sha256": sha256(result.ciphertext).hexdigest(),
     }
     args.out.write_bytes(pack_ies(result.ciphertext, metadata))
@@ -173,7 +172,10 @@ def _inspect(args: argparse.Namespace) -> int:
     ciphertext, metadata = unpack_ies(source.read_bytes())
     wrap = metadata.get("key_wrap")
     wrap_type = wrap.get("type") if isinstance(wrap, dict) else None
-    original = metadata.get("original_filename")
+    context = metadata.get("context")
+    original = metadata.get("original_filename") or (
+        context.get("filename") if isinstance(context, dict) else None
+    )
     digest = sha256(ciphertext).hexdigest()
     print(f"version: {metadata.get('version', '')}")
     print(f"algorithm: {metadata.get('algorithm', '')}")
@@ -181,7 +183,6 @@ def _inspect(args: argparse.Namespace) -> int:
         print(f"wrap: {wrap_type}")
     if original:
         print(f"original_filename: {original}")
-    context = metadata.get("context")
     if isinstance(context, dict):
         for key in sorted(context):
             print(f"context.{key}: {context[key]}")

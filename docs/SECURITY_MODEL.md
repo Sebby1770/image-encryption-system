@@ -104,6 +104,12 @@ lengths and total size. Base64 is decoded strictly, and metadata is capped at
 | `n` is a power of two, `n >= 2^14`, `n <= 2^22` | Blocks downgrade below the vault's baseline and CPU exhaustion |
 | `128 * n * r <= 256 MiB`, `1 <= r <= 32`, `1 <= p <= 16` | Bounds the allocation |
 
+Version 3 envelopes are closed. Unknown top-level or wrap keys are rejected,
+so renaming a key cannot make a default value apply. Base64 must be canonical,
+and `ciphertext_sha256` is verified, so every byte of a `.ies` header
+influences decryption. A Hypothesis property test flips every byte position
+with every XOR mask class and requires decryption to fail.
+
 Salt, nonce, and wrapped-key lengths are checked before use. Malformed input
 raises `CryptoError`, so the CLI exits 1 and the web app returns a clean error
 rather than a traceback.

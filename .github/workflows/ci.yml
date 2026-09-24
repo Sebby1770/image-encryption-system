@@ -36,8 +36,32 @@ jobs:
       - name: Type check
         run: mypy
 
+      # Unit, regression, and property tests. The e2e browser test skips here
+      # (Playwright is not installed) and runs in its own job below.
       - name: Run tests with coverage
-        run: pytest --cov=image_encryption_system --cov-report=term-missing --cov-fail-under=80
+        env:
+          HYPOTHESIS_PROFILE: ci
+        run: pytest --cov=image_encryption_system --cov-report=term-missing --cov-fail-under=85
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package and Playwright
+        run: |
+          pip install -e ".[dev,e2e]"
+          python -m playwright install --with-deps chromium
+
+      - name: Run browser end-to-end tests
+        run: pytest -m e2e tests/e2e -v
 
   audit:
     runs-on: ubuntu-latest

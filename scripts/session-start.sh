@@ -19,7 +19,9 @@ if [ ! -x .venv/bin/python ]; then
 fi
 
 .venv/bin/python -m pip install --quiet --upgrade pip
-.venv/bin/python -m pip install --quiet -e ".[dev]"
+# The e2e extra only installs the Playwright Python package. Browsers are
+# preinstalled under $PLAYWRIGHT_BROWSERS_PATH; never run `playwright install`.
+.venv/bin/python -m pip install --quiet -e ".[dev,e2e]"
 
 # Fail loudly now rather than at test collection time.
 .venv/bin/python -c "import PIL, cryptography, flask, jwt, hypothesis"

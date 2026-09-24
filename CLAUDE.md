@@ -35,7 +35,10 @@ pip install -e ".[dev]"
 
 python run.py                     # web app on http://127.0.0.1:5000 (FLASK_DEBUG=1 for debug)
 ies --help                        # CLI
-pytest                            # full suite
+pytest                            # full suite (includes the browser test if Playwright is installed)
+pytest -m "not e2e"               # skip the browser test
+pytest -m e2e tests/e2e           # Playwright end-to-end flow (pip install -e ".[e2e]")
+HYPOTHESIS_PROFILE=ci pytest tests/test_properties.py   # 200 examples per property, as CI runs
 pytest --cov=image_encryption_system --cov-fail-under=80
 ruff check src tests scripts run.py && ruff format --check src tests scripts run.py
 mypy                              # configured in pyproject.toml, checks src/
@@ -101,7 +104,14 @@ decrypt. Version 2 is never written: the discarded v1.0 lineage used that
 number for an incompatible layout.
 
 `crypto.validate_envelope()` must run before any field is used; it bounds and
-type-checks everything.
+type-checks everything. Version 3 envelopes are closed: only the keys above
+are allowed (exact key sets for each wrap type too), base64 must be canonical,
+and `ciphertext_sha256` is verified, so flipping any byte of a `.ies` file makes
+decryption fail (`tests/test_properties.py` proves it with Hypothesis).
+
+The e2e test launches Playwright's bundled Chromium and falls back to
+`/opt/pw-browsers/chromium` (preinstalled in cloud sessions) or
+`$IES_CHROMIUM_EXECUTABLE`. Do not run `playwright install` in cloud sessions.
 
 Never change these byte layouts silently: existing blobs must stay decryptable.
 Add a new `version` instead and keep a test that decrypts the old one.

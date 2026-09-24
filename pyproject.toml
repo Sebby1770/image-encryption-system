@@ -26,6 +26,7 @@ dev = [
   "pytest-cov>=5.0.0",
   "ruff>=0.6.0",
 ]
+e2e = ["playwright>=1.45.0"]
 
 [project.scripts]
 ies = "image_encryption_system.cli:main"
@@ -45,6 +46,7 @@ image_encryption_system = [
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "--strict-markers"
+markers = ["e2e: drives a real browser against a live server (needs Playwright + Chromium)"]
 
 [tool.ruff]
 line-length = 100

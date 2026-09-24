@@ -194,8 +194,20 @@ mypy
 pytest
 ```
 
-CI runs lint, format, mypy, and pytest (with an 80% coverage gate) on Python
-3.10 through 3.13, plus a `pip-audit` dependency scan.
+The suite includes Hypothesis property tests (`tests/test_properties.py`):
+flipping any byte of an `.ies` file must make decryption fail, CLI and web
+uploads must round-trip, and out-of-bounds KDF parameters must be rejected
+cheaply. There is also a Playwright browser test that registers two users,
+uploads, views, shares, revokes, and checks that the recipient is locked out:
+
+```bash
+pip install -e '.[e2e]' && python -m playwright install chromium
+pytest -m e2e tests/e2e
+```
+
+CI runs lint, format, mypy, and pytest (85% coverage gate, 200 Hypothesis
+examples per property) on Python 3.10 through 3.13, the browser test in its own
+job, and a `pip-audit` dependency scan.
 
 ## Project Structure
 

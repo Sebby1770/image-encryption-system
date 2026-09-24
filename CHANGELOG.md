@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+### Tests and CI (phase 2)
+- Hypothesis property tests (`tests/test_properties.py`):
+  - flipping any byte of a CLI or web `.ies` file fails to decrypt;
+  - the CLI and the web app round-trip arbitrary inputs, and a web download
+    opens in the CLI;
+  - out-of-bounds Scrypt parameters are rejected in under a second;
+  - the KDF validator accepts exactly the documented region.
+- Playwright end-to-end test (`tests/e2e/`): register two users, upload, view,
+  share, revoke, and check the recipient is locked out, with CSRF and CSP
+  enforced and no console errors.
+- CI: 85% coverage gate (up from 80%), `HYPOTHESIS_PROFILE=ci` (200 examples
+  per property), and a separate `e2e` job with Playwright Chromium.
+
+### Security (found by the phase 2 property tests)
+- **Unauthenticated header bytes in `.ies` files (low).** Flipping a byte
+  inside `ciphertext_sha256` or `original_filename`, renaming a Scrypt key
+  so a default applied, or altering a base64 string's padding bits still
+  decrypted. The integrity check was never verified. Version 3 envelopes are
+  now closed:
+  - exact key sets for the envelope and each wrap type;
+  - canonical base64 only;
+  - integer-only KDF parameters;
+  - `ciphertext_sha256` verified on decrypt.
+
+  The CLI no longer writes the redundant top-level `original_filename`; the
+  name is already sealed in `context.filename`. Version 1 files are unaffected.
+
 ### Security (phase 1 adversarial review)
 Each item has a regression test in `tests/test_security_review.py` that failed
 before the fix.

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import binascii
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -52,6 +54,17 @@ MAX_METADATA_BYTES = 64 * 1024
 MAX_CONTEXT_BYTES = 4096
 CONTEXT_SOURCES = frozenset({"web", "cli", "browser"})
 _ASSET_ID = re.compile(r"[0-9a-f]{32}")
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+# Version 3 envelopes are closed: every byte of the header either feeds the
+# AAD, the key unwrap, or an integrity check, so no field can be edited (or a
+# key renamed so a default kicks in) without decryption failing.
+V3_ENVELOPE_KEYS = frozenset(
+    {"version", "algorithm", "image_nonce", "key_wrap", "context", "ciphertext_sha256"}
+)
+WRAP_KEYS = {
+    WRAP_SCRYPT: frozenset({"type", "salt", "nonce", "wrapped_key", "n", "r", "p"}),
+    WRAP_RSA: frozenset({"type", "wrapped_key"}),
+}
 
 
 class CryptoError(Exception):
@@ -155,6 +168,11 @@ def decrypt_image_bytes(
         raise CryptoError("Supplied AAD conflicts with the sealed envelope context.")
     if not isinstance(ciphertext, bytes) or len(ciphertext) < GCM_TAG_BYTES:
         raise CryptoError("Encrypted image ciphertext is truncated.")
+    recorded = metadata.get("ciphertext_sha256")
+    if recorded is not None and not hmac.compare_digest(
+        str(recorded), hashlib.sha256(ciphertext).hexdigest()
+    ):
+        raise CryptoError("Ciphertext integrity check failed.")
 
     data_key = unwrap_data_key(
         metadata["key_wrap"],
@@ -195,6 +213,15 @@ def validate_envelope(metadata: Any) -> int:
     if not isinstance(key_wrap, dict) or key_wrap.get("type") not in WRAP_TYPES:
         raise CryptoError("Encrypted image key wrapping metadata is invalid.")
     if version == ENVELOPE_V3:
+        if not set(metadata) <= V3_ENVELOPE_KEYS:
+            raise CryptoError("Encrypted image metadata has unexpected fields.")
+        if set(key_wrap) != WRAP_KEYS[key_wrap["type"]]:
+            raise CryptoError("Encrypted image key wrapping metadata has unexpected fields.")
+        recorded = metadata.get("ciphertext_sha256")
+        if recorded is not None and (
+            not isinstance(recorded, str) or not _SHA256_HEX.fullmatch(recorded)
+        ):
+            raise CryptoError("Encrypted image ciphertext digest is malformed.")
         _validate_context(metadata.get("context"), algorithm=algorithm)
     else:
         legacy = metadata.get("aad")
@@ -401,12 +428,11 @@ def _unwrap_key_with_passphrase(key_wrap: dict[str, Any], passphrase: str | None
     except KeyError as exc:
         raise CryptoError("AES key wrapping metadata is incomplete.") from exc
 
-    try:
-        n = int(key_wrap.get("n", SCRYPT_N))
-        r = int(key_wrap.get("r", SCRYPT_R))
-        p = int(key_wrap.get("p", SCRYPT_P))
-    except (TypeError, ValueError) as exc:
-        raise CryptoError("AES key wrapping metadata is incomplete.") from exc
+    n = key_wrap.get("n", SCRYPT_N)
+    r = key_wrap.get("r", SCRYPT_R)
+    p = key_wrap.get("p", SCRYPT_P)
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in (n, r, p)):
+        raise CryptoError("Scrypt parameters must be integers.")
 
     if len(salt) != SCRYPT_SALT_BYTES:
         raise CryptoError("Scrypt salt has an invalid length.")
@@ -530,6 +556,11 @@ def _b64decode(value: Any) -> bytes:
     if not isinstance(value, str):
         raise CryptoError("Encrypted image metadata field must be base64 text.")
     try:
-        return b64decode(value.encode("ascii"), validate=True)
+        decoded = b64decode(value.encode("ascii"), validate=True)
     except (UnicodeEncodeError, binascii.Error) as exc:
         raise CryptoError("Encrypted image metadata field is not valid base64.") from exc
+    # Reject non-canonical encodings (stray bits in the final character), so no
+    # two distinct strings decode to the same bytes.
+    if b64encode(decoded).decode("ascii") != value:
+        raise CryptoError("Encrypted image metadata field is not canonical base64.")
+    return decoded
