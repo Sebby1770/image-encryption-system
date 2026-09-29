@@ -47,12 +47,18 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install package and audit tooling
-        run: |
-          pip install -e ".[dev]"
-          pip install pip-audit
+      # Auditing the declared requirements needs only the tool, not the project.
+      - name: Install audit tooling
+        run: pip install pip-audit
 
       # A vault is only as trustworthy as the crypto library under it, so a
       # known-vulnerable dependency should fail the build rather than warn.
+      #
+      # Audits the declared requirements rather than the installed environment.
+      # The environment also contains this project's own editable install, which
+      # is not published to PyPI, so under --strict pip-audit treated "could not
+      # be audited" as a failure: the job had been red on every run since it was
+      # added, which meant the dependency audit gave no signal at all.
+      # (--skip-editable does not help - a skip is itself fatal under --strict.)
       - name: Audit dependencies for known vulnerabilities
-        run: pip-audit --strict --desc
+        run: pip-audit --strict --desc -r requirements.txt

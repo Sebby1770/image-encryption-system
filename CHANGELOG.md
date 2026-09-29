@@ -105,6 +105,11 @@ already strong; the browser-facing layer around it had no controls at all.
 - The password policy was bypassable by registering with a strong password and
   then rotating to a weak one.
 
+- The dependency audit had never once passed. `pip-audit --strict` also audits
+  this project's own editable install, which is not published to PyPI, so
+  "could not be audited" failed the job on every run since it was added. It now
+  audits `requirements.txt`, which covers every declared runtime dependency.
+
 ### Security
 
 Reported in the README before this release but never actually implemented:
