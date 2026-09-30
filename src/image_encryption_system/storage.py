@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 import time
 import zipfile
@@ -264,7 +265,15 @@ class VaultStore:
 
     def authenticate_user(self, username: str, password: str) -> User | None:
         user = self.get_user_by_username(username)
-        if user and check_password_hash(user.password_hash, password):
+        if user is None:
+            # Spend the same password-hash work an existing account would, so
+            # response time does not reveal whether a username is registered.
+            # Skipping it made unknown usernames answer ~25x faster, and the
+            # login throttle is keyed per username, so an attacker could probe
+            # one candidate per request without ever tripping it.
+            check_password_hash(_dummy_password_hash(), password)
+            return None
+        if check_password_hash(user.password_hash, password):
             return user
         return None
 
@@ -998,6 +1007,17 @@ class VaultStore:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
+
+
+_DUMMY_HASH: str | None = None
+
+
+def _dummy_password_hash() -> str:
+    """A throwaway hash made with the same default method real accounts use."""
+    global _DUMMY_HASH
+    if _DUMMY_HASH is None:
+        _DUMMY_HASH = generate_password_hash(secrets.token_urlsafe(24))
+    return _DUMMY_HASH
 
 
 def _utc_now() -> str:

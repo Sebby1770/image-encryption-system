@@ -44,6 +44,35 @@
   gated at 80%, and a `pip-audit` dependency scan.
 
 
+## 3.1.0 - 2026-09-30
+
+### Security
+
+- **Login leaked which usernames exist.** `authenticate_user` skipped password
+  hashing when the username was unknown, so a failed login for a real account
+  took ~40 ms and one for a nonexistent account ~1.6 ms, with identical status
+  codes. The login throttle is keyed per username, so probing one candidate per
+  request never tripped it. Unknown usernames now pay for a comparison against a
+  dummy hash made with the same method; measured 41.9 ms vs 42.0 ms after.
+- **API tokens were accepted with required claims missing.** The README claimed
+  audience validation, but tokens carried no `aud` and none was checked. PyJWT
+  also validates `exp` only when present, so a token without it never expired,
+  and a token without `ver` defaulted to version 1 and outlived the
+  password-change revocation. Tokens now carry an audience, and `exp`, `iat`,
+  `iss`, `aud`, `sub`, and `ver` are all required.
+- **Sessions and API tokens shared a signing key** whenever `JWT_SECRET` was
+  unset. The default is now an HMAC-derived key with a fixed, versioned label,
+  so it still needs no configuration but is distinct from the session secret.
+- **Sessions had no absolute lifetime.** The idle timeout alone let a session
+  kept warm by activity - including a stolen cookie - live forever. Sessions
+  now also expire 12 hours after sign-in (`IES_SESSION_ABSOLUTE_SECONDS`).
+
+### Upgrade notes
+
+Outstanding API tokens and session cookies issued by 3.0.0 are invalidated once:
+tokens lack the new `aud` claim and are signed with the old key, and cookies lack
+an issue time. Users sign in again; nothing else changes.
+
 ## 3.0.0 - 2026-09-07
 
 Hardens the HTTP surface around the envelope crypto. The cryptography was

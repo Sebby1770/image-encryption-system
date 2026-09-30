@@ -54,7 +54,12 @@ was ever sent. 3.0.0 makes it true.)
   CORP, and HSTS on HTTPS requests.
 - `no-store` on every response carrying plaintext, ciphertext, key material, or
   a backup archive.
-- Session cookies are HttpOnly, SameSite=Lax, and Secure by default.
+- Session cookies are HttpOnly, SameSite=Lax, and Secure by default, with both
+  an idle timeout and an absolute lifetime.
+- Login does the same password-hash work for unknown usernames as for real
+  ones, so response time does not reveal which accounts exist.
+- API tokens require `exp`, `iat`, `iss`, `aud`, `sub`, and `ver`, and are
+  signed with a key derived separately from the session secret.
 - Refuses to start on a short or publicly known `SECRET_KEY`; generates and
   persists a random one when none is configured.
 - Password policy enforced in storage, so rotation cannot bypass it, with a

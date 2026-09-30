@@ -826,18 +826,20 @@ def create_app(test_config: dict | None = None) -> Flask:
 
         _login_success(app, store, user)
         now = datetime.now(timezone.utc)
+        lifetime = int(app.config.get("JWT_LIFETIME_SECONDS", 7200))
         token = jwt.encode(
             {
                 "sub": str(user.id),
                 "iss": app.config["JWT_ISSUER"],
+                "aud": app.config["JWT_AUDIENCE"],
                 "iat": now,
-                "exp": now + timedelta(hours=2),
+                "exp": now + timedelta(seconds=lifetime),
                 "ver": user.token_version,
             },
             app.config["JWT_SECRET"],
             algorithm="HS256",
         )
-        return jsonify({"token": token, "token_type": "Bearer", "expires_in": 7200})
+        return jsonify({"token": token, "token_type": "Bearer", "expires_in": lifetime})
 
     @app.get("/api/images")
     @jwt_required(store)
@@ -965,14 +967,22 @@ def jwt_required(store: VaultStore) -> Callable[[F], F]:
                 return jsonify({"error": "missing bearer token"}), 401
             token = auth_header.removeprefix("Bearer ").strip()
             try:
+                # Every claim the checks below rely on is *required*. PyJWT only
+                # validates exp/aud when they are present, so a token missing
+                # them would otherwise never expire and would be accepted by any
+                # service sharing the key; a token missing `ver` would default
+                # to version 1 and survive the password-change revocation.
                 payload = jwt.decode(
                     token,
                     current_app.config["JWT_SECRET"],
                     algorithms=["HS256"],
                     issuer=current_app.config["JWT_ISSUER"],
+                    audience=current_app.config["JWT_AUDIENCE"],
+                    options={"require": ["exp", "iat", "iss", "aud", "sub", "ver"]},
+                    leeway=30,
                 )
                 user = store.get_user(int(payload["sub"]))
-                token_version = int(payload.get("ver", 1))
+                token_version = int(payload["ver"])
                 if token_version != user.token_version:
                     raise ValueError("token version mismatch")
                 g.api_user = user
@@ -1044,9 +1054,11 @@ def _csrf_field() -> Markup:
 
 def _establish_session(user: User) -> None:
     session.clear()
+    now = time.time()
     session["user_id"] = user.id
     session["token_version"] = user.token_version
-    session["last_seen"] = time.time()
+    session["issued_at"] = now
+    session["last_seen"] = now
 
 
 def _current_user(store: VaultStore) -> User | None:
@@ -1067,6 +1079,17 @@ def _current_user(store: VaultStore) -> User | None:
     if cookie_version != user.token_version:
         session.clear()
         return None
+    absolute = int(current_app.config.get("SESSION_ABSOLUTE_SECONDS", 0) or 0)
+    if absolute > 0:
+        try:
+            issued_at = float(session.get("issued_at") or 0)
+        except (TypeError, ValueError):
+            issued_at = 0.0
+        # A cookie with no issue time predates this check; treat it as expired
+        # rather than granting it an unbounded lifetime.
+        if not issued_at or time.time() - issued_at > absolute:
+            session.clear()
+            return None
     idle = int(current_app.config.get("SESSION_IDLE_SECONDS", 1800) or 0)
     if idle > 0:
         try:

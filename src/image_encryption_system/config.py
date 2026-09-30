@@ -1,6 +1,8 @@
+import hmac
 import os
 import secrets
 import stat
+from hashlib import sha256
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -64,11 +66,24 @@ def load_or_create_secret_key(instance_dir: Path) -> str:
     return minted
 
 
+def derive_jwt_secret(secret_key: str) -> str:
+    """Derive the API-token signing key from the session secret.
+
+    Sessions (itsdangerous) and API tokens (HS256 JWTs) used to be signed with
+    the very same key whenever JWT_SECRET was unset. Deriving a distinct key with
+    a fixed, versioned label keeps the zero-configuration default while ensuring
+    a value produced for one protocol can never verify under the other.
+    """
+    return hmac.new(secret_key.encode("utf-8"), b"ies/jwt-signing-key/v1", sha256).hexdigest()
+
+
 class Config:
     INSTANCE_DIR = Path(os.getenv("IES_INSTANCE_DIR", BASE_DIR / "instance"))
     SECRET_KEY = load_or_create_secret_key(INSTANCE_DIR)
-    JWT_SECRET = os.getenv("JWT_SECRET", SECRET_KEY)
+    JWT_SECRET = os.getenv("JWT_SECRET") or derive_jwt_secret(SECRET_KEY)
     JWT_ISSUER = "image-encryption-system"
+    JWT_AUDIENCE = "image-encryption-system/api"
+    JWT_LIFETIME_SECONDS = int(os.getenv("IES_JWT_LIFETIME_SECONDS", 7200))
     DATABASE_PATH = INSTANCE_DIR / "vault.sqlite3"
     VAULT_DIR = INSTANCE_DIR / "vault"
     KEY_DIR = INSTANCE_DIR / "keys"
@@ -78,6 +93,10 @@ class Config:
     LOGIN_LOCKOUT_THRESHOLD = int(os.getenv("IES_LOGIN_LOCKOUT_THRESHOLD", 8))
     LOGIN_LOCKOUT_SECONDS = int(os.getenv("IES_LOGIN_LOCKOUT_SECONDS", 900))
     SESSION_IDLE_SECONDS = int(os.getenv("IES_SESSION_IDLE_SECONDS", 1800))
+    # Hard ceiling on a session's life regardless of activity. The idle timeout
+    # alone lets a session that is used every few minutes live forever, so a
+    # stolen cookie that is kept warm never expires.
+    SESSION_ABSOLUTE_SECONDS = int(os.getenv("IES_SESSION_ABSOLUTE_SECONDS", 12 * 3600))
 
     # Throttles for the unauthenticated and key-guessing surfaces that sit
     # outside the login flow. Registration matters because it generates an
