@@ -43,8 +43,10 @@ test together.
 Each image gets a fresh random 256-bit data key and 96-bit nonce and is sealed
 with AES-256-GCM. The data key is wrapped by one of:
 
-- **Passphrase (`AES-GCM`):** Scrypt (`n=2^14, r=8, p=1`, 16-byte salt) derives a
-  wrapping key; AES-GCM seals the data key with AAD `b"image-data-key"`.
+- **Passphrase (`AES-GCM`):** Scrypt (`n=2^16, r=8, p=1`, 16-byte salt) derives a
+  wrapping key; AES-GCM seals the data key with AAD `b"image-data-key"`. Files
+  written before 3.1 used `n=2^14` and remain readable: the accepted floor below
+  is a separate constant from the cost written today.
 - **RSA hybrid (`RSA-HYBRID`):** RSA-OAEP-SHA256/MGF1-SHA256 with the owner's
   3072-bit key. The private key PEM is encrypted with the account password.
 
@@ -101,7 +103,8 @@ lengths and total size. Base64 is decoded strictly, and metadata is capped at
 
 | Rule | Reason |
 | --- | --- |
-| `n` is a power of two, `n >= 2^14`, `n <= 2^22` | Blocks downgrade below the vault's baseline and CPU exhaustion |
+| `n` is a power of two, `n >= 2^14` (`MIN_SCRYPT_N`), `n <= 2^22` | Blocks downgrade below the vault's baseline and CPU exhaustion. The floor is deliberately below the `2^16` written today, so raising the default never strands an existing file |
+| A wrap that omits `n` uses `2^14` (`LEGACY_SCRYPT_N`) | Such wraps predate explicit parameters; falling back to the *current* default would derive the wrong key |
 | `128 * n * r <= 256 MiB`, `1 <= r <= 32`, `1 <= p <= 16` | Bounds the allocation |
 
 Version 3 envelopes are closed. Unknown top-level or wrap keys are rejected,
@@ -147,6 +150,20 @@ this origin. Backups are also validated on restore (see below).
 
 - Passwords use Werkzeug's salted hash. Unknown usernames still run a dummy
   hash check, so login timing does not reveal whether an account exists.
+- **Password policy**, enforced in `VaultStore` so registration, rotation and the
+  CLI all apply it: at least 10 characters, at least five distinct characters,
+  not containing the username, not one of a short list of the most common
+  choices. The account password also encrypts the RSA private key, so a weak one
+  weakens every image shared to that account. A breach-corpus check is out of
+  scope; a deployment that needs one should add it.
+- **Throttles beyond login**, all SQLite-backed so a restart does not reset them:
+  - registration: 5 per hour per address. Each registration generates an
+    RSA-3072 key pair, so without a limit it is a CPU amplifier that needs no
+    account;
+  - decrypt attempts: 30 per 5 minutes per account. Keyed on the account rather
+    than the asset, so one user cannot lock another out of a shared image;
+  - capability-link requests: 20 per 5 minutes per address, bounding token
+    guessing on the one surface whose only credential is the URL.
 - Login is rate limited (5 per 10 minutes per IP+username). Eight failures lock
   the username for 15 minutes. Both counters are stored in SQLite, so a restart
   does not reset them. Usernames are normalised with `strip().lower()` for
@@ -159,9 +176,11 @@ this origin. Backups are also validated on restore (see below).
   - Sessions expire after 30 minutes idle and 7 days absolute.
   - Cookies are `HttpOnly` and `SameSite=Lax`. Set `IES_SECURE_COOKIES=1` behind
     HTTPS to add `Secure`.
-- **JWTs** (`/api/*`) are HS256 only. `exp`, `iat`, `iss`, `sub`, and an integer
-  `ver` are required, and `ver` must equal the user's current
-  `token_version`. `alg=none`, other algorithms, and other keys are rejected.
+- **JWTs** (`/api/*`) are HS256 only. `exp`, `iat`, `iss`, `aud`, `sub`, and an
+  integer `ver` are required; `aud` must be `image-encryption-system/api`, so a
+  token minted for another service that shares the key is refused; and `ver`
+  must equal the user's current `token_version`. `alg=none`, other algorithms,
+  and other keys are rejected.
 - **CSRF.** Every state-changing HTML route requires the session CSRF token
   (tested across the whole URL map). `/api/*` routes ignore cookies entirely and
   need a bearer token, so they cannot be driven cross-site.
@@ -173,7 +192,10 @@ this origin. Backups are also validated on restore (see below).
 - **Page headers.** Every HTML page sends a CSP with no inline script or style,
   `frame-ancestors 'none'`, and `form-action 'self'`. It also sends
   `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`, so link tokens
-  cannot leak through Referer.
+  cannot leak through Referer, plus a restrictive `Permissions-Policy`,
+  `Cross-Origin-Opener-Policy: same-origin`, and
+  `Cross-Origin-Resource-Policy: same-origin`. HSTS is sent on HTTPS requests
+  only, so a plain-HTTP development run is never pinned to a scheme it lacks.
 
 ## Sharing and capability links
 
@@ -227,3 +249,5 @@ vouches for them only from that moment on.
   secrets.
 - Run a single app process per instance directory, or put the SQLite database
   on storage that supports its locking.
+- Give the process a memory limit: each in-flight passphrase decrypt holds
+  ~64 MiB for Scrypt. `compose.yaml` sets one.

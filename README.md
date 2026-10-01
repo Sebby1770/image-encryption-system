@@ -39,6 +39,17 @@ checks, session idle timeout, audit CSV, and CLI rewrap/hash.
   sessions; 30-minute idle and 7-day absolute timeouts.
 - Login rate limit (5 / 10 minutes per IP+username) and lockout after 8
   failures, persisted in SQLite.
+- Throttles beyond the login form: registration per address (each one mints an
+  RSA-3072 key pair, so it is a CPU amplifier reachable without an account),
+  decrypt attempts per account, and capability-link requests per address.
+- Password policy enforced in storage, so registration, rotation, and the CLI
+  all clear the same bar; a register-page meter mirrors the same rules.
+- Scrypt at `n=2^16` for new passphrase wrappings. The accepted floor (`2^14`)
+  is a separate constant, so older files stay readable.
+- API tokens carry and require an audience, alongside `exp`, `iat`, `iss`,
+  `sub`, and `ver`.
+- Permissions-Policy, COOP, CORP, and HSTS (on HTTPS requests) alongside the
+  CSP; `GET /healthz` for probes; a non-root Docker image.
 - Owner-only audit log, HMAC-chained and verified on every view (web, CSV
   export, and `GET /api/audit`).
 - Encrypted backup zip (ciphertext + metadata, never private keys) and restore.
@@ -140,6 +151,13 @@ account: vault blobs, shares, RSA keys, audit rows, and the user.
 | `IES_SECURE_COOKIES` | `1` behind HTTPS to mark the session cookie `Secure` |
 | `IES_INSTANCE_DIR` | SQLite, vault blobs, and RSA keys |
 | `IES_MAX_UPLOAD_BYTES` | Upload cap (default 8 MiB) |
+| `IES_HSTS_SECONDS` | HSTS max-age, sent only on HTTPS requests (default one year; `0` disables) |
+| `IES_MIN_PASSWORD_LENGTH` | Minimum password length (default 10) |
+| `IES_REGISTER_RATE_LIMIT` / `_WINDOW` | Registrations per address per window (default 5 / 3600 s) |
+| `IES_DECRYPT_RATE_LIMIT` / `_WINDOW` | Decrypt attempts per account per window (default 30 / 300 s) |
+| `IES_LINK_RATE_LIMIT` / `_WINDOW` | Capability-link requests per address per window (default 20 / 300 s) |
+
+A throttle limit of `0` disables that throttle.
 
 Use strong secrets for any shared deployment.
 
@@ -218,12 +236,25 @@ image-encryption-system/
     storage.py         # SQLite, shares, audit, backup zip
     web.py             # Flask app, auth, share, revoke, audit, API
     cli.py             # ies console script
-    security.py        # persistent login rate limit and lockout
+    security.py        # login guard, request throttles, password policy
     templates/         # HTML views
     static/css/        # UI styling
   tests/               # pytest coverage
   docs/                # Threat model
 ```
+
+## Docker
+
+```bash
+docker compose up --build
+```
+
+The image builds the wheel in a throwaway stage and runs it with gunicorn as a
+non-root user, with a `HEALTHCHECK` against `/healthz`. The vault database,
+ciphertext, encrypted private keys, and the generated secrets all live in the
+`vault-data` volume mounted at `/data`. `compose.yaml` sets `IES_SECURE_COOKIES=1`
+(serve it behind TLS) and a memory limit, because Scrypt holds ~64 MiB per
+in-flight passphrase decrypt.
 
 ## License
 

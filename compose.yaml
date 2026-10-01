@@ -1,0 +1,19 @@
+services:
+  vault:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Serve behind TLS and keep this on; a Secure cookie is dropped over plain
+      # HTTP, so turn it off only for local experiments without a proxy.
+      IES_SECURE_COOKIES: "1"
+      # Leave SECRET_KEY / JWT_SECRET / AUDIT_HMAC_KEY unset to have random keys
+      # generated and persisted into the volume on first run.
+    volumes:
+      - vault-data:/data
+    restart: unless-stopped
+    # Bounds the memory a burst of concurrent Scrypt derivations can claim.
+    mem_limit: 1g
+
+volumes:
+  vault-data:

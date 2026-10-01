@@ -11,7 +11,7 @@ writes the same `.ies` envelope offline.
 src/image_encryption_system/
   crypto.py      # AES-GCM, key wrapping, .ies pack/unpack, AAD. No Flask imports.
   storage.py     # VaultStore: SQLite schema, users, assets, shares, links, audit, backup zip
-  security.py    # LoginGuard: SQLite-backed rate limit + lockout
+  security.py    # LoginGuard, RequestThrottle (register/decrypt/link), password policy
   web.py         # create_app(): every route, CSRF, sessions, JWT API, upload checks
   cli.py         # `ies` console script; talks only to crypto.py
   config.py      # Config defaults, all overridable via env vars
@@ -115,6 +115,13 @@ The e2e test launches Playwright's bundled Chromium and falls back to
 
 Never change these byte layouts silently: existing blobs must stay decryptable.
 Add a new `version` instead and keep a test that decrypts the old one.
+
+## Test-suite KDF cost
+
+`tests/conftest.py` runs every test at the cheapest accepted Scrypt cost
+(`MIN_SCRYPT_N`), because the production default (`SCRYPT_N`, 2^16) costs
+~300 ms per derivation and the property tests wrap hundreds of keys. Mark a test
+`@pytest.mark.production_kdf` when it must see the real default.
 
 ## Conventions
 

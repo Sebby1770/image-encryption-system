@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 from helpers import make_app, register, with_csrf
-from hypothesis import assume, given
+from hypothesis import assume, example, given
 from hypothesis import strategies as st
 from PIL import Image
 
@@ -20,7 +20,7 @@ from image_encryption_system.crypto import (
     AES_GCM_PASSPHRASE,
     MAX_SCRYPT_MEMORY_BYTES,
     MAX_SCRYPT_WORK_FACTOR,
-    SCRYPT_N,
+    MIN_SCRYPT_N,
     SCRYPT_R,
     CryptoError,
     decrypt_image_bytes,
@@ -50,7 +50,11 @@ def _cli_blob() -> bytes:
 @lru_cache(maxsize=1)
 def _web_session():
     tmp = Path(tempfile.mkdtemp())
-    app = make_app(tmp)
+    # One account is shared by every example (an RSA key pair per example would
+    # dominate the run), so per-account throttles would trip partway through.
+    # These properties are about round-tripping, not rate limits; the throttles
+    # have their own tests.
+    app = make_app(tmp, DECRYPT_RATE_LIMIT=0, LINK_RATE_LIMIT=0)
     client = app.test_client()
     register(client, "prop")
     return app, client
@@ -140,7 +144,7 @@ def test_flipping_any_byte_of_the_header_is_rejected_by_the_cli(data, tmp_path_f
 
 def _in_bounds(n: int, r: int, p: int) -> bool:
     return (
-        SCRYPT_N <= n <= MAX_SCRYPT_WORK_FACTOR
+        MIN_SCRYPT_N <= n <= MAX_SCRYPT_WORK_FACTOR
         and n & (n - 1) == 0
         and 1 <= r <= 32
         and 1 <= p <= 16
@@ -202,6 +206,10 @@ _passphrases = st.text(min_size=1, max_size=64).filter(lambda s: len(s.encode())
 
 
 @given(payload=st.binary(min_size=1, max_size=4096), passphrase=_passphrases, name=_filenames)
+# A passphrase starting with "-" cannot follow "-p" as a separate argument:
+# argparse reads it as an option and exits. Hypothesis found this one; pinning it
+# means it runs every time instead of whenever the search happens to reach it.
+@example(payload=b"\x00", passphrase="-:", name="0.png")
 def test_cli_round_trips_arbitrary_bytes(payload, passphrase, name, tmp_path_factory) -> None:
     tmp = tmp_path_factory.mktemp("cli")
     source = tmp / "input.bin"
@@ -209,8 +217,11 @@ def test_cli_round_trips_arbitrary_bytes(payload, passphrase, name, tmp_path_fac
     renamed = tmp / name.replace("/", "_")
     source.rename(renamed)
 
-    assert ies_main(["encrypt", str(renamed), "-p", passphrase, "-o", str(tmp / "x.ies")]) == 0
-    assert ies_main(["decrypt", str(tmp / "x.ies"), "-p", passphrase, "-o", str(tmp / "y")]) == 0
+    # The "--passphrase=VALUE" form is the only one argparse parses for every
+    # possible passphrase, including ones that begin with a dash.
+    secret = f"--passphrase={passphrase}"
+    assert ies_main(["encrypt", str(renamed), secret, "-o", str(tmp / "x.ies")]) == 0
+    assert ies_main(["decrypt", str(tmp / "x.ies"), secret, "-o", str(tmp / "y")]) == 0
     assert (tmp / "y").read_bytes() == payload
 
 

@@ -675,7 +675,10 @@ def test_legacy_v1_web_download_still_decrypts_with_the_cli(tmp_path) -> None:
         ]
     )
     assert code == 0
-    assert out.read_bytes() == sample_png()
+    # Compared against the recorded plaintext, not a fresh sample_png(): PNG
+    # encoding varies across Pillow releases (12.3 changes the bytes of the
+    # identical image), which made this test fail with no code change.
+    assert out.read_bytes() == (FIXTURES / "legacy-v1-web.png").read_bytes()
 
 
 def test_legacy_v1_backup_restores_and_decrypts_in_the_web_app(tmp_path) -> None:
@@ -690,7 +693,7 @@ def test_legacy_v1_backup_restores_and_decrypts_in_the_web_app(tmp_path) -> None
 
     response = _decrypt(client, asset.id, passphrase="legacy fixture passphrase")
     assert response.status_code == 200
-    assert response.data == sample_png()
+    assert response.data == (FIXTURES / "legacy-v1-web.png").read_bytes()
 
 
 # --------------------------------------------------------------------------- #

@@ -2,6 +2,47 @@
 
 ## [Unreleased]
 
+### Hardening carried over from the parallel v3.0 line (#6, #10)
+- **Registration was unthrottled**, and each one generates an RSA-3072 key
+  pair, so anyone could burn server CPU without an account. Registration is now
+  limited per address; decrypt attempts per account (keyed on the account, not
+  the asset, so one user cannot throttle another's shared image); and
+  capability-link requests per address. Counters reuse the `login_guard` table,
+  so they survive restarts.
+- **Scrypt cost raised from `2^14` to `2^16`** for new passphrase wrappings
+  (~300 ms, 64 MiB). The validator compared against the *current* default, which
+  made the default un-raisable — raising it would have rejected every existing
+  file — so the accepted floor is now a separate `MIN_SCRYPT_N`. A wrap that omits
+  `n` falls back to `LEGACY_SCRYPT_N` rather than the new default, which would
+  derive the wrong key. `2^17` was measured and rejected: ~600 ms and 128 MiB on
+  every passphrase decrypt.
+- The passphrase wrap derived its key through import-time default arguments
+  while writing the cost into the metadata separately; both now come from one
+  value resolved at call time.
+- **Password policy** (length, at least five distinct characters, not the
+  username, not a top-of-list choice) enforced in storage, so registration,
+  rotation, and the CLI all clear it — enforcing it only in a view would leave
+  rotation as a bypass. A register-page meter mirrors the same rules.
+- **API tokens carry and require `aud`.** The README promised audience
+  validation; tokens had no `aud` and none was checked.
+- Permissions-Policy, Cross-Origin-Opener-Policy, Cross-Origin-Resource-Policy,
+  and HSTS on HTTPS requests.
+- `GET /healthz`, a multi-stage non-root Dockerfile with a `HEALTHCHECK`, and a
+  `compose.yaml` with a memory limit sized against Scrypt.
+
+### Test fixes
+- `test_cli_round_trips_arbitrary_bytes` was flaky: a passphrase starting with
+  `-` cannot follow `-p` as its own argument, so argparse exited. Hypothesis
+  found `"-:"`; the test now uses `--passphrase=VALUE` and pins that example.
+- Two legacy-fixture tests compared decrypted bytes with a freshly encoded
+  `sample_png()`, and PNG encoding differs across Pillow releases (12.3 changes
+  the bytes), so they failed with no code change. They now compare against the
+  recorded plaintext `tests/fixtures/legacy-v1-web.png`, recovered by
+  authenticated decryption and checked to decode to the expected image.
+- The suite runs at the cheapest accepted Scrypt cost via an autouse fixture;
+  tests marked `production_kdf` pin the real default. The cost changes no code
+  path, only work, and the property tests wrap hundreds of keys.
+
 ### Tests and CI (phase 2)
 - Hypothesis property tests (`tests/test_properties.py`):
   - flipping any byte of a CLI or web `.ies` file fails to decrypt;

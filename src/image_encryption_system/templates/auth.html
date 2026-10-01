@@ -26,13 +26,20 @@
         <label>
           Password
           <input
+            id="password-input"
             name="password"
             type="password"
             autocomplete="{% if mode == 'register' %}new-password{% else %}current-password{% endif %}"
-            minlength="10"
+            minlength="{{ min_password_length }}"
             required
           >
         </label>
+        {% if mode == "register" %}
+          <div class="password-meter">
+            <progress id="password-meter-bar" max="5" value="0" aria-hidden="true"></progress>
+            <small id="password-meter-label" class="field-note" role="status">Enter a password</small>
+          </div>
+        {% endif %}
         <button class="button button-primary" type="submit">
           {% if mode == "register" %}Create account{% else %}Sign in{% endif %}
         </button>

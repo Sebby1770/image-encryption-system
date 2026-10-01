@@ -27,9 +27,21 @@ AES_KEY_BYTES = 32
 GCM_NONCE_BYTES = 12
 GCM_TAG_BYTES = 16
 SCRYPT_SALT_BYTES = 16
-SCRYPT_N = 2**14
+# Cost written into new passphrase wrappings: ~300 ms and 64 MiB per derivation.
+# 2**17 was measured and rejected — ~600 ms and 128 MiB, and this KDF runs on
+# every passphrase decrypt rather than only at login, so a handful of
+# concurrent decrypts could exhaust a small host.
+SCRYPT_N = 2**16
 SCRYPT_R = 8
 SCRYPT_P = 1
+# Weakest cost still accepted on an existing file. Kept separate from SCRYPT_N:
+# when the validator compared against the *current* default, raising the default
+# would have rejected every file already written at the old one.
+MIN_SCRYPT_N = 2**14
+# Cost every release before 3.1 wrote. Envelopes that predate explicit KDF
+# parameters fall back to this — never to the current default, which would
+# derive the wrong key for them.
+LEGACY_SCRYPT_N = 2**14
 # Wrap metadata travels with the ciphertext, so every parameter below is
 # attacker-controlled on any .ies file or restored backup. These ceilings keep a
 # hostile blob from steering Scrypt into a memory-exhaustion DoS.
@@ -400,7 +412,13 @@ def _wrap_key_with_passphrase(data_key: bytes, passphrase: str | None) -> dict[s
         raise CryptoError("AES-GCM mode requires a passphrase.")
 
     salt = os.urandom(SCRYPT_SALT_BYTES)
-    wrapping_key = _derive_passphrase_key(passphrase, salt)
+    # Resolve the cost once and use the same values for the derivation and the
+    # metadata. They used to be supplied twice — implicitly through
+    # _derive_passphrase_key's default arguments, which are bound at import, and
+    # explicitly in the dict below — so the recorded cost could drift from the
+    # cost actually spent.
+    n, r, p = SCRYPT_N, SCRYPT_R, SCRYPT_P
+    wrapping_key = _derive_passphrase_key(passphrase, salt, n=n, r=r, p=p)
     wrapping_nonce = os.urandom(GCM_NONCE_BYTES)
     wrapped_key = AESGCM(wrapping_key).encrypt(wrapping_nonce, data_key, b"image-data-key")
 
@@ -409,9 +427,9 @@ def _wrap_key_with_passphrase(data_key: bytes, passphrase: str | None) -> dict[s
         "salt": _b64encode(salt),
         "nonce": _b64encode(wrapping_nonce),
         "wrapped_key": _b64encode(wrapped_key),
-        "n": SCRYPT_N,
-        "r": SCRYPT_R,
-        "p": SCRYPT_P,
+        "n": n,
+        "r": r,
+        "p": p,
     }
 
 
@@ -428,7 +446,7 @@ def _unwrap_key_with_passphrase(key_wrap: dict[str, Any], passphrase: str | None
     except KeyError as exc:
         raise CryptoError("AES key wrapping metadata is incomplete.") from exc
 
-    n = key_wrap.get("n", SCRYPT_N)
+    n = key_wrap.get("n", LEGACY_SCRYPT_N)
     r = key_wrap.get("r", SCRYPT_R)
     p = key_wrap.get("p", SCRYPT_P)
     if any(isinstance(value, bool) or not isinstance(value, int) for value in (n, r, p)):
@@ -513,9 +531,9 @@ def _derive_passphrase_key(
     passphrase: str,
     salt: bytes,
     *,
-    n: int = SCRYPT_N,
-    r: int = SCRYPT_R,
-    p: int = SCRYPT_P,
+    n: int,
+    r: int,
+    p: int,
 ) -> bytes:
     _validate_scrypt_parameters(n=n, r=r, p=p)
     kdf = Scrypt(salt=salt, length=AES_KEY_BYTES, n=n, r=r, p=p)
@@ -525,11 +543,12 @@ def _derive_passphrase_key(
 def _validate_scrypt_parameters(*, n: int, r: int, p: int) -> None:
     """Reject Scrypt costs outside the range this vault is willing to spend.
 
-    ``n`` must stay a power of two at or above the value we write ourselves, so
-    a hostile blob can neither weaken the KDF below our own baseline nor push it
-    into an allocation large enough to take the process down.
+    ``n`` must stay a power of two at or above ``MIN_SCRYPT_N``, so a hostile
+    blob can neither weaken the KDF below the supported baseline nor push it into
+    an allocation large enough to take the process down. The floor sits below
+    the cost written today so the default can rise without stranding old files.
     """
-    if n < SCRYPT_N or n > MAX_SCRYPT_WORK_FACTOR or n & (n - 1):
+    if n < MIN_SCRYPT_N or n > MAX_SCRYPT_WORK_FACTOR or n & (n - 1):
         raise CryptoError("Scrypt work factor is outside the supported range.")
     if not 1 <= r <= 32 or not 1 <= p <= 16:
         raise CryptoError("Scrypt parameters are outside the supported range.")

@@ -42,6 +42,7 @@ class Config:
     JWT_SECRET = os.getenv("JWT_SECRET")
     AUDIT_HMAC_KEY = os.getenv("AUDIT_HMAC_KEY")
     JWT_ISSUER = "image-encryption-system"
+    JWT_AUDIENCE = "image-encryption-system/api"
     INSTANCE_DIR = Path(os.getenv("IES_INSTANCE_DIR", BASE_DIR / "instance"))
     DATABASE_PATH = INSTANCE_DIR / "vault.sqlite3"
     VAULT_DIR = INSTANCE_DIR / "vault"
@@ -56,6 +57,18 @@ class Config:
     SESSION_COOKIE_HTTPONLY = True
     SESSION_COOKIE_SAMESITE = "Lax"
     SESSION_COOKIE_SECURE = _env_flag("IES_SECURE_COOKIES")
+    # Sent only on HTTPS requests, so plain-HTTP development is unaffected.
+    HSTS_SECONDS = int(os.getenv("IES_HSTS_SECONDS", 31_536_000))
+    MIN_PASSWORD_LENGTH = int(os.getenv("IES_MIN_PASSWORD_LENGTH", 10))
+    # Throttles for surfaces outside the login flow. Registration generates an
+    # RSA-3072 key pair, so without a limit it is a CPU amplifier anyone can
+    # call. Decrypt attempts and capability links both take a secret as input.
+    REGISTER_RATE_LIMIT = int(os.getenv("IES_REGISTER_RATE_LIMIT", 5))
+    REGISTER_RATE_WINDOW_SECONDS = int(os.getenv("IES_REGISTER_RATE_WINDOW", 3600))
+    DECRYPT_RATE_LIMIT = int(os.getenv("IES_DECRYPT_RATE_LIMIT", 30))
+    DECRYPT_RATE_WINDOW_SECONDS = int(os.getenv("IES_DECRYPT_RATE_WINDOW", 300))
+    LINK_RATE_LIMIT = int(os.getenv("IES_LINK_RATE_LIMIT", 20))
+    LINK_RATE_WINDOW_SECONDS = int(os.getenv("IES_LINK_RATE_WINDOW", 300))
     ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"}
     # Decoded formats we are willing to load. The extension allow-list above is
     # only a filename check; this is matched against what Pillow actually

@@ -50,7 +50,7 @@ from .crypto import (
     wrap_data_key_passphrase,
     wrap_data_key_rsa,
 )
-from .security import LoginGuard
+from .security import LoginGuard, RequestThrottle, validate_password
 from .storage import (
     AssetShare,
     EncryptedAsset,
@@ -148,6 +148,15 @@ def create_app(test_config: dict | None = None) -> Flask:
         lockout_threshold=int(app.config.get("LOGIN_LOCKOUT_THRESHOLD", 8)),
         lockout_seconds=int(app.config.get("LOGIN_LOCKOUT_SECONDS", 900)),
     )
+    app.extensions["throttles"] = {
+        name: RequestThrottle(
+            store,
+            f"throttle:{name}",
+            limit=int(app.config.get(f"{name.upper()}_RATE_LIMIT", limit)),
+            window_seconds=int(app.config.get(f"{name.upper()}_RATE_WINDOW_SECONDS", window)),
+        )
+        for name, limit, window in (("register", 5, 3600), ("decrypt", 30, 300), ("link", 20, 300))
+    }
 
     @app.context_processor
     def inject_globals() -> dict[str, object]:
@@ -159,6 +168,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                 (AES_GCM_PASSPHRASE, "AES-GCM passphrase"),
                 (RSA_HYBRID, "RSA hybrid"),
             ],
+            "min_password_length": int(app.config.get("MIN_PASSWORD_LENGTH", 10)),
         }
 
     @app.before_request
@@ -184,7 +194,30 @@ def create_app(test_config: dict | None = None) -> Flask:
         # Capability-link tokens live in the URL path; never leak them via Referer.
         headers.setdefault("Referrer-Policy", "no-referrer")
         headers.setdefault("Content-Security-Policy", PAGE_CSP)
+        headers.setdefault(
+            "Permissions-Policy",
+            "camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()",
+        )
+        headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+        headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+        # Only meaningful over TLS; asserting it on plain HTTP would pin the
+        # browser to a scheme a development host does not serve.
+        hsts = int(current_app.config.get("HSTS_SECONDS", 0) or 0)
+        if hsts > 0 and request.is_secure:
+            headers.setdefault("Strict-Transport-Security", f"max-age={hsts}; includeSubDomains")
         return response
+
+    @app.get("/healthz")
+    def healthz() -> ResponseReturnValue:
+        """Liveness/readiness probe: confirms the process and database answer.
+
+        Unauthenticated by design and deliberately empty of detail.
+        """
+        try:
+            store.count_users()
+        except Exception:
+            return jsonify({"status": "unavailable"}), 503
+        return jsonify({"status": "ok"})
 
     @app.errorhandler(RequestEntityTooLarge)
     def too_large(_error: RequestEntityTooLarge) -> ResponseReturnValue:
@@ -208,7 +241,17 @@ def create_app(test_config: dict | None = None) -> Flask:
     def register() -> ResponseReturnValue:
         username = request.form.get("username", "")
         password = request.form.get("password", "")
+        # Each registration generates an RSA-3072 key pair, so an unthrottled
+        # caller can burn CPU indefinitely without ever holding an account.
+        if not _throttle(app, "register", request.remote_addr or "-"):
+            flash("Too many accounts created from this address. Try again later.", "error")
+            return redirect(url_for("register_form")), 429
         try:
+            validate_password(
+                password,
+                username=username,
+                min_length=int(app.config.get("MIN_PASSWORD_LENGTH", 10)),
+            )
             user = store.create_user(username, password)
         except IntegrityError:
             flash("That username is already registered.", "error")
@@ -263,6 +306,11 @@ def create_app(test_config: dict | None = None) -> Flask:
             flash("New password and confirmation do not match.", "error")
             return redirect(url_for("password_form"))
         try:
+            validate_password(
+                new_password,
+                username=user.username,
+                min_length=int(app.config.get("MIN_PASSWORD_LENGTH", 10)),
+            )
             store.change_password(user.id, old_password, new_password)
         except (ValueError, CryptoError) as exc:
             flash(str(exc), "error")
@@ -384,6 +432,15 @@ def create_app(test_config: dict | None = None) -> Flask:
     @login_required(store)
     def decrypt_image(asset_id: int) -> ResponseReturnValue:
         user = _require_user(store)
+        # Every attempt tests a passphrase or private-key password against real
+        # ciphertext. Keyed per account, not per asset: keying on the asset
+        # would let one user throttle another's shared image.
+        if not _throttle(app, "decrypt", f"user:{user.id}"):
+            message = "Too many decryption attempts. Wait a few minutes and try again."
+            if _wants_json():
+                return jsonify({"error": message}), 429
+            flash(message, "error")
+            return redirect(url_for("dashboard")), 429
         try:
             asset, share = _accessible_asset(store, asset_id, user)
             ciphertext = store.read_ciphertext(asset)
@@ -579,6 +636,11 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.get("/l/<token>")
     def open_link_share(token: str) -> ResponseReturnValue:
+        # Capability links are unauthenticated and CSRF-exempt by design, so the
+        # bearer token is the only secret. Bound token guessing per address.
+        limited = _link_throttled(app)
+        if limited is not None:
+            return limited
         store.sweep_expired_shares()
         try:
             link, asset = _resolve_link(store, token)
@@ -590,6 +652,11 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.post("/l/<token>/decrypt")
     def decrypt_link_share(token: str) -> ResponseReturnValue:
+        # Capability links are unauthenticated and CSRF-exempt by design, so the
+        # bearer token is the only secret. Bound token guessing per address.
+        limited = _link_throttled(app)
+        if limited is not None:
+            return limited
         try:
             return _decrypt_link(store, token)
         except PermissionError as exc:
@@ -601,6 +668,11 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.get("/l/<token>/blob")
     def download_link_blob(token: str) -> ResponseReturnValue:
+        # Capability links are unauthenticated and CSRF-exempt by design, so the
+        # bearer token is the only secret. Bound token guessing per address.
+        limited = _link_throttled(app)
+        if limited is not None:
+            return limited
         try:
             link, asset = _resolve_link(store, token)
             store.ciphertext_sha256(asset)
@@ -745,6 +817,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             {
                 "sub": str(user.id),
                 "iss": app.config["JWT_ISSUER"],
+                "aud": app.config["JWT_AUDIENCE"],
                 "iat": now,
                 "exp": now + timedelta(hours=2),
                 "ver": user.token_version,
@@ -858,6 +931,21 @@ def create_app(test_config: dict | None = None) -> Flask:
     return app
 
 
+def _throttle(app: Flask, name: str, key: str) -> bool:
+    """Record one attempt against a named throttle; False once it is full."""
+    throttle = app.extensions.get("throttles", {}).get(name)
+    return True if throttle is None else throttle.allow(key)
+
+
+def _link_throttled(app: Flask) -> ResponseReturnValue | None:
+    if _throttle(app, "link", f"ip:{request.remote_addr or '-'}"):
+        return None
+    message = "Too many link requests. Try again shortly."
+    if _wants_json():
+        return jsonify({"error": message}), 429
+    return (message, 429)
+
+
 def login_required(store: VaultStore) -> Callable[[F], F]:
     def decorator(view: F) -> F:
         @wraps(view)
@@ -886,7 +974,8 @@ def jwt_required(store: VaultStore) -> Callable[[F], F]:
                     current_app.config["JWT_SECRET"],
                     algorithms=["HS256"],
                     issuer=current_app.config["JWT_ISSUER"],
-                    options={"require": ["exp", "iat", "iss", "sub", "ver"]},
+                    audience=current_app.config["JWT_AUDIENCE"],
+                    options={"require": ["exp", "iat", "iss", "aud", "sub", "ver"]},
                 )
                 user = store.get_user(int(payload["sub"]))
                 token_version = payload["ver"]
