@@ -2,7 +2,157 @@
 
 ## [Unreleased]
 
+### Hardening carried over from the parallel v3.0 line (#6, #10)
+- **Registration was unthrottled**, and each one generates an RSA-3072 key
+  pair, so anyone could burn server CPU without an account. Registration is now
+  limited per address; decrypt attempts per account (keyed on the account, not
+  the asset, so one user cannot throttle another's shared image); and
+  capability-link requests per address. Counters reuse the `login_guard` table,
+  so they survive restarts.
+- **Scrypt cost raised from `2^14` to `2^16`** for new passphrase wrappings
+  (~300 ms, 64 MiB). The validator compared against the *current* default, which
+  made the default un-raisable — raising it would have rejected every existing
+  file — so the accepted floor is now a separate `MIN_SCRYPT_N`. A wrap that omits
+  `n` falls back to `LEGACY_SCRYPT_N` rather than the new default, which would
+  derive the wrong key. `2^17` was measured and rejected: ~600 ms and 128 MiB on
+  every passphrase decrypt.
+- The passphrase wrap derived its key through import-time default arguments
+  while writing the cost into the metadata separately; both now come from one
+  value resolved at call time.
+- **Password policy** (length, at least five distinct characters, not the
+  username, not a top-of-list choice) enforced in storage, so registration,
+  rotation, and the CLI all clear it — enforcing it only in a view would leave
+  rotation as a bypass. A register-page meter mirrors the same rules.
+- **API tokens carry and require `aud`.** The README promised audience
+  validation; tokens had no `aud` and none was checked.
+- Permissions-Policy, Cross-Origin-Opener-Policy, Cross-Origin-Resource-Policy,
+  and HSTS on HTTPS requests.
+- `GET /healthz`, a multi-stage non-root Dockerfile with a `HEALTHCHECK`, and a
+  `compose.yaml` with a memory limit sized against Scrypt.
+
+### Test fixes
+- `test_cli_round_trips_arbitrary_bytes` was flaky: a passphrase starting with
+  `-` cannot follow `-p` as its own argument, so argparse exited. Hypothesis
+  found `"-:"`; the test now uses `--passphrase=VALUE` and pins that example.
+- Two legacy-fixture tests compared decrypted bytes with a freshly encoded
+  `sample_png()`, and PNG encoding differs across Pillow releases (12.3 changes
+  the bytes), so they failed with no code change. They now compare against the
+  recorded plaintext `tests/fixtures/legacy-v1-web.png`, recovered by
+  authenticated decryption and checked to decode to the expected image.
+- The suite runs at the cheapest accepted Scrypt cost via an autouse fixture;
+  tests marked `production_kdf` pin the real default. The cost changes no code
+  path, only work, and the property tests wrap hundreds of keys.
+
+### Tests and CI (phase 2)
+- Hypothesis property tests (`tests/test_properties.py`):
+  - flipping any byte of a CLI or web `.ies` file fails to decrypt;
+  - the CLI and the web app round-trip arbitrary inputs, and a web download
+    opens in the CLI;
+  - out-of-bounds Scrypt parameters are rejected in under a second;
+  - the KDF validator accepts exactly the documented region.
+- Playwright end-to-end test (`tests/e2e/`): register two users, upload, view,
+  share, revoke, and check the recipient is locked out, with CSRF and CSP
+  enforced and no console errors.
+- CI: 85% coverage gate (up from 80%), `HYPOTHESIS_PROFILE=ci` (200 examples
+  per property), and a separate `e2e` job with Playwright Chromium.
+
+### Security (found by the phase 2 property tests)
+- **Unauthenticated header bytes in `.ies` files (low).** Flipping a byte
+  inside `ciphertext_sha256` or `original_filename`, renaming a Scrypt key
+  so a default applied, or altering a base64 string's padding bits still
+  decrypted. The integrity check was never verified. Version 3 envelopes are
+  now closed:
+  - exact key sets for the envelope and each wrap type;
+  - canonical base64 only;
+  - integer-only KDF parameters;
+  - `ciphertext_sha256` verified on decrypt.
+
+  The CLI no longer writes the redundant top-level `original_filename`; the
+  name is already sealed in `context.filename`. Version 1 files are unaffected.
+
+### Security (phase 1 adversarial review)
+Each item has a regression test in `tests/test_security_review.py` that failed
+before the fix.
+
+- **Stored XSS through backup restore (high).** Restore accepted any
+  `mime_type`, and decrypt served plaintext inline with that type, so a
+  crafted backup could plant HTML that ran on this origin when a share
+  recipient opened it. Restore now accepts only allow-listed image types. The
+  served `Content-Type` comes from the allow-list, the bytes must parse as that
+  format, and responses are sandboxed with a CSP.
+- **Published default secrets were live (high).** With `SECRET_KEY`/`JWT_SECRET`
+  unset, the app signed sessions and JWTs with the default string in
+  `config.py`, so anyone could forge an API token. Unset or placeholder secrets
+  are now replaced with a generated key persisted under the instance
+  directory, and the JWT key is derived separately.
+- **AAD did not bind file identity, algorithm, format, or dimensions
+  (medium).** Ciphertext and metadata could be swapped between records, and a
+  row's type or size edited, without detection. New **envelope version 3**
+  seals owner, asset id, algorithm, wrap type, MIME type, format, and
+  dimensions, and the web app checks the row against that sealed context
+  before unwrapping. Version 1 files still decrypt (fixtures in
+  `tests/fixtures/`).
+- **Capability-link download cap raced (medium).** Check-then-increment let
+  concurrent requests exceed `max_downloads`. The download is now reserved
+  with one atomic `UPDATE` before decryption, and handed back if decryption
+  fails.
+- **Location metadata survived stripping (medium).** GPS in XMP (JPEG, PNG),
+  PNG text chunks, and JPEG/GIF comments all passed through. Stripping now
+  covers every metadata container, re-encodes TIFF and GIF always, keeps
+  animation frames, and applies EXIF orientation.
+- **Backup restore amplification (medium).** One blob could be referenced many
+  times, turning a 64 MiB zip into unbounded disk writes. Each blob may now be
+  referenced once, a restore is capped at 1000 assets, and every entry is
+  validated before anything is written.
+- **The documented HMAC audit chain did not exist (medium).** The README and
+  security model promised it, but the code wrote plain rows. Events are now
+  HMAC-chained per account, verified on `/audit` and `/api/audit`, and legacy
+  rows are sealed once on upgrade.
+- **Logout did not end the session (low).** Sessions lived only in the signed
+  cookie, so a copied cookie kept working after logout. Sessions are now bound
+  to a server-side row that logout and password changes delete, with a 7-day
+  absolute lifetime.
+- **Hostile image headers caused HTTP 500 (low).** Pillow's
+  `DecompressionBombError` and truncated-file errors escaped the upload
+  handler. They are now clean rejections, and only allow-listed decoders run.
+- **Login timing revealed whether a username exists (low).** Unknown users now
+  get a dummy hash check.
+- **Malformed envelope fields crashed the CLI (low).** A non-string nonce or a
+  non-dict wrap raised `AttributeError`. `validate_envelope()` now checks every
+  field (strict base64, bounded sizes) first.
+- **JWTs without a `ver` claim were accepted (low, hardening).** `ver`
+  defaulted to 1. `exp`, `iat`, `iss`, `sub`, and an integer `ver` are now
+  required.
+
+### Changed
+- Every HTML page sends a strict CSP (no inline script), `X-Frame-Options:
+  DENY`, and `Referrer-Policy: no-referrer`. Session cookies are `SameSite=Lax`,
+  plus `Secure` with `IES_SECURE_COOKIES=1`. The dashboard script moved to
+  `static/js/`.
+- Restoring the same backup twice no longer duplicates images. Version 3
+  images can only be restored into the account that exported them.
+- `ies inspect` prints the sealed context.
+- `JWT_SECRET` now defaults to a key derived from `SECRET_KEY` rather than the
+  same value, so JWTs issued before upgrading (2-hour lifetime) stop working
+  once.
+- Existing browser sessions sign in again once after upgrading (they have no
+  server-side session row).
+- `docs/SECURITY_MODEL.md` was rewritten to match the code claim for claim.
+
 ### Fixed
+- **`ies decrypt` could not open a `.ies` file downloaded from the web vault.**
+  The CLI only rebuilt the AAD for files it had written itself and used empty
+  AAD for everything else, so every web download and capability-link blob failed
+  authentication. AAD reconstruction now lives in `crypto.aad_from_metadata()`
+  and is shared by the CLI and the web app.
+- Passing a non-RSA PEM to `ies encrypt --public-key` (or storing one as a
+  user key) crashed with `AttributeError`; it is now a clean `CryptoError`.
+- Removed `static/js/auth.js` and `static/js/dashboard.js`, orphaned by the
+  merge: no template loaded them and they targeted elements that do not exist.
+- README listed features from the discarded v1.0 lineage (tags, time-locks, an
+  HMAC audit chain, JWT audience checks) that this codebase does not have; the
+  feature list now matches the code. `SECURITY.md` claimed new assets use a
+  "version 2" envelope; they use version 1.
 - **Repaired a broken merge that left the package non-functional.** Commit
   `4149200` spliced two independently-developed lineages (both branched from the
   initial commit) whose modules were incompatible. The textual merge succeeded
@@ -40,6 +190,14 @@
 - `SECURITY.md`, and a security model section documenting both trust boundaries.
 
 ### Changed
+- mypy now runs in CI and is clean; fixing it surfaced the RSA key-type bug
+  above. `hypothesis` and `mypy` join the `dev` extra.
+- The `pip-audit` CI job could never pass: with `--strict` it tried to audit
+  this package itself, which is not on PyPI. It now audits `requirements.txt`.
+- Added a Claude Code SessionStart hook (`.claude/settings.json`,
+  `scripts/session-start.sh`) that builds a project venv with Pillow and the
+  dev tools in cloud sessions, and a `CLAUDE.md` describing the layout,
+  commands, and envelope format.
 - CI now runs a 3.10-3.13 matrix, `ruff check`, `ruff format --check`, coverage
   gated at 80%, and a `pip-audit` dependency scan.
 

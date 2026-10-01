@@ -31,8 +31,8 @@ def _tiff() -> bytes:
 
 def test_inspect_accepts_an_ordinary_png():
     info = _inspect_image(_png(80, 48), allowed_formats={"PNG"}, max_pixels=10_000)
-    assert info["format"] == "PNG"
-    assert (info["width"], info["height"]) == (80, 48)
+    assert info.format == "PNG"
+    assert (info.width, info.height) == (80, 48)
 
 
 def test_inspect_refuses_images_over_the_pixel_ceiling():
@@ -50,9 +50,9 @@ def test_pixel_ceiling_is_checked_before_any_decode(monkeypatch):
     import image_encryption_system.web as web
 
     def explode(*_args, **_kwargs):
-        raise AssertionError("EXIF stripping ran before the size check")
+        raise AssertionError("Metadata stripping ran before the size check")
 
-    monkeypatch.setattr(web, "_strip_image_exif", explode)
+    monkeypatch.setattr(web, "_strip_image_metadata", explode)
 
     with pytest.raises(UnsupportedImageError):
         _inspect_image(_png(400, 400), allowed_formats={"PNG"}, max_pixels=1000)

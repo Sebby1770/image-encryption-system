@@ -2,8 +2,8 @@
 
 ## Supported version
 
-Security fixes are developed against the latest release. Version 1 envelopes
-remain readable for migration, but new assets use the hardened version 2 format.
+Security fixes are developed against the latest release. Every envelope format
+the vault has ever written stays decryptable.
 
 ## Reporting a vulnerability
 

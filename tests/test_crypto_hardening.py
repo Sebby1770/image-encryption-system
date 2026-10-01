@@ -13,7 +13,7 @@ import pytest
 from image_encryption_system.crypto import (
     AES_GCM_PASSPHRASE,
     MAX_SCRYPT_MEMORY_BYTES,
-    SCRYPT_N,
+    MIN_SCRYPT_N,
     CryptoError,
     decrypt_image_bytes,
     encrypt_image_bytes,
@@ -66,7 +66,7 @@ def test_downgraded_scrypt_work_factor_is_refused():
 
 def test_non_power_of_two_work_factor_is_refused():
     ciphertext, metadata = _wrapped()
-    metadata["key_wrap"]["n"] = SCRYPT_N + 1
+    metadata["key_wrap"]["n"] = MIN_SCRYPT_N + 1
 
     with pytest.raises(CryptoError, match="Scrypt"):
         decrypt_image_bytes(ciphertext, metadata, passphrase=PASSPHRASE)

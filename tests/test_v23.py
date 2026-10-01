@@ -12,7 +12,7 @@ from helpers import (
 from PIL import Image
 
 from image_encryption_system.cli import main
-from image_encryption_system.crypto import cli_aad, decrypt_image_bytes, unpack_ies
+from image_encryption_system.crypto import decrypt_image_bytes, unpack_ies
 
 
 def test_capability_link_decrypt_and_max_downloads(tmp_path) -> None:
@@ -159,7 +159,6 @@ def test_integrity_hash_and_cli_rewrap(tmp_path, capsys) -> None:
         ciphertext,
         metadata,
         passphrase="new-secret-pass",
-        aad=cli_aad("IN.png"),
     )
     assert restored.startswith(b"\x89PNG")
 

@@ -76,8 +76,9 @@ def test_download_ciphertext_ies_and_delete(tmp_path) -> None:
     from image_encryption_system.crypto import decrypt_image_bytes, unpack_ies
 
     ciphertext, metadata = unpack_ies(download.data)
-    aad = f"user={asset.user_id}|filename=secret.png|mime={asset.mime_type}".encode()
-    restored = decrypt_image_bytes(ciphertext, metadata, passphrase="image passphrase", aad=aad)
+    assert metadata["context"]["owner"] == asset.user_id
+    assert metadata["context"]["filename"] == "secret.png"
+    restored = decrypt_image_bytes(ciphertext, metadata, passphrase="image passphrase")
     assert restored == sample_png()
 
     deleted = client.post(f"/images/{asset.id}/delete", follow_redirects=True)

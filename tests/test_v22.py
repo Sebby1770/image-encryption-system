@@ -47,6 +47,7 @@ def test_password_change_invalidates_old_session_and_jwt(tmp_path) -> None:
         app.config["JWT_SECRET"],
         algorithms=["HS256"],
         issuer=app.config["JWT_ISSUER"],
+        audience=app.config["JWT_AUDIENCE"],
     )
     assert payload["ver"] == 1
     assert alice.get("/api/images", headers={"Authorization": f"Bearer {token}"}).status_code == 200
@@ -89,6 +90,7 @@ def test_password_change_invalidates_old_session_and_jwt(tmp_path) -> None:
         app.config["JWT_SECRET"],
         algorithms=["HS256"],
         issuer=app.config["JWT_ISSUER"],
+        audience=app.config["JWT_AUDIENCE"],
     )
     assert new_payload["ver"] == 2
     listed = alice.get("/api/images", headers={"Authorization": f"Bearer {new_token}"})
