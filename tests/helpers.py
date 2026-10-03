@@ -1,4 +1,7 @@
 import secrets
+import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from io import BytesIO
 
 from PIL import Image
@@ -28,6 +31,21 @@ def make_app(tmp_path, **overrides):
     }
     config.update(overrides)
     return create_app(config)
+
+
+@contextmanager
+def raw_db(tmp_path) -> Iterator[sqlite3.Connection]:
+    """Edit a ``make_app`` vault's database directly, bypassing the store.
+
+    Commits on success and always closes: a bare ``with sqlite3.connect()``
+    block leaves the connection open until garbage collection.
+    """
+    connection = sqlite3.connect(tmp_path / "vault.sqlite3")
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
 
 
 def csrf_token(client) -> str:

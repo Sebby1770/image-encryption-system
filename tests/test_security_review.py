@@ -10,7 +10,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import sqlite3
 import struct
 import threading
 import zipfile
@@ -30,6 +29,7 @@ from helpers import (
     login,
     logout,
     make_app,
+    raw_db,
     register,
     sample_png,
     with_csrf,
@@ -536,7 +536,7 @@ def test_swapping_ciphertext_and_metadata_between_files_fails(tmp_path) -> None:
     second_blob = (vault / second.stored_filename).read_bytes()
     (vault / first.stored_filename).write_bytes(second_blob)
     (vault / second.stored_filename).write_bytes(first_blob)
-    with sqlite3.connect(tmp_path / "vault.sqlite3") as db:
+    with raw_db(tmp_path) as db:
         for target, source in ((first, second), (second, first)):
             db.execute(
                 "UPDATE encrypted_assets SET metadata_json = ? WHERE id = ?",
@@ -554,7 +554,7 @@ def test_tampering_with_recorded_format_or_dimensions_fails(tmp_path) -> None:
     register(client, "alice")
     encrypt_png(client)
     asset = _store(app).list_assets(_user(app, "alice").id)[0]
-    with sqlite3.connect(tmp_path / "vault.sqlite3") as db:
+    with raw_db(tmp_path) as db:
         db.execute(
             "UPDATE encrypted_assets SET image_format = 'GIF', mime_type = 'image/gif', "
             "width = 4000 WHERE id = ?",
@@ -580,7 +580,7 @@ def test_audit_chain_detects_an_edited_event(tmp_path) -> None:
     alice = _user(app, "alice")
     assert store.verify_audit_chain(alice.id).ok
 
-    with sqlite3.connect(tmp_path / "vault.sqlite3") as db:
+    with raw_db(tmp_path) as db:
         db.execute(
             "UPDATE audit_events SET action = 'login' WHERE action = 'upload' AND user_id = ?",
             (alice.id,),
@@ -599,7 +599,7 @@ def test_audit_chain_detects_a_deleted_event(tmp_path) -> None:
     login(client, "alice")
     store = _store(app)
     alice = _user(app, "alice")
-    with sqlite3.connect(tmp_path / "vault.sqlite3") as db:
+    with raw_db(tmp_path) as db:
         db.execute("DELETE FROM audit_events WHERE action = 'upload' AND user_id = ?", (alice.id,))
 
     assert not store.verify_audit_chain(alice.id).ok
@@ -876,7 +876,7 @@ def test_revoked_and_expired_shares_stop_decrypting(tmp_path) -> None:
     assert bob_decrypts() == 403
 
     _share_with_bob(app, alice, asset.id)
-    with sqlite3.connect(tmp_path / "vault.sqlite3") as db:
+    with raw_db(tmp_path) as db:
         db.execute("UPDATE shares SET expires_at = '2000-01-01T00:00:00+00:00'")
     assert bob_decrypts() == 403
 
