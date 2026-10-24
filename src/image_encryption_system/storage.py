@@ -1267,16 +1267,31 @@ class VaultStore:
             "favorite": bool(item.get("favorite")),
         }
 
-    def _connect(self) -> sqlite3.Connection:
+    def _open_connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
     @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """A connection that commits on success, rolls back on error, then closes.
+
+        A bare ``with sqlite3.connect(...)`` block only ends the transaction;
+        it never closes the connection, which then holds a file descriptor
+        until garbage collection.
+        """
+        connection = self._open_connection()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
+    @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
         """A connection holding the database write lock until commit."""
-        connection = self._connect()
+        connection = self._open_connection()
         connection.isolation_level = None
         try:
             connection.execute("BEGIN IMMEDIATE")

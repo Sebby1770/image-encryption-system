@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Every storage operation leaked its SQLite connection.** `VaultStore` used
+  `with self._connect() as db:`, and a sqlite3 connection's context manager only
+  commits or rolls back — it never closes. Each call held a file descriptor (and
+  could delay releasing SQLite locks) until garbage collection; the test suite
+  raised thousands of `ResourceWarning: unclosed database`. `_connect()` is now
+  a context manager that commits on success, rolls back on error, and always
+  closes, and `_transaction()` closes in `finally`. A test tracks every
+  connection the store opens across all of its operations and asserts each one
+  is closed. Measured on two test modules: 680 warnings before, 0 after.
+
 ### Hardening carried over from the parallel v3.0 line (#6, #10)
 - **Registration was unthrottled**, and each one generates an RSA-3072 key
   pair, so anyone could burn server CPU without an account. Registration is now

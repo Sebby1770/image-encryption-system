@@ -7,7 +7,16 @@ import zipfile
 from io import BytesIO
 
 import pytest
-from helpers import PASSWORD, bearer_headers, encrypt_png, login, make_app, register, with_csrf
+from helpers import (
+    PASSWORD,
+    bearer_headers,
+    encrypt_png,
+    login,
+    make_app,
+    raw_db,
+    register,
+    with_csrf,
+)
 
 from image_encryption_system.crypto import (
     AES_GCM_PASSPHRASE,
@@ -162,12 +171,10 @@ def test_audit_chain_is_reported_on_the_page_and_api(tmp_path) -> None:
 
 
 def test_legacy_audit_rows_are_sealed_on_upgrade(tmp_path) -> None:
-    import sqlite3
-
     app = make_app(tmp_path)
     client = app.test_client()
     register(client, "alice")
-    with sqlite3.connect(tmp_path / "vault.sqlite3") as db:
+    with raw_db(tmp_path) as db:
         db.execute("UPDATE audit_events SET prev_hash = NULL, chain_hash = NULL")
 
     upgraded = make_app(tmp_path)
