@@ -11,7 +11,7 @@ from image_encryption_system.crypto import (
     encrypt_image_bytes,
     generate_rsa_key_pair,
     pack_ies,
-    reencrypt_private_key_pem,
+    rewrap_private_key,
     unpack_ies,
     unwrap_data_key,
     wrap_data_key_passphrase,
@@ -122,11 +122,11 @@ def test_unpack_ies_rejects_garbage() -> None:
         unpack_ies(b"not-an-ies-file")
 
 
-def test_reencrypt_private_key_pem_uses_new_password() -> None:
+def test_rewrap_private_key_uses_new_password() -> None:
     plaintext = sample_png()
     private_pem, public_pem = generate_rsa_key_pair("old password 1")
     encrypted = encrypt_image_bytes(plaintext, RSA_HYBRID, public_key_pem=public_pem)
-    rotated = reencrypt_private_key_pem(private_pem, "old password 1", "new password 2")
+    rotated = rewrap_private_key(private_pem, "old password 1", "new password 2")
 
     with pytest.raises(CryptoError):
         decrypt_image_bytes(

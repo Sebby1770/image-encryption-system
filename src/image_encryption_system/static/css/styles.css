@@ -17,6 +17,12 @@
   box-sizing: border-box;
 }
 
+/* Component display rules (.button is inline-flex, panels are grids) would
+   otherwise beat the hidden attribute that scripts toggle. */
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   background: var(--bg);
@@ -550,4 +556,153 @@ input:disabled {
 .password-meter progress {
   width: 100%;
   height: 6px;
+}
+
+/* End-to-end mode */
+
+.badge {
+  border-radius: 999px;
+  display: inline-block;
+  font-size: 0.74rem;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  padding: 2px 8px;
+  vertical-align: 1px;
+}
+
+.badge-e2e {
+  background: var(--mint);
+  border: 1px solid #9ad8c6;
+  color: var(--accent-strong);
+}
+
+.asset-card-e2e {
+  border-left: 3px solid var(--accent);
+}
+
+.mode-switch {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 10px 12px 12px;
+}
+
+.mode-switch legend {
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-weight: 800;
+  padding: 0 4px;
+}
+
+.mode-option {
+  align-items: center;
+  cursor: pointer;
+  display: flex;
+  flex-direction: row;
+  gap: 8px;
+}
+
+.mode-option input {
+  width: auto;
+}
+
+.mode-option input:disabled + span {
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+.e2e-status {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--accent);
+  border-radius: 8px;
+  font-weight: 600;
+  margin: 0 0 16px;
+  padding: 10px 14px;
+}
+
+.e2e-status[data-kind="error"] {
+  border-left-color: var(--red);
+  color: var(--red);
+}
+
+.dialog-result {
+  background: var(--mint);
+  border-radius: 8px;
+  margin: 0;
+  padding: 10px 12px;
+}
+
+.link-output {
+  display: grid;
+  gap: 8px;
+}
+
+.link-output input {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.82rem;
+}
+
+.fingerprint {
+  background: #f0f4f2;
+  border-radius: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.95rem;
+  letter-spacing: 0.04em;
+  padding: 10px 12px;
+  word-spacing: 0.2em;
+}
+
+.viewer {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  max-height: calc(100vh - 48px);
+  max-width: min(960px, calc(100vw - 32px));
+  padding: 18px;
+}
+
+.viewer::backdrop {
+  background: rgba(23, 33, 31, 0.6);
+}
+
+.viewer-head,
+.viewer-foot {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.viewer-head h2 {
+  font-size: 1.05rem;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.viewer img,
+.link-result img {
+  background: repeating-conic-gradient(#eef2f0 0% 25%, #ffffff 0% 50%) 50% / 20px 20px;
+  border-radius: 8px;
+  display: block;
+  margin: 14px auto;
+  max-height: calc(100vh - 220px);
+  max-width: 100%;
+}
+
+.link-result {
+  display: grid;
+  gap: 8px;
+  justify-items: start;
+  margin: 16px 0 0;
+}
+
+.security-panel ul + h2 {
+  margin-top: 24px;
+}
+
+[data-e2e-link] #link-decrypt {
+  margin: 10px 0 14px;
 }

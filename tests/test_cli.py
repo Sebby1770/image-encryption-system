@@ -41,7 +41,7 @@ def test_cli_keygen_rsa_round_trip(tmp_path) -> None:
     source = tmp_path / "photo.png"
     vault = tmp_path / "photo.ies"
     restored = tmp_path / "photo-out.png"
-    private_key = tmp_path / "ies-private.pem"
+    private_key = tmp_path / "ies-private.key"
     public_key = tmp_path / "ies-public.pem"
     _png(source, "#b7791f")
 
@@ -59,7 +59,8 @@ def test_cli_keygen_rsa_round_trip(tmp_path) -> None:
         )
         == 0
     )
-    assert b"BEGIN" in private_key.read_bytes()
+    # Scrypt-sealed by default; see test_private_key_wrap for the PEM option.
+    assert b'"format":"ies-private-key"' in private_key.read_bytes()
     assert b"BEGIN PUBLIC KEY" in public_key.read_bytes()
 
     assert main(["encrypt", str(source), "--public-key", str(public_key), "--out", str(vault)]) == 0

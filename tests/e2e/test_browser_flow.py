@@ -7,53 +7,18 @@ Chromium build is unavailable; CI installs both in the `e2e` job.
 
 from __future__ import annotations
 
-import os
 import sys
-import threading
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-playwright_sync = pytest.importorskip("playwright.sync_api")
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from helpers import make_app, sample_png  # noqa: E402
+from helpers import sample_png  # noqa: E402
 
 pytestmark = pytest.mark.e2e
 
 PASSWORD = "correct horse battery"
 IMAGE_PASS = "a very secret image passphrase"
-# Preinstalled browsers in Claude Code cloud sessions (see CLAUDE.md).
-FALLBACK_CHROMIUM = "/opt/pw-browsers/chromium"
-
-
-@pytest.fixture()
-def live_server(tmp_path) -> Iterator[str]:
-    from werkzeug.serving import make_server
-
-    app = make_app(tmp_path, CSRF_ENABLED=True)
-    server = make_server("127.0.0.1", 0, app, threaded=True)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f"http://127.0.0.1:{server.server_port}"
-    finally:
-        server.shutdown()
-
-
-@pytest.fixture()
-def browser():
-    with playwright_sync.sync_playwright() as playwright:
-        executable = os.getenv("IES_CHROMIUM_EXECUTABLE")
-        try:
-            launched = playwright.chromium.launch(executable_path=executable or None)
-        except playwright_sync.Error:
-            if executable or not Path(FALLBACK_CHROMIUM).exists():
-                pytest.skip("no Chromium build available for Playwright")
-            launched = playwright.chromium.launch(executable_path=FALLBACK_CHROMIUM)
-        yield launched
-        launched.close()
 
 
 def _new_user_page(browser, base_url: str, username: str, problems: list[str]):
@@ -87,6 +52,8 @@ def test_share_then_revoke_locks_the_recipient_out(live_server, browser, tmp_pat
     alice = _new_user_page(browser, live_server, "alice", problems)
 
     # Alice uploads an image with a passphrase.
+    alice.wait_for_function("() => !document.querySelector('#mode-browser').disabled")
+    alice.check("#mode-server")
     alice.set_input_files("input[name=image]", str(image))
     alice.select_option("#algorithm-select", "AES-GCM")
     alice.fill("#passphrase-field input", IMAGE_PASS)

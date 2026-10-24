@@ -24,8 +24,18 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Install package
         run: pip install -e ".[dev]"
+
+      # The browser crypto modules, on their own and (inside pytest, via
+      # tests/test_browser_crypto.py) against crypto.py, hashlib, and Pillow.
+      - name: Test browser crypto
+        run: node --test tests/js/*.test.mjs
 
       - name: Lint
         run: ruff check src tests scripts run.py

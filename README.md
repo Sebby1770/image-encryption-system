@@ -3,17 +3,35 @@
 **Live site:** [https://sebby1770.github.io/image-encryption-system/](https://sebby1770.github.io/image-encryption-system/)
 
 A Flask image vault that encrypts photos with **AES-256-GCM** before they touch
-disk. Per-image data keys are wrapped with Scrypt+AES or RSA-OAEP. Version
-**2.3.0** adds capability link shares, notes/favorites, ciphertext integrity
-checks, session idle timeout, audit CSV, and CLI rewrap/hash.
+disk. Per-image data keys are wrapped with Scrypt+AES or RSA-OAEP.
+
+**End-to-end mode** (the default) encrypts in your browser: metadata is stripped,
+the image sealed, shared, linked, and decrypted in the page, and the server only
+ever stores ciphertext and key wraps it cannot open. Server mode is still there
+for TIFF and for clients without JavaScript.
 
 ## Features
 
+- **End-to-end encryption in the browser.** WebCrypto AES-256-GCM, a pure
+  JavaScript Scrypt in a Web Worker, and RSA-OAEP, producing the same `.ies`
+  envelope the server and CLI read. Upload, view, share, capability links, and
+  passphrase rotation all run in the page; the server refuses to unwrap an
+  end-to-end key even when handed the right secret.
+- **Metadata stripped before encryption, in the browser too:** EXIF and GPS,
+  XMP, IPTC, MPF, PNG text and C2PA chunks, JPEG thumbnails, comments, and data
+  appended after the image, with every pixel kept.
+- **End-to-end links** keep their key in the URL fragment, which browsers never
+  send; the server counts downloads but cannot open what it serves.
+- **Key fingerprints** for comparing a recipient's key out of band before
+  trusting a share.
+- **Account private keys sealed with Scrypt + AES-GCM**, not OpenSSL's 2,048-round
+  PBKDF2, and written `0600`. Older PEM keys keep working and are resealed at
+  the next sign-in.
 - AES-256-GCM encryption for PNG, JPEG, WEBP, GIF, BMP, and TIFF images, with a
   fresh 256-bit data key per image.
 - Data keys wrapped with Scrypt + AES-GCM (passphrase mode) or RSA-OAEP-SHA256
   (hybrid mode, 3072-bit per-user key pair generated at registration; the
-  private key is encrypted with the account password).
+  private key is sealed with the account password).
 - Share with another username by re-wrapping the **same** data key with their
   RSA public key. Recipients decrypt with **their** password. Revoke at any time,
   with optional expiry (`expires_hours` / `expires_days`).
@@ -84,14 +102,40 @@ ies inspect out.bin
 ies verify out.bin --passphrase 'a long secret'
 ies hash out.bin
 ies rewrap out.bin --old-passphrase 'a long secret' --new-passphrase 'rotated' --out rotated.ies
-ies keygen --passphrase 'account password' --out-private key.pem --out-public pub.pem
+ies keygen --passphrase 'account password' --out-private key.key --out-public pub.pem
 ies encrypt IN.png --public-key pub.pem --out photo.ies
-ies decrypt photo.ies --private-key key.pem --passphrase 'account password' --out restored.png
+ies decrypt photo.ies --private-key key.key --passphrase 'account password' --out restored.png
 ```
 
 The CLI talks only to `crypto.py`. It does not start Flask or write decrypted
 images unless you pass `--out`. `inspect` prints algorithm and version only.
-`verify` unwraps the data key and exits 0 or 1.
+`verify` unwraps the data key and exits 0 or 1. `keygen` seals the private key
+with Scrypt; `--pem` writes OpenSSL-compatible PKCS#8 instead, which is far
+cheaper to brute-force. A `.ies` downloaded from an end-to-end image opens in
+the CLI like any other.
+
+## End-to-end mode
+
+Choose **In this browser** (the default once the page's module loads):
+
+1. The browser strips capture metadata, encrypts the image with a fresh data
+   key, and wraps that key with your passphrase (Scrypt) or your account public
+   key (RSA-OAEP).
+2. Only the ciphertext and the envelope are uploaded. The server validates
+   everything it can without the key and stores it.
+3. **Decrypt in browser** fetches the ciphertext and opens it in the page. For
+   RSA images and anything shared with you, your account password unlocks your
+   private key in the page, once per visit; it is never sent.
+4. **Share** re-wraps the data key to the recipient's public key in your
+   browser and shows their key fingerprint. They can read the same value on
+   their Account page.
+5. **Link** creates a URL whose key is after the `#`. Anyone with the whole link
+   can decrypt it in their browser, within its expiry and download cap.
+
+End-to-end mode protects against a server that is curious, compromised later,
+or leaking its storage. It cannot protect against a server that is malicious
+while you use it, since that server supplies the JavaScript. See
+[docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md).
 
 ## Sharing
 
@@ -223,9 +267,22 @@ pip install -e '.[e2e]' && python -m playwright install chromium
 pytest -m e2e tests/e2e
 ```
 
-CI runs lint, format, mypy, and pytest (85% coverage gate, 200 Hypothesis
-examples per property) on Python 3.10 through 3.13, the browser test in its own
-job, and a `pip-audit` dependency scan.
+The browser crypto has its own tests. `node --test` covers the JavaScript
+directly (including the RFC 7914 Scrypt vectors), and
+`tests/test_browser_crypto.py` runs the real modules under Node against
+`crypto.py`, `hashlib.scrypt`, and Pillow: envelopes open in both directions,
+AADs match byte for byte on hostile Unicode, and stripped images decode to
+identical pixels with no metadata left. A second browser test drives the whole
+end-to-end flow and records every request to prove that no plaintext,
+passphrase, account password, or link key reaches the server.
+
+```bash
+node --test tests/js/*.test.mjs
+```
+
+CI runs lint, format, mypy, the Node tests, and pytest (85% coverage gate, 200
+Hypothesis examples per property) on Python 3.10 through 3.13, the browser
+tests in their own job, and a `pip-audit` dependency scan.
 
 ## Project Structure
 
@@ -239,7 +296,9 @@ image-encryption-system/
     security.py        # login guard, request throttles, password policy
     templates/         # HTML views
     static/css/        # UI styling
+    static/js/         # ies-crypto.js, ies-image.js, scrypt worker, page modules
   tests/               # pytest coverage
+  tests/js/            # node --test suite and the harness Python tests drive
   docs/                # Threat model
 ```
 
