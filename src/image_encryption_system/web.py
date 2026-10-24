@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+import json
 import secrets
 import struct
 import time
@@ -35,17 +36,26 @@ from markupsafe import Markup, escape
 from PIL import Image, ImageOps, ImageSequence, UnidentifiedImageError
 from werkzeug.exceptions import RequestEntityTooLarge
 
+from . import crypto
 from .config import IMAGE_MIME_TYPES, PLACEHOLDER_SECRETS, Config
 from .crypto import (
     AES_GCM_PASSPHRASE,
     ENVELOPE_V3,
+    GCM_TAG_BYTES,
+    MAX_METADATA_BYTES,
+    MIN_SCRYPT_N,
     RSA_HYBRID,
+    WRAP_RSA,
+    WRAP_SCRYPT,
     CryptoError,
     decrypt_image_bytes,
     encrypt_image_bytes,
+    is_legacy_private_key,
     pack_ies,
+    public_key_fingerprint,
     unwrap_data_key,
     validate_envelope,
+    validate_key_wrap,
     web_aad,
     wrap_data_key_passphrase,
     wrap_data_key_rsa,
@@ -84,6 +94,27 @@ PAGE_CSP = (
 # load anything, or be framed, and it is never written to a cache.
 PLAINTEXT_CSP = "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox"
 SECRET_KEY_FILENAME = "flask-secret.key"
+# Formats a browser can both encrypt and display again after decrypting. TIFF
+# is server-mode only: browsers (other than Safari) cannot render it.
+END_TO_END_FORMATS = frozenset({"PNG", "JPEG", "WEBP", "GIF", "BMP"})
+END_TO_END_CONTEXT = frozenset(
+    {
+        "asset",
+        "algorithm",
+        "wrap",
+        "owner",
+        "filename",
+        "mime",
+        "format",
+        "width",
+        "height",
+        "source",
+    }
+)
+SERVER_SIDE_REFUSED = (
+    "This image is end-to-end encrypted: open, share, and link it from your browser. "
+    "The server never holds its key."
+)
 
 
 def _resolve_secrets(app: Flask) -> bytes | None:
@@ -179,7 +210,9 @@ def create_app(test_config: dict | None = None) -> Flask:
         if request.path.startswith("/api/") or request.path.startswith("/l/"):
             return None
         expected = session.get("csrf_token") or ""
-        submitted = request.form.get("csrf_token") or ""
+        # fetch() calls send the token as a header; a cross-site page cannot set
+        # one without a CORS preflight this app never answers.
+        submitted = request.form.get("csrf_token") or request.headers.get("X-CSRF-Token") or ""
         if not expected or not submitted or not hmac.compare_digest(str(expected), str(submitted)):
             if _wants_json():
                 return jsonify({"error": "missing or invalid CSRF token"}), 400
@@ -276,7 +309,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         if not user:
             return _failed_login(app, username, json_mode=False)
 
-        _login_success(app, store, user)
+        _login_success(app, store, user, password)
         _establish_session(store, user)
         flash("Signed in.", "success")
         return redirect(url_for("dashboard"))
@@ -293,7 +326,16 @@ def create_app(test_config: dict | None = None) -> Flask:
     @app.get("/account/password")
     @login_required(store)
     def password_form() -> ResponseReturnValue:
-        return render_template("account.html")
+        user = _require_user(store)
+        try:
+            legacy_key = is_legacy_private_key(store.read_private_key(user.id))
+        except (CryptoError, OSError):
+            legacy_key = False
+        return render_template(
+            "account.html",
+            fingerprint=public_key_fingerprint(store.read_public_key(user.id)),
+            legacy_key=legacy_key,
+        )
 
     @app.post("/account/password")
     @login_required(store)
@@ -368,6 +410,9 @@ def create_app(test_config: dict | None = None) -> Flask:
             query=query,
             selected_algorithm=algorithm or "",
             favorites_only=favorites_only,
+            scrypt_n=crypto.SCRYPT_N,
+            max_upload_bytes=int(app.config["MAX_CONTENT_LENGTH"]),
+            max_image_pixels=int(app.config["MAX_IMAGE_PIXELS"]),
         )
 
     @app.post("/images")
@@ -380,6 +425,16 @@ def create_app(test_config: dict | None = None) -> Flask:
 
         if upload is None or not upload.filename:
             flash("Choose an image to encrypt.", "error")
+            return redirect(url_for("dashboard"))
+        if request.form.get("mode") == "browser":
+            # End-to-end was chosen but the page posted the plaintext anyway (the
+            # module failed to run). Never store what the user meant to keep
+            # from the server.
+            flash(
+                "End-to-end encryption did not run in your browser, so nothing was stored. "
+                "Reload the page and try again, or choose server mode.",
+                "error",
+            )
             return redirect(url_for("dashboard"))
 
         if not _allowed_extension(upload.filename, app.config["ALLOWED_EXTENSIONS"]):
@@ -443,6 +498,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             return redirect(url_for("dashboard")), 429
         try:
             asset, share = _accessible_asset(store, asset_id, user)
+            _require_server_side(asset)
             ciphertext = store.read_ciphertext(asset)
             store.ciphertext_sha256(asset)
             metadata = dict(asset.metadata)
@@ -537,6 +593,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         new_passphrase = request.form.get("new_passphrase") or ""
         try:
             asset = _owned_asset(store, asset_id, user)
+            _require_server_side(asset)
             if asset.algorithm != AES_GCM_PASSPHRASE:
                 raise ValueError("Only AES-GCM passphrase wraps can be rotated this way.")
             metadata = dict(asset.metadata)
@@ -798,6 +855,219 @@ def create_app(test_config: dict | None = None) -> Flask:
         flash(f"Restored {restored} encrypted image(s).", "success")
         return redirect(url_for("dashboard"))
 
+    # ----------------------------------------------------------------------
+    # End-to-end mode. The browser encrypts, decrypts, shares, and links; these
+    # routes only ever receive ciphertext and key wraps the server cannot open.
+
+    @app.post("/images/sealed")
+    @login_required(store)
+    def upload_sealed_image() -> ResponseReturnValue:
+        user = _require_user(store)
+        upload = request.files.get("ciphertext")
+        if upload is None:
+            return _json_error("Missing ciphertext.", 400)
+        try:
+            ciphertext = upload.read()
+            metadata, context = _check_sealed_upload(
+                store,
+                user,
+                request.form.get("envelope") or "",
+                ciphertext,
+                max_pixels=app.config["MAX_IMAGE_PIXELS"],
+            )
+            asset = store.save_asset(
+                user_id=user.id,
+                original_filename=context["filename"],
+                algorithm=metadata["algorithm"],
+                mime_type=context["mime"],
+                image_format=context["format"],
+                width=context["width"],
+                height=context["height"],
+                metadata=metadata,
+                ciphertext=ciphertext,
+                asset_uuid=context["asset"],
+            )
+        except (CryptoError, UnsupportedImageError, ValueError) as exc:
+            return _json_error(str(exc), 400)
+        _audit(store, user.id, "upload", asset.id)
+        flash(
+            "Image encrypted in your browser and stored. The server only received ciphertext.",
+            "success",
+        )
+        return jsonify({"ok": True, "asset_id": asset.id}), 201
+
+    @app.get("/images/<int:asset_id>/sealed")
+    @login_required(store)
+    def download_sealed(asset_id: int) -> ResponseReturnValue:
+        """The ciphertext with the caller's own wrap: the owner's, or their share."""
+        user = _require_user(store)
+        try:
+            asset, share = _accessible_asset(store, asset_id, user)
+            store.ciphertext_sha256(asset)
+            _check_sealed_context(asset, primary_wrap=share is None)
+            metadata = dict(asset.metadata)
+            if share is not None:
+                metadata["key_wrap"] = share.key_wrap
+            blob = pack_ies(store.read_ciphertext(asset), metadata)
+        except PermissionError as exc:
+            return _json_error(str(exc), 403)
+        except LookupError as exc:
+            return _json_error(str(exc), 404)
+        except (CryptoError, ValueError) as exc:
+            return _json_error(str(exc), 400)
+        _audit(store, user.id, "fetch", asset.id)
+        return _ciphertext_response(blob, f"{asset.original_filename}.ies")
+
+    @app.post("/account/private-key")
+    @login_required(store)
+    def sealed_private_key() -> ResponseReturnValue:
+        """The account's Scrypt-sealed private key, for unwrapping in the browser.
+
+        POST with a CSRF token, throttled like decryption, never cached. The
+        password that opens it is typed into the page and never sent here.
+        """
+        user = _require_user(store)
+        if not _throttle(app, "decrypt", f"user:{user.id}"):
+            return _json_error(
+                "Too many decryption attempts. Wait a few minutes and try again.", 429
+            )
+        try:
+            blob = store.read_private_key(user.id)
+        except (CryptoError, OSError) as exc:
+            return _json_error(str(exc), 400)
+        if is_legacy_private_key(blob):
+            return _json_error(
+                "Sign out and back in once to upgrade your key protection, then try again.", 409
+            )
+        _audit(store, user.id, "key_fetch")
+        response = jsonify({"owner": user.id, "private_key": json.loads(blob)})
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.get("/users/<username>/public-key")
+    @login_required(store)
+    def user_public_key(username: str) -> ResponseReturnValue:
+        _require_user(store)
+        target = store.get_user_by_username(username)
+        if target is None:
+            return _json_error("No account exists with that username.", 404)
+        return jsonify(
+            {
+                "username": target.username,
+                "public_key": store.read_public_key(target.id).decode("ascii"),
+            }
+        )
+
+    @app.post("/images/<int:asset_id>/shares/sealed")
+    @login_required(store)
+    def share_sealed(asset_id: int) -> ResponseReturnValue:
+        user = _require_user(store)
+        payload = _json_payload()
+        try:
+            asset = _owned_asset(store, asset_id, user)
+            _require_end_to_end(asset)
+            recipient = _resolve_recipient(store, user, str(payload.get("username", "")))
+            key_wrap = payload.get("key_wrap")
+            if validate_key_wrap(key_wrap) != WRAP_RSA:
+                raise CryptoError("A share must wrap the key to the recipient's public key.")
+            assert isinstance(key_wrap, dict)
+            share = store.create_share(
+                asset_id=asset.id,
+                recipient_user_id=recipient.id,
+                key_wrap=key_wrap,
+                expires_at=_parse_share_expiry(
+                    payload.get("expires_hours"), payload.get("expires_days")
+                ),
+            )
+        except PermissionError as exc:
+            return _json_error(str(exc), 403)
+        except LookupError as exc:
+            return _json_error(str(exc), 404)
+        except (CryptoError, ValueError) as exc:
+            return _json_error(str(exc), 400)
+        _audit(store, user.id, "share", asset.id)
+        flash(f"Shared with {recipient.username} end-to-end.", "success")
+        return jsonify(
+            {
+                "ok": True,
+                "share_id": share.id,
+                "username": recipient.username,
+                "expires_at": share.expires_at,
+            }
+        )
+
+    @app.post("/images/<int:asset_id>/links/sealed")
+    @login_required(store)
+    def link_sealed(asset_id: int) -> ResponseReturnValue:
+        user = _require_user(store)
+        payload = _json_payload()
+        try:
+            asset = _owned_asset(store, asset_id, user)
+            _require_end_to_end(asset)
+            key_wrap = payload.get("key_wrap")
+            # Link keys are 256-bit random values, so the KDF floor is plenty.
+            if validate_key_wrap(key_wrap, min_scrypt_n=MIN_SCRYPT_N) != WRAP_SCRYPT:
+                raise CryptoError("A link must wrap the key with its link secret.")
+            assert isinstance(key_wrap, dict)
+            max_downloads = _parse_optional_int(payload.get("max_downloads"))
+            if max_downloads is not None and max_downloads <= 0:
+                raise ValueError("max_downloads must be greater than zero.")
+            token = secrets.token_urlsafe(32)
+            link = store.create_link_share(
+                asset_id=asset.id,
+                token_hash=_hash_link_token(token),
+                key_wrap=key_wrap,
+                expires_at=_parse_share_expiry(
+                    payload.get("expires_hours"), payload.get("expires_days")
+                ),
+                max_downloads=max_downloads,
+                label=str(payload.get("label") or "").strip()[:80],
+            )
+        except PermissionError as exc:
+            return _json_error(str(exc), 403)
+        except LookupError as exc:
+            return _json_error(str(exc), 404)
+        except (CryptoError, ValueError) as exc:
+            return _json_error(str(exc), 400)
+        _audit(store, user.id, "link", asset.id)
+        flash("End-to-end link created. Its key exists only in the link you copied.", "success")
+        return jsonify(
+            {
+                "ok": True,
+                "link_id": link.id,
+                # The browser appends #<secret>; the fragment never reaches us.
+                "url": url_for("open_link_share", token=token, _external=True),
+                "expires_at": link.expires_at,
+                "max_downloads": link.max_downloads,
+            }
+        )
+
+    @app.post("/images/<int:asset_id>/rewrap")
+    @login_required(store)
+    def rewrap_sealed(asset_id: int) -> ResponseReturnValue:
+        user = _require_user(store)
+        payload = _json_payload()
+        try:
+            asset = _owned_asset(store, asset_id, user)
+            _require_end_to_end(asset)
+            if asset.algorithm != AES_GCM_PASSPHRASE:
+                raise ValueError("Only passphrase-wrapped images can be rotated.")
+            key_wrap = payload.get("key_wrap")
+            if validate_key_wrap(key_wrap) != WRAP_SCRYPT:
+                raise CryptoError("A rotated wrap must be a passphrase wrap.")
+            metadata = dict(asset.metadata)
+            metadata["key_wrap"] = key_wrap
+            store.update_asset_metadata(asset.id, user.id, metadata)
+        except PermissionError as exc:
+            return _json_error(str(exc), 403)
+        except LookupError as exc:
+            return _json_error(str(exc), 404)
+        except (CryptoError, ValueError) as exc:
+            return _json_error(str(exc), 400)
+        _audit(store, user.id, "rotate", asset.id)
+        flash("Passphrase wrap rotated in your browser.", "success")
+        return jsonify({"ok": True})
+
     @app.post("/api/token")
     def api_token() -> ResponseReturnValue:
         payload = request.get_json(silent=True) or {}
@@ -811,7 +1081,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         if not user:
             return _failed_login(app, username, json_mode=True)
 
-        _login_success(app, store, user)
+        _login_success(app, store, user, password)
         now = datetime.now(timezone.utc)
         token = jwt.encode(
             {
@@ -929,6 +1199,70 @@ def create_app(test_config: dict | None = None) -> Flask:
         )
 
     return app
+
+
+def _json_payload() -> dict[str, Any]:
+    payload = request.get_json(silent=True)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _ciphertext_response(blob: bytes, download_name: str) -> Response:
+    response = send_file(
+        BytesIO(blob),
+        mimetype="application/octet-stream",
+        download_name=download_name,
+        as_attachment=True,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _check_sealed_upload(
+    store: VaultStore,
+    user: User,
+    raw_envelope: str,
+    ciphertext: bytes,
+    *,
+    max_pixels: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate an envelope sealed in a browser before storing it.
+
+    The server can never decrypt it, so everything that can be checked is: a
+    closed version 3 envelope sealed to this account with a complete browser
+    context; an allow-listed type the browser can display, within the pixel
+    ceiling; a well-formed wrap at today's KDF cost that matches the sealed
+    algorithm; a digest that matches the bytes received; and a fresh asset id.
+    What it cannot check is that the ciphertext really is that image, which is
+    why the browser re-checks the format after decrypting before showing it.
+    """
+    if not raw_envelope or len(raw_envelope.encode("utf-8")) > MAX_METADATA_BYTES:
+        raise ValueError("The envelope is missing or too large.")
+    try:
+        metadata = json.loads(raw_envelope)
+    except json.JSONDecodeError as exc:
+        raise ValueError("The envelope is not valid JSON.") from exc
+    if validate_envelope(metadata) != ENVELOPE_V3:
+        raise CryptoError("End-to-end uploads must use envelope version 3.")
+    context = metadata["context"]
+    if set(context) != END_TO_END_CONTEXT or context["source"] != "browser":
+        raise CryptoError("End-to-end uploads must seal a complete browser context.")
+    if context["owner"] != user.id:
+        raise CryptoError("This envelope is sealed to a different account.")
+    expected_wrap = WRAP_SCRYPT if metadata["algorithm"] == AES_GCM_PASSPHRASE else WRAP_RSA
+    if validate_key_wrap(metadata["key_wrap"]) != expected_wrap or context["wrap"] != expected_wrap:
+        raise CryptoError("The key wrap does not match the sealed algorithm.")
+    image_format = context["format"]
+    if image_format not in END_TO_END_FORMATS or IMAGE_MIME_TYPES[image_format] != context["mime"]:
+        raise UnsupportedImageError("This file type is not accepted.")
+    if context["width"] * context["height"] > max_pixels:
+        raise UnsupportedImageError(f"Image is too large to process (over {max_pixels:,} pixels).")
+    if len(ciphertext) <= GCM_TAG_BYTES:
+        raise CryptoError("Encrypted image ciphertext is truncated.")
+    if metadata.get("ciphertext_sha256") != sha256(ciphertext).hexdigest():
+        raise CryptoError("Ciphertext integrity check failed.")
+    if store.find_asset_by_uuid(context["asset"]) is not None:
+        raise ValueError("An image with this asset id already exists.")
+    return metadata, context
 
 
 def _throttle(app: Flask, name: str, key: str) -> bool:
@@ -1094,14 +1428,8 @@ def _share_asset(
     expires_at: str | None = None,
 ) -> AssetShare:
     asset = _owned_asset(store, asset_id, owner)
-    recipient_name = recipient_username.strip().lower()
-    if not recipient_name:
-        raise ValueError("Recipient username is required.")
-    if recipient_name == owner.username:
-        raise ValueError("You already own this image.")
-    recipient = store.get_user_by_username(recipient_name)
-    if recipient is None:
-        raise LookupError("No account exists with that username.")
+    _require_server_side(asset)
+    recipient = _resolve_recipient(store, owner, recipient_username)
 
     data_key = unwrap_data_key(
         asset.metadata["key_wrap"],
@@ -1120,6 +1448,41 @@ def _share_asset(
     return share
 
 
+def _resolve_recipient(store: VaultStore, owner: User, username: str) -> User:
+    recipient_name = username.strip().lower()
+    if not recipient_name:
+        raise ValueError("Recipient username is required.")
+    if recipient_name == owner.username:
+        raise ValueError("You already own this image.")
+    recipient = store.get_user_by_username(recipient_name)
+    if recipient is None:
+        raise LookupError("No account exists with that username.")
+    return recipient
+
+
+def _require_server_side(asset: EncryptedAsset) -> None:
+    """Refuse to unwrap an end-to-end image's key on the server.
+
+    Its key was never given to the server, so any route that asks for a
+    passphrase or account password to unwrap it here would exist only to
+    collect that secret. Such images are opened, shared, and linked in the
+    browser instead.
+    """
+    if asset.end_to_end:
+        raise CryptoError(SERVER_SIDE_REFUSED)
+
+
+def _require_end_to_end(asset: EncryptedAsset) -> None:
+    if not asset.end_to_end:
+        raise ValueError(
+            "This image was encrypted on the server; use the regular share and link forms."
+        )
+
+
+def _json_error(message: str, status: int) -> ResponseReturnValue:
+    return jsonify({"error": message}), status
+
+
 def _hash_link_token(token: str) -> str:
     return sha256(token.encode("utf-8")).hexdigest()
 
@@ -1136,6 +1499,7 @@ def _create_link_share(
     label: str = "",
 ) -> tuple[str, LinkShare]:
     asset = _owned_asset(store, asset_id, owner)
+    _require_server_side(asset)
     if max_downloads is not None and max_downloads <= 0:
         raise ValueError("max_downloads must be greater than zero.")
     data_key = unwrap_data_key(
@@ -1174,6 +1538,9 @@ def _decrypt_link(store: VaultStore, token: str) -> Response:
     exceed ``max_downloads``; it is handed back if decryption fails.
     """
     link, asset = _resolve_link(store, token)
+    # The token in an end-to-end link's path only finds the row; the key that
+    # unwraps the image lives in the URL fragment, which never reaches us.
+    _require_server_side(asset)
     if not store.reserve_link_download(link.id):
         raise PermissionError("This capability link is no longer valid.")
     try:
@@ -1235,9 +1602,16 @@ def _locked_response(json_mode: bool):
     return redirect(url_for("index")), 403
 
 
-def _login_success(app: Flask, store: VaultStore, user: User) -> None:
+def _login_success(app: Flask, store: VaultStore, user: User, password: str) -> None:
     guard: LoginGuard = app.extensions["login_guard"]
     guard.record_success(user.username)
+    # Sign-in is the one moment the verified password is in hand, so it is
+    # where a legacy PBKDF2 private key is resealed with Scrypt.
+    try:
+        if store.upgrade_private_key(user.id, password):
+            _audit(store, user.id, "key_upgrade")
+    except (CryptoError, OSError) as exc:
+        app.logger.warning("Could not upgrade the private key for user %s: %s", user.id, exc)
     _audit(store, user.id, "login")
 
 
@@ -1255,6 +1629,7 @@ def _asset_payload(asset: EncryptedAsset) -> dict:
         "created_at": asset.created_at,
         "notes": asset.notes,
         "favorite": asset.favorite,
+        "end_to_end": asset.end_to_end,
     }
 
 

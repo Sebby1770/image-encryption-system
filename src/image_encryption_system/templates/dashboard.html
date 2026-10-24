@@ -3,10 +3,19 @@
 {% block title %}Dashboard - Image Encryption System{% endblock %}
 
 {% block content %}
+  <div
+    id="vault"
+    data-user-id="{{ current_user.id }}"
+    data-username="{{ current_user.username }}"
+    data-scrypt-n="{{ scrypt_n }}"
+    data-max-bytes="{{ max_upload_bytes }}"
+    data-max-pixels="{{ max_image_pixels }}"
+    data-csrf="{{ csrf_token }}"
+  >
   <section class="dashboard-header">
     <div>
       <h1>Encrypted image vault</h1>
-      <p>Upload an image, choose a key protection mode, and store only ciphertext. Share by re-wrapping the same AES data key.</p>
+      <p>Encrypt images in your browser so the server only ever stores ciphertext, or on the server. Share by re-wrapping the same AES data key.</p>
     </div>
     <div class="metric-row">
       <div class="metric">
@@ -20,11 +29,27 @@
     </div>
   </section>
 
+  <p class="e2e-status" id="e2e-status" role="status" aria-live="polite" hidden></p>
+
   <section class="workspace-grid">
     <div class="sidebar-stack">
-      <form class="upload-panel" method="post" action="{{ url_for('upload_image') }}" enctype="multipart/form-data">
+      <form class="upload-panel" id="upload-form" method="post" action="{{ url_for('upload_image') }}" enctype="multipart/form-data">
         {{ csrf_field }}
         <h2>Encrypt image</h2>
+        <fieldset class="mode-switch">
+          <legend>Where to encrypt</legend>
+          <label class="mode-option">
+            <input type="radio" name="mode" value="browser" id="mode-browser" disabled>
+            <span>In this browser <span class="badge badge-e2e">End-to-end</span></span>
+          </label>
+          <label class="mode-option">
+            <input type="radio" name="mode" value="server" id="mode-server" checked>
+            <span>On the server</span>
+          </label>
+        </fieldset>
+        <p class="field-note" id="mode-note">
+          Server mode: the image is sent to the server, stripped of metadata, and encrypted there.
+        </p>
         <label>
           Image file
           <input name="image" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp,image/tiff" required>
@@ -87,10 +112,13 @@
       {% if assets %}
         <div class="asset-list">
           {% for asset in assets %}
-            <article class="asset-card">
+            <article class="asset-card{% if asset.end_to_end %} asset-card-e2e{% endif %}">
               <div>
                 <h3>{{ asset.original_filename }}{% if asset.favorite %} ★{% endif %}</h3>
-                <p>{{ asset.algorithm }} · {{ asset.image_format }} · {{ asset.width }}x{{ asset.height }}</p>
+                <p>
+                  {% if asset.end_to_end %}<span class="badge badge-e2e" title="Encrypted in your browser. The server has never held its key or plaintext.">End-to-end</span>{% endif %}
+                  {{ asset.algorithm }} · {{ asset.image_format }} · {{ asset.width }}x{{ asset.height }}
+                </p>
                 <small>{{ asset.created_at }}</small>
                 {% if asset.notes %}
                   <p class="field-note">{{ asset.notes }}</p>
@@ -135,35 +163,54 @@
                 {% endif %}
               </div>
               <div class="asset-actions">
-                <form method="post" action="{{ url_for('decrypt_image', asset_id=asset.id) }}" target="_blank">
-                  {{ csrf_field }}
-                  {% if asset.algorithm == "AES-GCM" %}
-                    <label>
-                      Passphrase
-                      <input name="passphrase" type="password" autocomplete="off" required>
-                    </label>
-                  {% else %}
-                    <label>
-                      Private key password
-                      <input name="private_key_passphrase" type="password" autocomplete="current-password" required>
-                    </label>
-                  {% endif %}
-                  <button class="button button-secondary" type="submit">Decrypt preview</button>
-                </form>
+                {% if asset.end_to_end %}
+                  <form class="e2e-open" data-e2e-asset="{{ asset.id }}">
+                    {% if asset.algorithm == "AES-GCM" %}
+                      <label>
+                        Passphrase
+                        <input name="secret" type="password" autocomplete="off" required>
+                      </label>
+                    {% else %}
+                      <label>
+                        Account password
+                        <input name="secret" type="password" autocomplete="current-password" data-account-secret required>
+                      </label>
+                    {% endif %}
+                    <button class="button button-secondary" type="submit">Decrypt in browser</button>
+                  </form>
+                {% else %}
+                  <form method="post" action="{{ url_for('decrypt_image', asset_id=asset.id) }}" target="_blank">
+                    {{ csrf_field }}
+                    {% if asset.algorithm == "AES-GCM" %}
+                      <label>
+                        Passphrase
+                        <input name="passphrase" type="password" autocomplete="off" required>
+                      </label>
+                    {% else %}
+                      <label>
+                        Private key password
+                        <input name="private_key_passphrase" type="password" autocomplete="current-password" required>
+                      </label>
+                    {% endif %}
+                    <button class="button button-secondary" type="submit">Decrypt preview</button>
+                  </form>
+                {% endif %}
                 <div class="action-row">
                   <button
-                    class="button button-ghost share-open"
+                    class="button button-ghost {% if asset.end_to_end %}e2e-share-open{% else %}share-open{% endif %}"
                     type="button"
                     data-asset-id="{{ asset.id }}"
                     data-algorithm="{{ asset.algorithm }}"
                     data-filename="{{ asset.original_filename }}"
+                    {% if asset.end_to_end %}disabled{% endif %}
                   >Share</button>
                   <button
-                    class="button button-ghost link-open"
+                    class="button button-ghost {% if asset.end_to_end %}e2e-link-open{% else %}link-open{% endif %}"
                     type="button"
                     data-asset-id="{{ asset.id }}"
                     data-algorithm="{{ asset.algorithm }}"
                     data-filename="{{ asset.original_filename }}"
+                    {% if asset.end_to_end %}disabled{% endif %}
                   >Link</button>
                   <a class="button button-ghost" href="{{ url_for('download_ciphertext', asset_id=asset.id) }}">.ies</a>
                   <form method="post" action="{{ url_for('delete_image', asset_id=asset.id) }}" data-confirm="Delete this ciphertext permanently?">
@@ -193,18 +240,32 @@
                 {% if asset.algorithm == "AES-GCM" %}
                   <details class="rotate-details">
                     <summary>Rotate passphrase</summary>
-                    <form method="post" action="{{ url_for('rotate_passphrase', asset_id=asset.id) }}" class="rotate-form">
-                      {{ csrf_field }}
-                      <label>
-                        Current passphrase
-                        <input name="old_passphrase" type="password" autocomplete="off" required>
-                      </label>
-                      <label>
-                        New passphrase
-                        <input name="new_passphrase" type="password" autocomplete="off" required>
-                      </label>
-                      <button class="button button-ghost" type="submit">Rotate wrap</button>
-                    </form>
+                    {% if asset.end_to_end %}
+                      <form class="rotate-form e2e-rotate" data-e2e-asset="{{ asset.id }}">
+                        <label>
+                          Current passphrase
+                          <input name="old_passphrase" type="password" autocomplete="off" required>
+                        </label>
+                        <label>
+                          New passphrase
+                          <input name="new_passphrase" type="password" autocomplete="off" required>
+                        </label>
+                        <button class="button button-ghost" type="submit">Rotate in browser</button>
+                      </form>
+                    {% else %}
+                      <form method="post" action="{{ url_for('rotate_passphrase', asset_id=asset.id) }}" class="rotate-form">
+                        {{ csrf_field }}
+                        <label>
+                          Current passphrase
+                          <input name="old_passphrase" type="password" autocomplete="off" required>
+                        </label>
+                        <label>
+                          New passphrase
+                          <input name="new_passphrase" type="password" autocomplete="off" required>
+                        </label>
+                        <button class="button button-ghost" type="submit">Rotate wrap</button>
+                      </form>
+                    {% endif %}
                   </details>
                 {% endif %}
               </div>
@@ -223,10 +284,13 @@
         {% if shared_items %}
           <div class="asset-list">
             {% for item in shared_items %}
-              <article class="asset-card">
+              <article class="asset-card{% if item.asset.end_to_end %} asset-card-e2e{% endif %}">
                 <div>
                   <h3>{{ item.asset.original_filename }}</h3>
-                  <p>From {{ item.owner_username }} · {{ item.asset.algorithm }} · {{ item.asset.image_format }}</p>
+                  <p>
+                    {% if item.asset.end_to_end %}<span class="badge badge-e2e">End-to-end</span>{% endif %}
+                    From {{ item.owner_username }} · {{ item.asset.algorithm }} · {{ item.asset.image_format }}
+                  </p>
                   <small>
                     Shared {{ item.share.created_at }}
                     {% if item.share.expires_at %}
@@ -237,14 +301,24 @@
                     {% endif %}
                   </small>
                 </div>
-                <form method="post" action="{{ url_for('decrypt_image', asset_id=item.asset.id) }}" target="_blank">
-                  {{ csrf_field }}
-                  <label>
-                    Your account password
-                    <input name="private_key_passphrase" type="password" autocomplete="current-password" required>
-                  </label>
-                  <button class="button button-secondary" type="submit">Decrypt preview</button>
-                </form>
+                {% if item.asset.end_to_end %}
+                  <form class="e2e-open" data-e2e-asset="{{ item.asset.id }}">
+                    <label>
+                      Your account password
+                      <input name="secret" type="password" autocomplete="current-password" data-account-secret required>
+                    </label>
+                    <button class="button button-secondary" type="submit">Decrypt in browser</button>
+                  </form>
+                {% else %}
+                  <form method="post" action="{{ url_for('decrypt_image', asset_id=item.asset.id) }}" target="_blank">
+                    {{ csrf_field }}
+                    <label>
+                      Your account password
+                      <input name="private_key_passphrase" type="password" autocomplete="current-password" required>
+                    </label>
+                    <button class="button button-secondary" type="submit">Decrypt preview</button>
+                  </form>
+                {% endif %}
               </article>
             {% endfor %}
           </div>
@@ -257,6 +331,7 @@
       </section>
     </section>
   </section>
+  </div>
 
   <dialog class="share-modal" id="link-modal">
     <form method="post" id="link-form">
@@ -318,5 +393,76 @@
     </form>
   </dialog>
 
+  <dialog class="share-modal" id="e2e-share-modal">
+    <form id="e2e-share-form">
+      <h2>Share <span data-filename>image</span> end-to-end</h2>
+      <p class="field-note">Your browser unwraps the image key and re-wraps it to the recipient’s public key. The server never sees the key.</p>
+      <label>
+        Recipient username
+        <input name="username" type="text" autocomplete="off" required>
+      </label>
+      <label>
+        Expires in hours (optional)
+        <input name="expires_hours" type="number" min="1" step="1" placeholder="Never">
+      </label>
+      <label>
+        <span data-secret-label>AES passphrase</span>
+        <input name="secret" type="password" autocomplete="off" required>
+      </label>
+      <p class="dialog-result" data-result hidden></p>
+      <div class="action-row">
+        <button class="button button-primary" type="submit" data-submit>Share</button>
+        <button class="button button-ghost" type="button" data-close>Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="share-modal" id="e2e-link-modal">
+    <form id="e2e-link-form">
+      <h2>End-to-end link for <span data-filename>image</span></h2>
+      <p class="field-note">The key travels in the link after the <code>#</code>, which browsers never send to a server. Anyone with the whole link can decrypt; the server only counts downloads.</p>
+      <label>
+        Expires in hours (optional)
+        <input name="expires_hours" type="number" min="1" step="1" placeholder="Never">
+      </label>
+      <label>
+        Max downloads (optional)
+        <input name="max_downloads" type="number" min="1" step="1" placeholder="Unlimited">
+      </label>
+      <label>
+        Label (optional)
+        <input name="label" type="text" maxlength="80" placeholder="reviewer, printer, …">
+      </label>
+      <label>
+        <span data-secret-label>AES passphrase</span>
+        <input name="secret" type="password" autocomplete="off" required>
+      </label>
+      <div class="link-output" data-link-output hidden>
+        <label>
+          Copy this link now — it is shown once
+          <input type="text" readonly data-link-url>
+        </label>
+        <button class="button button-secondary" type="button" data-copy>Copy link</button>
+      </div>
+      <div class="action-row">
+        <button class="button button-primary" type="submit" data-submit>Create link</button>
+        <button class="button button-ghost" type="button" data-close>Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="viewer" id="viewer" aria-labelledby="viewer-title">
+    <div class="viewer-head">
+      <h2 id="viewer-title">Decrypted image</h2>
+      <button class="button button-ghost" type="button" data-close>Close</button>
+    </div>
+    <img id="viewer-image" alt="">
+    <div class="viewer-foot">
+      <p class="field-note">Decrypted in this browser. Neither the key nor the image was sent to the server.</p>
+      <a class="button button-primary" id="viewer-save" href="#" download>Save image</a>
+    </div>
+  </dialog>
+
   <script src="{{ url_for('static', filename='js/dashboard.js') }}" defer></script>
+  <script type="module" src="{{ url_for('static', filename='js/vault-e2e.js') }}"></script>
 {% endblock %}

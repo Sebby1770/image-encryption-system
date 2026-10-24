@@ -27,9 +27,13 @@ from .crypto import (
     SUPPORTED_ALGORITHMS,
     CryptoError,
     generate_rsa_key_pair,
+    is_legacy_private_key,
+    load_private_key,
     new_asset_id,
-    reencrypt_private_key_pem,
+    private_key_owner,
+    rewrap_private_key,
     validate_envelope,
+    wrap_private_key,
 )
 from .security import validate_password
 
@@ -64,6 +68,12 @@ class EncryptedAsset:
     created_at: str
     notes: str = ""
     favorite: bool = False
+
+    @property
+    def end_to_end(self) -> bool:
+        """Sealed in a browser: the server has never held its key or plaintext."""
+        context = self.metadata.get("context") if isinstance(self.metadata, dict) else None
+        return isinstance(context, dict) and context.get("source") == "browser"
 
 
 @dataclass(frozen=True)
@@ -295,8 +305,8 @@ class VaultStore:
             )
             user_id = _last_row_id(cursor)
 
-        private_pem, public_pem = generate_rsa_key_pair(password)
-        self.private_key_path(user_id).write_bytes(private_pem)
+        private_key, public_pem = generate_rsa_key_pair(password, owner=user_id)
+        _write_owner_only(self.private_key_path(user_id), private_key)
         self.public_key_path(user_id).write_bytes(public_pem)
         return self.get_user(user_id)
 
@@ -328,7 +338,33 @@ class VaultStore:
         return self.public_key_path(user_id).read_bytes()
 
     def read_private_key(self, user_id: int) -> bytes:
-        return self.private_key_path(user_id).read_bytes()
+        """The account's sealed private key, or its legacy PEM until upgraded."""
+        path = self.private_key_path(user_id)
+        if not path.exists():
+            return self.legacy_private_key_path(user_id).read_bytes()
+        blob = path.read_bytes()
+        # Checked without the password: a key file copied into another account's
+        # slot is refused here, and its owner field is sealed into the AAD.
+        if private_key_owner(blob) != user_id:
+            raise CryptoError("The stored private key does not belong to this account.")
+        return blob
+
+    def upgrade_private_key(self, user_id: int, password: str) -> bool:
+        """Replace a legacy PBKDF2 PEM with the Scrypt-sealed format.
+
+        Called at sign-in, the one moment the server holds the verified
+        password. Returns True if a key was upgraded.
+        """
+        legacy_path = self.legacy_private_key_path(user_id)
+        if self.private_key_path(user_id).exists() or not legacy_path.exists():
+            return False
+        legacy = legacy_path.read_bytes()
+        if not is_legacy_private_key(legacy):
+            return False
+        sealed = wrap_private_key(load_private_key(legacy, password), password, owner=user_id)
+        _write_owner_only(self.private_key_path(user_id), sealed)
+        legacy_path.unlink(missing_ok=True)  # a concurrent sign-in may have won
+        return True
 
     def change_password(self, user_id: int, old_password: str, new_password: str) -> None:
         user = self.get_user(user_id)
@@ -338,15 +374,16 @@ class VaultStore:
         # password change away from being bypassed.
         validate_password(new_password, username=user.username)
 
-        new_pem = reencrypt_private_key_pem(
+        new_key = rewrap_private_key(
             self.read_private_key(user_id),
             old_password,
             new_password,
+            owner=user_id,
         )
         new_hash = generate_password_hash(new_password)
-        pem_path = self.private_key_path(user_id)
-        tmp_path = pem_path.with_name(pem_path.name + ".tmp")
-        tmp_path.write_bytes(new_pem)
+        key_path = self.private_key_path(user_id)
+        tmp_path = key_path.with_name(key_path.name + ".tmp")
+        _write_owner_only(tmp_path, new_key, atomic=False)
         try:
             with self._connect() as db:
                 db.execute(
@@ -357,7 +394,7 @@ class VaultStore:
                     """,
                     (new_hash, user_id),
                 )
-            tmp_path.replace(pem_path)
+            tmp_path.replace(key_path)
         except Exception:
             with self._connect() as db:
                 db.execute(
@@ -372,8 +409,15 @@ class VaultStore:
         finally:
             if tmp_path.exists():
                 tmp_path.unlink()
+        legacy_path = self.legacy_private_key_path(user_id)
+        if legacy_path.exists():
+            legacy_path.unlink()
 
     def private_key_path(self, user_id: int) -> Path:
+        return self.key_dir / f"user-{user_id}-private.key"
+
+    def legacy_private_key_path(self, user_id: int) -> Path:
+        """Where releases before the Scrypt-sealed format kept the PEM key."""
         return self.key_dir / f"user-{user_id}-private.pem"
 
     def public_key_path(self, user_id: int) -> Path:
@@ -386,7 +430,11 @@ class VaultStore:
 
         assets = self.list_assets(user_id)
         ciphertext_paths = [self.vault_dir / asset.stored_filename for asset in assets]
-        key_paths = [self.private_key_path(user_id), self.public_key_path(user_id)]
+        key_paths = [
+            self.private_key_path(user_id),
+            self.legacy_private_key_path(user_id),
+            self.public_key_path(user_id),
+        ]
 
         with self._connect() as db:
             db.execute("DELETE FROM shares WHERE recipient_user_id = ?", (user_id,))
@@ -433,36 +481,49 @@ class VaultStore:
     ) -> EncryptedAsset:
         safe_name = secure_filename(original_filename) or "image"
         stored_filename = f"{asset_uuid or new_asset_id()}.enc"
-        (self.vault_dir / stored_filename).write_bytes(ciphertext)
+        blob_path = self.vault_dir / stored_filename
+        # Exclusive create: an asset id is chosen by the uploader on the
+        # end-to-end and restore paths, and the file is written before the row,
+        # so an id that collides must fail here rather than overwrite the
+        # ciphertext of whoever already holds it.
+        try:
+            with blob_path.open("xb") as handle:
+                handle.write(ciphertext)
+        except FileExistsError as exc:
+            raise ValueError("An image with this asset id already exists.") from exc
         now = _utc_now()
         stored_meta = dict(metadata)
         stored_meta.setdefault("ciphertext_sha256", sha256(ciphertext).hexdigest())
 
-        with self._connect() as db:
-            cursor = db.execute(
-                """
+        try:
+            with self._connect() as db:
+                cursor = db.execute(
+                    """
                 INSERT INTO encrypted_assets (
                     user_id, original_filename, stored_filename, algorithm, mime_type,
                     image_format, width, height, metadata_json, created_at, notes, favorite
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    user_id,
-                    safe_name,
-                    stored_filename,
-                    algorithm,
-                    mime_type,
-                    image_format,
-                    width,
-                    height,
-                    json.dumps(stored_meta, sort_keys=True),
-                    now,
-                    notes or "",
-                    1 if favorite else 0,
-                ),
-            )
+                    (
+                        user_id,
+                        safe_name,
+                        stored_filename,
+                        algorithm,
+                        mime_type,
+                        image_format,
+                        width,
+                        height,
+                        json.dumps(stored_meta, sort_keys=True),
+                        now,
+                        notes or "",
+                        1 if favorite else 0,
+                    ),
+                )
             asset_id = _last_row_id(cursor)
+        except Exception:
+            blob_path.unlink(missing_ok=True)
+            raise
         return self.get_asset(asset_id)
 
     def get_asset(self, asset_id: int) -> EncryptedAsset:
@@ -1303,6 +1364,22 @@ class VaultStore:
             connection.execute("COMMIT")
         finally:
             connection.close()
+
+
+def _write_owner_only(path: Path, data: bytes, *, atomic: bool = True) -> None:
+    """Write a key file readable by this process's user only (mode 0600).
+
+    With ``atomic`` the bytes land in a temporary sibling first, so a crash
+    never leaves a truncated key behind.
+    """
+    target = path.with_name(path.name + ".partial") if atomic else path
+    if target.exists():
+        target.unlink()
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data)
+    if atomic:
+        os.replace(target, path)
 
 
 def load_or_create_secret(path: Path) -> str:

@@ -77,6 +77,22 @@ WRAP_KEYS = {
     WRAP_SCRYPT: frozenset({"type", "salt", "nonce", "wrapped_key", "n", "r", "p"}),
     WRAP_RSA: frozenset({"type", "wrapped_key"}),
 }
+RSA_KEY_BITS = 3072
+RSA_WRAPPED_KEY_BYTES = RSA_KEY_BITS // 8
+
+# Account RSA private keys. OpenSSL's encrypted PKCS#8 (what
+# BestAvailableEncryption writes) derives its key with PBKDF2-HMAC-SHA256 at
+# 2,048 iterations, which made the private key — the secret behind every
+# RSA-hybrid image and every share — the cheapest thing on disk to brute-force.
+# Keys are now sealed like a data key: Scrypt derives an AES-256-GCM key, the
+# unencrypted PKCS#8 DER is the plaintext, and the header is the AAD, so the
+# browser can open the same file with WebCrypto.
+PRIVATE_KEY_FORMAT = "ies-private-key"
+PRIVATE_KEY_VERSION = 1
+PRIVATE_KEY_AAD_PREFIX = b"IES-PRIVATE-KEY-V1\x00"
+PRIVATE_KEY_FIELDS = frozenset({"format", "version", "owner", "kdf", "nonce", "ciphertext"})
+PRIVATE_KEY_KDF_FIELDS = frozenset({"type", "salt", "n", "r", "p"})
+MAX_PRIVATE_KEY_BYTES = 16 * 1024
 
 
 class CryptoError(Exception):
@@ -89,21 +105,208 @@ class EncryptionResult:
     metadata: dict[str, Any]
 
 
-def generate_rsa_key_pair(passphrase: str) -> tuple[bytes, bytes]:
+def generate_rsa_key_pair(
+    passphrase: str, *, owner: int | None = None, pem: bool = False
+) -> tuple[bytes, bytes]:
+    """Generate an RSA-3072 key pair: (protected private key, public key PEM).
+
+    The private key is sealed with ``wrap_private_key``. ``pem=True`` writes
+    OpenSSL-compatible encrypted PKCS#8 instead, for interoperability only:
+    that format is about a thousand times cheaper to brute-force.
+    """
     if not passphrase:
         raise CryptoError("A passphrase is required to protect the private key.")
 
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
-    private_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.BestAvailableEncryption(passphrase.encode("utf-8")),
-    )
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=RSA_KEY_BITS)
     public_pem = private_key.public_key().public_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
     )
-    return private_pem, public_pem
+    if pem:
+        private_blob = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.BestAvailableEncryption(passphrase.encode("utf-8")),
+        )
+    else:
+        private_blob = wrap_private_key(private_key, passphrase, owner=owner)
+    return private_blob, public_pem
+
+
+def wrap_private_key(
+    private_key: rsa.RSAPrivateKey, passphrase: str, *, owner: int | None = None
+) -> bytes:
+    """Seal an RSA private key with Scrypt + AES-256-GCM.
+
+    ``owner`` (an account id) is recorded and sealed into the AAD, so a key
+    file moved into another account's slot is refused rather than used.
+    """
+    salt = os.urandom(SCRYPT_SALT_BYTES)
+    n, r, p = SCRYPT_N, SCRYPT_R, SCRYPT_P
+    header: dict[str, Any] = {
+        "format": PRIVATE_KEY_FORMAT,
+        "version": PRIVATE_KEY_VERSION,
+        "kdf": {"type": "scrypt", "salt": _b64encode(salt), "n": n, "r": r, "p": p},
+    }
+    if owner is not None:
+        _check_key_owner(owner)
+        header["owner"] = owner
+    key = _derive_passphrase_key(passphrase, salt, n=n, r=r, p=p, label="Private key passphrase")
+    nonce = os.urandom(GCM_NONCE_BYTES)
+    der = private_key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    sealed = AESGCM(key).encrypt(nonce, der, _private_key_aad(header))
+    return canonical_json({**header, "nonce": _b64encode(nonce), "ciphertext": _b64encode(sealed)})
+
+
+def load_private_key(
+    blob: bytes, passphrase: str | None, *, owner: int | None = None
+) -> rsa.RSAPrivateKey:
+    """Open a private key sealed by ``wrap_private_key``, or a legacy PEM.
+
+    With ``owner`` set, a sealed key recorded for a different account is
+    refused. Legacy PEM files carry no owner.
+    """
+    if not isinstance(passphrase, str) or not passphrase:
+        raise CryptoError("RSA hybrid decryption requires the private key passphrase.")
+    if is_legacy_private_key(blob):
+        try:
+            key = serialization.load_pem_private_key(blob, password=passphrase.encode("utf-8"))
+        except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
+            raise CryptoError("Private key passphrase is invalid.") from exc
+    else:
+        wrapped = _parse_private_key(blob)
+        if owner is not None and wrapped.get("owner") != owner:
+            raise CryptoError("This private key does not belong to this account.")
+        kdf = wrapped["kdf"]
+        wrapping_key = _derive_passphrase_key(
+            passphrase,
+            _b64decode(kdf["salt"]),
+            n=kdf["n"],
+            r=kdf["r"],
+            p=kdf["p"],
+            label="Private key passphrase",
+        )
+        try:
+            der = AESGCM(wrapping_key).decrypt(
+                _b64decode(wrapped["nonce"]),
+                _b64decode(wrapped["ciphertext"]),
+                _private_key_aad(wrapped),
+            )
+        except InvalidTag as exc:
+            raise CryptoError("Private key passphrase is invalid.") from exc
+        try:
+            key = serialization.load_der_private_key(der, password=None)
+        except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
+            raise CryptoError("The stored private key is damaged.") from exc
+    if not isinstance(key, rsa.RSAPrivateKey):
+        raise CryptoError("The stored private key is not an RSA private key.")
+    return key
+
+
+def rewrap_private_key(
+    blob: bytes, old_passphrase: str, new_passphrase: str, *, owner: int | None = None
+) -> bytes:
+    """Open a private key (sealed or legacy PEM) and seal it under a new passphrase."""
+    if not new_passphrase:
+        raise CryptoError("A passphrase is required to protect the private key.")
+    try:
+        private_key = load_private_key(blob, old_passphrase, owner=owner)
+    except CryptoError as exc:
+        if "does not belong" in str(exc):
+            raise
+        raise CryptoError("Current password is invalid.") from exc
+    return wrap_private_key(private_key, new_passphrase, owner=owner)
+
+
+def is_legacy_private_key(blob: bytes) -> bool:
+    """True for an OpenSSL PEM file written before keys were Scrypt-sealed."""
+    return blob.lstrip().startswith(b"-----BEGIN")
+
+
+def private_key_owner(blob: bytes) -> int | None:
+    """The account a sealed key is bound to, checked structurally (no passphrase).
+
+    ``None`` for legacy PEM files and for sealed keys made without an owner.
+    The owner is also in the AAD, so editing it breaks decryption.
+    """
+    if is_legacy_private_key(blob):
+        return None
+    owner = _parse_private_key(blob).get("owner")
+    return int(owner) if owner is not None else None
+
+
+def public_key_fingerprint(public_key_pem: bytes) -> str:
+    """First 128 bits of SHA-256 over the SubjectPublicKeyInfo DER, grouped.
+
+    The browser computes the same value from the key it actually wraps to, so
+    two people can compare it out of band before trusting a share.
+    """
+    try:
+        key = serialization.load_pem_public_key(public_key_pem)
+    except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
+        raise CryptoError("RSA public key could not be parsed.") from exc
+    der = key.public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    digest = hashlib.sha256(der).hexdigest()[:32]
+    return " ".join(digest[i : i + 4] for i in range(0, 32, 4))
+
+
+def canonical_json(value: Any) -> bytes:
+    """Sorted keys, no whitespace, UTF-8: the bytes every AAD here is built from.
+
+    ``JSON.stringify`` in a browser produces identical bytes for the same
+    sorted object, which is what lets the browser and server share envelopes.
+    """
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
+
+
+def _private_key_aad(wrapped: Mapping[str, Any]) -> bytes:
+    header = {key: wrapped[key] for key in ("format", "version", "owner", "kdf") if key in wrapped}
+    return PRIVATE_KEY_AAD_PREFIX + canonical_json(header)
+
+
+def _parse_private_key(blob: Any) -> dict[str, Any]:
+    """Bound and type-check a sealed private key file before any field is used."""
+    if not isinstance(blob, bytes) or len(blob) > MAX_PRIVATE_KEY_BYTES:
+        raise CryptoError("Private key file is not valid.")
+    try:
+        wrapped = json.loads(blob.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CryptoError("Private key file is not valid.") from exc
+    required = PRIVATE_KEY_FIELDS - {"owner"}
+    if not isinstance(wrapped, dict) or not required <= set(wrapped) <= PRIVATE_KEY_FIELDS:
+        raise CryptoError("Private key file has an unexpected structure.")
+    version = wrapped["version"]
+    if wrapped["format"] != PRIVATE_KEY_FORMAT or isinstance(version, bool) or version != 1:
+        raise CryptoError("Private key file format is not supported.")
+    if "owner" in wrapped:
+        _check_key_owner(wrapped["owner"])
+    kdf = wrapped["kdf"]
+    if not isinstance(kdf, dict) or set(kdf) != PRIVATE_KEY_KDF_FIELDS or kdf["type"] != "scrypt":
+        raise CryptoError("Private key file KDF is not supported.")
+    if any(isinstance(kdf[k], bool) or not isinstance(kdf[k], int) for k in ("n", "r", "p")):
+        raise CryptoError("Scrypt parameters must be integers.")
+    _validate_scrypt_parameters(n=kdf["n"], r=kdf["r"], p=kdf["p"])
+    if len(_b64decode(kdf["salt"])) != SCRYPT_SALT_BYTES:
+        raise CryptoError("Scrypt salt has an invalid length.")
+    if len(_b64decode(wrapped["nonce"])) != GCM_NONCE_BYTES:
+        raise CryptoError("Private key nonce has an invalid length.")
+    if len(_b64decode(wrapped["ciphertext"])) <= GCM_TAG_BYTES:
+        raise CryptoError("Private key ciphertext is truncated.")
+    return wrapped
+
+
+def _check_key_owner(owner: Any) -> None:
+    if isinstance(owner, bool) or not isinstance(owner, int) or not 1 <= owner < 2**31:
+        raise CryptoError("Private key owner is invalid.")
 
 
 def new_asset_id() -> str:
@@ -248,8 +451,7 @@ def context_aad(context: Mapping[str, Any]) -> bytes:
     Sorted keys, no whitespace, UTF-8 (not ASCII-escaped), so a browser's
     ``JSON.stringify`` over the same sorted object produces identical bytes.
     """
-    body = json.dumps(dict(context), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return CONTEXT_AAD_PREFIX + body.encode("utf-8")
+    return CONTEXT_AAD_PREFIX + canonical_json(dict(context))
 
 
 def _validate_context(context: Any, *, algorithm: str) -> None:
@@ -307,6 +509,39 @@ def unwrap_data_key(
     raise CryptoError("Unsupported key wrapping metadata.")
 
 
+def validate_key_wrap(key_wrap: Any, *, min_scrypt_n: int | None = None) -> str:
+    """Check a key wrap's structure and lengths without unwrapping it.
+
+    For wraps made in a browser, which the server stores but can never open.
+    Returns the wrap type. ``min_scrypt_n`` defaults to the cost written today
+    (``SCRYPT_N``), so a new passphrase wrap cannot be weaker than the server's
+    own; pass ``MIN_SCRYPT_N`` for wraps of high-entropy secrets such as link
+    keys.
+    """
+    if not isinstance(key_wrap, dict) or key_wrap.get("type") not in WRAP_TYPES:
+        raise CryptoError("Encrypted image key wrapping metadata is invalid.")
+    wrap_type = str(key_wrap["type"])
+    if set(key_wrap) != WRAP_KEYS[wrap_type]:
+        raise CryptoError("Encrypted image key wrapping metadata has unexpected fields.")
+    if wrap_type == WRAP_RSA:
+        if len(_b64decode(key_wrap["wrapped_key"])) != RSA_WRAPPED_KEY_BYTES:
+            raise CryptoError("Wrapped data key has an invalid length.")
+        return wrap_type
+    n, r, p = key_wrap["n"], key_wrap["r"], key_wrap["p"]
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in (n, r, p)):
+        raise CryptoError("Scrypt parameters must be integers.")
+    _validate_scrypt_parameters(n=n, r=r, p=p)
+    if n < (SCRYPT_N if min_scrypt_n is None else min_scrypt_n):
+        raise CryptoError("Scrypt work factor is below this vault's cost for new wraps.")
+    if len(_b64decode(key_wrap["salt"])) != SCRYPT_SALT_BYTES:
+        raise CryptoError("Scrypt salt has an invalid length.")
+    if len(_b64decode(key_wrap["nonce"])) != GCM_NONCE_BYTES:
+        raise CryptoError("Wrapping nonce has an invalid length.")
+    if len(_b64decode(key_wrap["wrapped_key"])) != AES_KEY_BYTES + GCM_TAG_BYTES:
+        raise CryptoError("Wrapped data key has an invalid length.")
+    return wrap_type
+
+
 def wrap_data_key_rsa(data_key: bytes, public_key_pem: bytes) -> dict[str, str]:
     """Re-wrap an existing AES data key with a recipient's RSA public key."""
     if len(data_key) != AES_KEY_BYTES:
@@ -319,30 +554,6 @@ def wrap_data_key_passphrase(data_key: bytes, passphrase: str) -> dict[str, str 
     if len(data_key) != AES_KEY_BYTES:
         raise CryptoError("Refusing to wrap a data key of unexpected length.")
     return _wrap_key_with_passphrase(data_key, passphrase)
-
-
-def reencrypt_private_key_pem(
-    private_pem: bytes,
-    old_passphrase: str,
-    new_passphrase: str,
-) -> bytes:
-    """Load a password-wrapped RSA PEM and wrap it again with a new password."""
-    if not new_passphrase:
-        raise CryptoError("A passphrase is required to protect the private key.")
-    try:
-        private_key = serialization.load_pem_private_key(
-            private_pem,
-            password=old_passphrase.encode("utf-8") if old_passphrase else None,
-        )
-    except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
-        raise CryptoError("Current password is invalid.") from exc
-    if not isinstance(private_key, rsa.RSAPrivateKey):
-        raise CryptoError("The stored private key is not an RSA private key.")
-    return private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.BestAvailableEncryption(new_passphrase.encode("utf-8")),
-    )
 
 
 def pack_ies(ciphertext: bytes, metadata: dict[str, Any]) -> bytes:
@@ -504,16 +715,10 @@ def _unwrap_key_with_rsa(
 
     try:
         wrapped_key = _b64decode(key_wrap["wrapped_key"])
-        private_key = serialization.load_pem_private_key(
-            private_key_pem,
-            password=private_key_passphrase.encode("utf-8"),
-        )
     except KeyError as exc:
         raise CryptoError("RSA key wrapping metadata is incomplete.") from exc
-    except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
-        raise CryptoError("Private key passphrase is invalid.") from exc
-    if not isinstance(private_key, rsa.RSAPrivateKey):
-        raise CryptoError("RSA hybrid decryption requires an RSA private key.")
+    # Accepts the Scrypt-sealed format and legacy PEM alike.
+    private_key = load_private_key(private_key_pem, private_key_passphrase)
     try:
         return private_key.decrypt(
             wrapped_key,
@@ -534,10 +739,11 @@ def _derive_passphrase_key(
     n: int,
     r: int,
     p: int,
+    label: str = "AES-GCM passphrase",
 ) -> bytes:
     _validate_scrypt_parameters(n=n, r=r, p=p)
     kdf = Scrypt(salt=salt, length=AES_KEY_BYTES, n=n, r=r, p=p)
-    return kdf.derive(_passphrase_bytes(passphrase, label="AES-GCM passphrase"))
+    return kdf.derive(_passphrase_bytes(passphrase, label=label))
 
 
 def _validate_scrypt_parameters(*, n: int, r: int, p: int) -> None:

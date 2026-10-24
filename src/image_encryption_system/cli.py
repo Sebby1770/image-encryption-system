@@ -43,14 +43,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--out", "-o", type=Path, required=True, help="Output plaintext file"
     )
     decrypt_parser.add_argument("--passphrase", "-p", help="AES or private-key passphrase")
-    decrypt_parser.add_argument("--private-key", type=Path, help="RSA private key (PEM)")
+    decrypt_parser.add_argument(
+        "--private-key", type=Path, help="RSA private key (.key from keygen, or PEM)"
+    )
 
     keygen_parser = subparsers.add_parser("keygen", help="Generate an RSA-3072 key pair.")
     keygen_parser.add_argument(
         "--passphrase", "-p", help="Private key passphrase (prompted if omitted)"
     )
-    keygen_parser.add_argument("--out-private", type=Path, default=Path("ies-private.pem"))
+    keygen_parser.add_argument("--out-private", type=Path, default=Path("ies-private.key"))
     keygen_parser.add_argument("--out-public", type=Path, default=Path("ies-public.pem"))
+    keygen_parser.add_argument(
+        "--pem",
+        action="store_true",
+        help=(
+            "Write OpenSSL-compatible encrypted PKCS#8 instead of the Scrypt-sealed "
+            "format. Its PBKDF2 (2,048 rounds) is far cheaper to brute-force."
+        ),
+    )
 
     inspect_parser = subparsers.add_parser(
         "inspect", help="Print public .ies metadata (no secrets)."
@@ -62,7 +72,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     verify_parser.add_argument("input", type=Path, help="Input vault file")
     verify_parser.add_argument("--passphrase", "-p", help="AES or private-key passphrase")
-    verify_parser.add_argument("--private-key", type=Path, help="RSA private key (PEM)")
+    verify_parser.add_argument(
+        "--private-key", type=Path, help="RSA private key (.key from keygen, or PEM)"
+    )
 
     rewrap_parser = subparsers.add_parser(
         "rewrap", help="Rotate the passphrase wrap on an .ies file (ciphertext unchanged)."
@@ -159,8 +171,8 @@ def _decrypt(args: argparse.Namespace) -> int:
 
 def _keygen(args: argparse.Namespace) -> int:
     passphrase = args.passphrase or getpass("Private key passphrase: ")
-    private_pem, public_pem = generate_rsa_key_pair(passphrase)
-    args.out_private.write_bytes(private_pem)
+    private_key, public_pem = generate_rsa_key_pair(passphrase, pem=args.pem)
+    args.out_private.write_bytes(private_key)
     args.out_public.write_bytes(public_pem)
     return 0
 

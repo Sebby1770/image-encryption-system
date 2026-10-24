@@ -16,8 +16,11 @@ src/image_encryption_system/
   cli.py         # `ies` console script; talks only to crypto.py
   config.py      # Config defaults, all overridable via env vars
   templates/     # Jinja views (layout, auth, dashboard, account, audit, link)
-  static/        # CSS and favicon
+  static/css/    # styles
+  static/js/     # ies-crypto.js (browser twin of crypto.py), ies-image.js (metadata
+                 # stripping), scrypt-worker.js, vault-e2e.js / link-e2e.js (pages)
 tests/           # pytest; tests/helpers.py has make_app/register/login/encrypt_png
+tests/js/        # node --test suite + harness.mjs, which test_browser_crypto.py drives
 docs/SECURITY_MODEL.md  # threat model — keep it in sync with the code
 web/             # static GitHub Pages marketing site, unrelated to the Flask app
 ```
@@ -39,7 +42,8 @@ pytest                            # full suite (includes the browser test if Pla
 pytest -m "not e2e"               # skip the browser test
 pytest -m e2e tests/e2e           # Playwright end-to-end flow (pip install -e ".[e2e]")
 HYPOTHESIS_PROFILE=ci pytest tests/test_properties.py   # 200 examples per property, as CI runs
-pytest --cov=image_encryption_system --cov-fail-under=80
+pytest --cov=image_encryption_system --cov-fail-under=85
+node --test tests/js/*.test.mjs   # browser crypto (Node 20+; leave the glob unquoted)
 ruff check src tests scripts run.py && ruff format --check src tests scripts run.py
 mypy                              # configured in pyproject.toml, checks src/
 ```
@@ -109,7 +113,28 @@ are allowed (exact key sets for each wrap type too), base64 must be canonical,
 and `ciphertext_sha256` is verified, so flipping any byte of a `.ies` file makes
 decryption fail (`tests/test_properties.py` proves it with Hypothesis).
 
-The e2e test launches Playwright's bundled Chromium and falls back to
+## End-to-end (browser) mode
+
+`static/js/ies-crypto.js` must stay byte-compatible with `crypto.py`: same
+canonical JSON, AAD prefixes, base64 strictness, and Scrypt bounds. Change both
+together; `tests/test_browser_crypto.py` checks them against each other under
+Node (it skips without Node 20+, so run it locally when touching either side).
+Browser uploads are version 3 envelopes with `context.source == "browser"`
+(`EncryptedAsset.end_to_end`). The server must never unwrap their keys: every
+route that takes a passphrase or account password calls
+`web._require_server_side()`. Wraps a browser sends are checked with
+`crypto.validate_key_wrap()` (structure only; the server cannot open them).
+
+Account private keys are `user-<id>-private.key`, sealed by
+`crypto.wrap_private_key()` (Scrypt + AES-GCM over PKCS#8 DER, owner in the
+AAD). `user-<id>-private.pem` is the legacy PBKDF2 format, still read and
+resealed at sign-in by `VaultStore.upgrade_private_key()`.
+
+Page modules run at import time, so keep start-up code at the bottom of the
+module: a `const` declared below the call that uses it throws at load (the
+browser tests fail on any console error).
+
+The e2e tests launch Playwright's bundled Chromium and fall back to
 `/opt/pw-browsers/chromium` (preinstalled in cloud sessions) or
 `$IES_CHROMIUM_EXECUTABLE`. Do not run `playwright install` in cloud sessions.
 

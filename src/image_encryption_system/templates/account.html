@@ -32,10 +32,23 @@
       <ul>
         <li>Verifies your current password</li>
         <li>Stores a new password hash and increments the session version</li>
-        <li>Re-encrypts your RSA private key with BestAvailableEncryption</li>
+        <li>Reseals your RSA private key with Scrypt and AES-256-GCM</li>
         <li>Signs out other browser sessions and API tokens</li>
         <li>Leaves image ciphertext and shares unchanged</li>
       </ul>
+      <h2>Your key</h2>
+      <p class="field-note">
+        Public key fingerprint. When someone shares an image with you end-to-end, their browser shows them this value;
+        compare it with them over another channel to be sure the share reached your key.
+      </p>
+      <p class="fingerprint" id="key-fingerprint">{{ fingerprint }}</p>
+      {% if legacy_key %}
+        <p class="flash flash-error">
+          Your private key still uses the older PBKDF2 protection. Sign out and back in once to reseal it with Scrypt.
+        </p>
+      {% else %}
+        <p class="field-note">Private key sealed with Scrypt and AES-256-GCM under your account password.</p>
+      {% endif %}
       <p><a class="button button-ghost" href="{{ url_for('download_public_key') }}">Download RSA public key</a></p>
       <form
         class="form-stack"

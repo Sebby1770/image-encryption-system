@@ -2,6 +2,69 @@
 
 ## [Unreleased]
 
+### End-to-end mode (phase 3)
+The threat model listed "the server sees plaintext" as its main non-goal and
+promised a client-side mode. It now exists, and it is the default.
+- **Images are encrypted, decrypted, shared, linked, and re-wrapped in the
+  browser.** `static/js/ies-crypto.js` mirrors `crypto.py` byte for byte
+  (WebCrypto AES-256-GCM and RSA-OAEP; Scrypt in pure JavaScript on a Web
+  Worker, ~270 ms at `2^16`). Envelopes are ordinary version 3 envelopes with
+  `source: "browser"`, so they move freely between the browser, the server, the
+  CLI, and backups.
+- **Metadata is stripped in the browser** (`ies-image.js`): container-level
+  allow-lists for PNG, JPEG, WebP, and GIF drop EXIF/GPS, XMP, IPTC, MPF, text
+  and C2PA chunks, JFIF thumbnails, comments, and data appended after the image,
+  keeping every pixel. Rotated JPEGs are drawn upright first.
+- **New routes** receive only ciphertext and wraps: `POST /images/sealed`,
+  `GET /images/<id>/sealed`, `POST /account/private-key`,
+  `GET /users/<name>/public-key`, `POST /images/<id>/shares/sealed`,
+  `POST /images/<id>/links/sealed`, `POST /images/<id>/rewrap`. Uploads are
+  checked for everything checkable without the key: closed envelope, complete
+  context sealed to the uploader, displayable allow-listed type, pixel ceiling,
+  wrap structure at no less than today's Scrypt cost, and digest.
+- **Server-side unwrap is refused for end-to-end images**, even with the right
+  secret, on every HTML and API route that would otherwise ask for one.
+- **End-to-end links** put their key in the URL fragment; the server stores a
+  token hash and counts downloads but cannot open what it serves.
+- **Key fingerprints** on the share result and the Account page, for comparing
+  keys out of band.
+- Without JavaScript the end-to-end option stays disabled, and the server
+  refuses a plain upload that claims to come from end-to-end mode, so plaintext
+  is never stored when the user asked for it to stay local.
+- `fetch()` calls carry the CSRF token in an `X-CSRF-Token` header.
+
+### Security
+- **Account private keys were the cheapest secret on disk to brute-force.**
+  `BestAvailableEncryption` writes PKCS#8 PBES2 with PBKDF2-HMAC-SHA256 at
+  OpenSSL's default 2,048 iterations, about a thousand times cheaper per guess
+  than the Scrypt the vault uses everywhere else, and the files were written
+  `0644`. Keys are now sealed with Scrypt (`2^16`) and AES-256-GCM, bound to their
+  account in the AAD, closed against unknown fields, and written atomically with
+  mode `0600`. Legacy PEM keys still open and are resealed at the next sign-in
+  (web or API). `ies keygen` writes the new format; `--pem` keeps OpenSSL's.
+- **The store could overwrite ciphertext on an asset-id collision.**
+  `save_asset` wrote the vault file before inserting the row, so an id that
+  collided with an existing image replaced that image's ciphertext before the
+  UNIQUE constraint failed. Backup restore checked for a collision first, which
+  left only a check-then-write race; end-to-end uploads, where the uploader
+  also chooses the id, would have been a second such path. The file is now
+  created exclusively, and removed again if the insert fails.
+
+### Tests
+- `tests/js/` (`node --test`): RFC 7914 Scrypt vectors, strict base64,
+  canonical JSON, envelope round trips and tamper checks.
+- `tests/test_browser_crypto.py` runs the browser modules under Node against
+  `crypto.py`, `hashlib.scrypt`, the CLI, and Pillow (skipped without Node 20+).
+- `tests/test_zero_knowledge.py`: every new route, every refusal, and the
+  asset-id overwrite.
+- `tests/test_private_key_wrap.py`: the key format, migration at sign-in,
+  password change, owner binding, file mode, and the CLI.
+- `tests/e2e/test_zero_knowledge_flow.py` drives the whole flow in Chromium and
+  records every request, proving no plaintext, passphrase, account password, or
+  link key reaches the server. Playwright fixtures moved to `tests/e2e/conftest.py`.
+- CI installs Node 22 for the JavaScript and cross-language tests.
+
+
 ### Fixed
 - **Every storage operation leaked its SQLite connection.** `VaultStore` used
   `with self._connect() as db:`, and a sqlite3 connection's context manager only
