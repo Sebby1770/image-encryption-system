@@ -275,3 +275,102 @@ def test_without_the_module_browser_mode_cannot_be_chosen(live_server, browser) 
     page.wait_for_url("**/dashboard")
     assert page.is_disabled("#mode-browser")
     assert page.is_checked("#mode-server")
+
+
+def _share_in_dialog(page, card, username: str, secret: str) -> None:
+    card.locator("button.e2e-share-open").click()
+    page.fill("#e2e-share-form input[name=username]", username)
+    page.fill("#e2e-share-form input[name=secret]", secret)
+    page.click("#e2e-share-form [data-submit]")
+    page.wait_for_selector("#e2e-share-form [data-result]:not([hidden])")
+    _click_expecting_reload(page, "#e2e-share-modal [data-close]")
+
+
+def _open_shared(page, filename: str) -> None:
+    inbox = page.locator(".shared-inbox .asset-card", has_text=filename).first
+    secret = inbox.locator("input[name=secret]")
+    if secret.get_attribute("placeholder") != "Unlocked for this page":
+        secret.fill(PASSWORD)
+    inbox.locator("button[type=submit]").click()
+    page.wait_for_function("() => document.querySelector('#viewer-image')?.naturalWidth > 0")
+    page.click("#viewer [data-close]")
+
+
+def test_batch_upload_then_rekey_cuts_off_a_dropped_recipient(
+    live_server, live_app, browser, tmp_path
+) -> None:
+    recorder = Recorder()
+    paths = []
+    for index in range(3):
+        path = tmp_path / f"batch-{index}.jpg"
+        path.write_bytes(_geotagged_jpeg(size=(40 + index, 30)))
+        paths.append(str(path))
+
+    bob = _user(browser, live_server, "bob", recorder)
+    carol = _user(browser, live_server, "carol", recorder)
+    alice = _user(browser, live_server, "alice", recorder)
+
+    # Three images in one go, all sealed in the browser.
+    alice.set_input_files("input[name=image]", paths)
+    assert "3 images selected" in alice.inner_text("#drop-hint")
+    alice.fill("#passphrase-field input", IMAGE_PASS)
+    _click_expecting_reload(alice, "#upload-form button[type=submit]")
+    assert "Encrypted 3 of 3 images" in alice.inner_text("#e2e-status")
+    store = live_app.extensions["vault_store"]
+    alice_id = store.get_user_by_username("alice").id
+    assets = store.list_assets(alice_id)
+    assert len(assets) == 3 and all(asset.end_to_end for asset in assets)
+
+    # Share one with both Bob and Carol; both can open it.
+    card = alice.locator(".vault-list > .asset-list .asset-card", has_text="batch-0.jpg")
+    _share_in_dialog(alice, card, "bob", IMAGE_PASS)
+    card = alice.locator(".vault-list > .asset-list .asset-card", has_text="batch-0.jpg")
+    _share_in_dialog(alice, card, "carol", IMAGE_PASS)
+    for page in (bob, carol):
+        page.goto("/dashboard")
+        _wait_for_module(page)
+        _open_shared(page, "batch-0.jpg")
+    asset = next(a for a in store.list_assets(alice_id) if a.original_filename == "batch-0.jpg")
+    before = store.read_ciphertext(asset)
+
+    # Re-key, keeping Carol and dropping Bob.
+    card = alice.locator(".vault-list > .asset-list .asset-card", has_text="batch-0.jpg")
+    card.locator("summary", has_text="Re-key").click()
+    card.locator("form.e2e-rekey input[name=keep][value=bob]").uncheck()
+    card.locator("form.e2e-rekey input[name=secret]").fill(IMAGE_PASS)
+    _click_expecting_reload(
+        alice, ".vault-list .asset-card:has-text('batch-0.jpg') form.e2e-rekey button[type=submit]"
+    )
+    assert "Re-keyed in your browser: kept 1 share(s)" in alice.inner_text(".flash-stack")
+    assert store.read_ciphertext(store.get_asset(asset.id)) != before
+
+    bob.goto("/dashboard")
+    _wait_for_module(bob)
+    assert bob.locator(".shared-inbox .asset-card", has_text="batch-0.jpg").count() == 0
+    carol.goto("/dashboard")
+    _wait_for_module(carol)
+    _open_shared(carol, "batch-0.jpg")
+
+    assert not recorder.sent(IMAGE_PASS.encode())
+    assert recorder.problems == [], recorder.problems
+
+
+def test_dropping_files_on_the_upload_panel_selects_them(live_server, browser) -> None:
+    recorder = Recorder()
+    alice = _user(browser, live_server, "alice", recorder)
+    alice.evaluate(
+        """() => {
+            const transfer = new DataTransfer();
+            const bytes = new Uint8Array([137, 80, 78, 71]);
+            for (const name of ["one.png", "two.png"]) {
+                transfer.items.add(new File([bytes], name, { type: "image/png" }));
+            }
+            const form = document.querySelector("#upload-form");
+            const init = { dataTransfer: transfer, bubbles: true, cancelable: true };
+            form.dispatchEvent(new DragEvent("dragover", init));
+            form.dispatchEvent(new DragEvent("drop", init));
+        }"""
+    )
+    assert alice.evaluate("() => document.querySelector('input[name=image]').files.length") == 2
+    assert "2 images selected" in alice.inner_text("#drop-hint")
+    assert recorder.problems == [], recorder.problems

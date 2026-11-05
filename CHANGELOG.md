@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Re-keying, batch uploads, and dark mode
+- **Revocation that holds against a recipient who kept the key.** Revoking a
+  share only deletes its wrap; the data key still opened the stored ciphertext.
+  **Re-key** (end-to-end images) re-encrypts the image in the browser under a
+  fresh key, re-wraps it for the recipients the owner keeps, invalidates every
+  other share and every link, and proves the new envelope opens before sending
+  it. `POST /images/<id>/rekey` requires the same sealed context and a new
+  digest, nonce, and wrap, accepts kept shares only for current unexpired
+  recipients, and swaps the ciphertext and database rows all-or-nothing: the old
+  file is kept until the commit and restored if anything fails, the live file
+  is replaced atomically, and staging is unique per call, so two overlapping
+  re-keys of one image cannot pair one envelope with the other's ciphertext.
+- `GET /images/<id>/envelope`: sharing, linking, and rotating no longer download
+  the whole ciphertext just to read the wrap.
+- **Batch and drag-and-drop uploads** in end-to-end mode: several images at once,
+  each stripped and sealed in the browser, with one summary instead of a flash
+  per file. Server mode still takes one file per request.
+- **Dark mode** following the system setting. Every colour in the stylesheet is
+  now a token, so the dark palette is one block.
+- Checkboxes and radios no longer inherit the 44px text-field box, which made
+  the Favorites filter a large empty square.
+
 ### End-to-end mode (phase 3)
 The threat model listed "the server sees plaintext" as its main non-goal and
 promised a client-side mode. It now exists, and it is the default.

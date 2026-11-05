@@ -130,6 +130,12 @@ Account private keys are `user-<id>-private.key`, sealed by
 AAD). `user-<id>-private.pem` is the legacy PBKDF2 format, still read and
 resealed at sign-in by `VaultStore.upgrade_private_key()`.
 
+Re-keying replaces an image's ciphertext in place (`VaultStore.rekey_asset`):
+staging names are unique per call, the old file is kept (hard link, or a copy)
+until the transaction commits and is restored on any failure, and the live file
+is replaced atomically. Keep that ordering if you touch it: `tests/test_rekey.py`
+fails the swap, fails the commit, and interleaves two re-keys on purpose.
+
 Page modules run at import time, so keep start-up code at the bottom of the
 module: a `const` declared below the call that uses it throws at load (the
 browser tests fail on any console error).
@@ -153,6 +159,8 @@ Add a new `version` instead and keep a test that decrypts the old one.
 - Security fixes are test-first: add the failing regression test, then fix.
 - HTML templates must not contain inline `<script>` or `on*=` handlers: the page
   CSP forbids them. Put behaviour in `static/js/` (a test enforces this).
+- Every colour in `styles.css` is a `:root` token with a dark-mode value in the
+  `prefers-color-scheme: dark` block. Add new colours to both, never inline.
 - Tests never contain secret-shaped literals (GitHub push protection rejects
   them); build fake keys and tokens at runtime.
 - Update `CHANGELOG.md`, `README.md`, and `docs/SECURITY_MODEL.md` when

@@ -54,6 +54,7 @@
           Image file
           <input name="image" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp,image/tiff" required>
         </label>
+        <p class="field-note drop-hint" id="drop-hint">or drop an image here</p>
         <label>
           Algorithm
           <select name="algorithm" id="algorithm-select">
@@ -237,6 +238,39 @@
                     <button class="button button-ghost" type="submit">Save details</button>
                   </form>
                 </details>
+                {% if asset.end_to_end %}
+                  <details class="rotate-details">
+                    <summary>Re-key (cut off old keys)</summary>
+                    <form class="rotate-form e2e-rekey" data-e2e-asset="{{ asset.id }}">
+                      <p class="field-note">
+                        Revoking a share cannot take back a key someone already saved. Re-keying re-encrypts
+                        this image in your browser under a new key: shares you keep get the new key, every
+                        other share and every link stops working.
+                      </p>
+                      {% if recipients.get(asset.id) %}
+                        <fieldset class="keep-list">
+                          <legend>Keep sharing with</legend>
+                          {% for rec in recipients[asset.id] %}
+                            <label class="mode-option">
+                              <input type="checkbox" name="keep" value="{{ rec.username }}" checked>
+                              <span>{{ rec.username }}</span>
+                            </label>
+                          {% endfor %}
+                        </fieldset>
+                      {% endif %}
+                      <label>
+                        {% if asset.algorithm == "AES-GCM" %}Passphrase{% else %}Account password{% endif %}
+                        <input
+                          name="secret"
+                          type="password"
+                          {% if asset.algorithm == "AES-GCM" %}autocomplete="off"{% else %}autocomplete="current-password" data-account-secret{% endif %}
+                          required
+                        >
+                      </label>
+                      <button class="button button-danger" type="submit">Re-key in browser</button>
+                    </form>
+                  </details>
+                {% endif %}
                 {% if asset.algorithm == "AES-GCM" %}
                   <details class="rotate-details">
                     <summary>Rotate passphrase</summary>

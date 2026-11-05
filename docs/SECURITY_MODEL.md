@@ -91,6 +91,8 @@ server.
 
 - `GET /images/<id>/sealed` returns the `.ies` with the caller's own wrap (the
   owner's, or the recipient's share wrap; expired or revoked shares get 403).
+  `GET /images/<id>/envelope` returns the same envelope without the
+  ciphertext, which is all that sharing, linking, and rotating need.
 - RSA wraps need the account private key. `POST /account/private-key` (CSRF,
   throttled with decryption, `no-store`) returns the Scrypt-sealed key; the
   password that opens it is typed into the page and never sent. The opened key
@@ -107,6 +109,33 @@ server.
   their secret is random.
 - Rotation re-wraps in the browser and proves the new wrap opens before the
   server replaces the only primary wrap.
+- **Re-keying** (below) re-encrypts the image under a new data key.
+
+**Re-keying.** Revoking a share deletes the recipient's wrap, but a recipient
+could have kept the data key, and the key opens the stored ciphertext for as
+long as it exists, whether they reach it later through a link, a leaked backup,
+or a breached server. Re-keying closes that: the owner's browser decrypts the
+image, encrypts it again under a fresh data key and nonce, re-wraps the new key
+for the recipients the owner keeps, and proves the new envelope opens before
+sending it. `POST /images/<id>/rekey` then checks the envelope like an upload,
+plus:
+
+- it must seal exactly the same context (asset id, owner, filename, type, and
+  size), so a re-key can only replace an image with itself;
+- its digest, nonce, and wrap must all differ from the current ones, so a
+  client cannot "re-key" by sending the old ciphertext back;
+- every kept share must belong to a current, unexpired recipient and wrap the
+  new key to an RSA public key. Kept shares keep their dates; every other
+  share and every link is deleted.
+
+The swap is all-or-nothing. The new ciphertext is staged beside the old one
+under a name unique to that re-key, so two overlapping re-keys of one image
+cannot swap in each other's bytes. The database changes run in one
+transaction; the old file is kept until that transaction commits and is put
+back if anything fails; and the live file is replaced atomically, so a
+concurrent reader gets the old image or the new one, never neither.
+Re-keying cannot recall copies already downloaded, in plaintext or as `.ies`
+files with their old wraps: it protects what the server stores from then on.
 
 **After decryption** the browser shows the image only as the allow-listed type
 its bytes really are, and only when that matches the sealed format, through an
@@ -337,8 +366,9 @@ this origin. Backups are also validated on restore (see below).
   max_downloads` **before** decryption. Concurrent requests cannot exceed it,
   and a failed decryption hands the download back.
 - Revocation cannot recall plaintext a recipient already downloaded, or a data
-  key they extracted. To fully cut off a recipient, re-upload the image under a
-  new key.
+  key they extracted. For an end-to-end image, **Re-key** retires that key so
+  it no longer opens what the server stores (see "Re-keying"); for a
+  server-mode image, re-upload it.
 
 ## Backup and restore
 

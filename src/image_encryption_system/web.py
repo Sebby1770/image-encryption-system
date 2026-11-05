@@ -890,10 +890,12 @@ def create_app(test_config: dict | None = None) -> Flask:
         except (CryptoError, UnsupportedImageError, ValueError) as exc:
             return _json_error(str(exc), 400)
         _audit(store, user.id, "upload", asset.id)
-        flash(
-            "Image encrypted in your browser and stored. The server only received ciphertext.",
-            "success",
-        )
+        # A batch upload reports once, from the page, instead of once per file.
+        if request.form.get("announce") != "0":
+            flash(
+                "Image encrypted in your browser and stored. The server only received ciphertext.",
+                "success",
+            )
         return jsonify({"ok": True, "asset_id": asset.id}), 201
 
     @app.get("/images/<int:asset_id>/sealed")
@@ -902,12 +904,8 @@ def create_app(test_config: dict | None = None) -> Flask:
         """The ciphertext with the caller's own wrap: the owner's, or their share."""
         user = _require_user(store)
         try:
-            asset, share = _accessible_asset(store, asset_id, user)
+            asset, metadata = _callers_envelope(store, asset_id, user)
             store.ciphertext_sha256(asset)
-            _check_sealed_context(asset, primary_wrap=share is None)
-            metadata = dict(asset.metadata)
-            if share is not None:
-                metadata["key_wrap"] = share.key_wrap
             blob = pack_ies(store.read_ciphertext(asset), metadata)
         except PermissionError as exc:
             return _json_error(str(exc), 403)
@@ -917,6 +915,73 @@ def create_app(test_config: dict | None = None) -> Flask:
             return _json_error(str(exc), 400)
         _audit(store, user.id, "fetch", asset.id)
         return _ciphertext_response(blob, f"{asset.original_filename}.ies")
+
+    @app.get("/images/<int:asset_id>/envelope")
+    @login_required(store)
+    def sealed_envelope(asset_id: int) -> ResponseReturnValue:
+        """Just the envelope with the caller's wrap: enough to share, link, or
+        rotate without downloading the ciphertext."""
+        user = _require_user(store)
+        try:
+            _asset, metadata = _callers_envelope(store, asset_id, user)
+        except PermissionError as exc:
+            return _json_error(str(exc), 403)
+        except LookupError as exc:
+            return _json_error(str(exc), 404)
+        except (CryptoError, ValueError) as exc:
+            return _json_error(str(exc), 400)
+        response = jsonify({"metadata": metadata})
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.post("/images/<int:asset_id>/rekey")
+    @login_required(store)
+    def rekey_sealed(asset_id: int) -> ResponseReturnValue:
+        """Replace an end-to-end image with a copy re-encrypted under a new key.
+
+        Revoking a share deletes its wrap, but cannot take back a data key the
+        recipient may have kept. After a re-key the stored ciphertext needs a
+        key nobody outside the browser that made it has seen; the shares the
+        owner keeps arrive with new wraps, and every link is invalidated.
+        """
+        user = _require_user(store)
+        upload = request.files.get("ciphertext")
+        if upload is None:
+            return _json_error("Missing ciphertext.", 400)
+        try:
+            asset = _owned_asset(store, asset_id, user)
+            _require_end_to_end(asset)
+            ciphertext = upload.read()
+            metadata, _context = _check_sealed_upload(
+                store,
+                user,
+                request.form.get("envelope") or "",
+                ciphertext,
+                max_pixels=app.config["MAX_IMAGE_PIXELS"],
+                replacing=asset,
+            )
+            kept = _kept_shares(store, asset, request.form.get("shares") or "[]")
+            links_revoked = store.rekey_asset(
+                asset.id,
+                user.id,
+                metadata=metadata,
+                ciphertext=ciphertext,
+                shares={recipient.id: wrap for recipient, wrap in kept},
+            )
+        except PermissionError as exc:
+            return _json_error(str(exc), 403)
+        except LookupError as exc:
+            return _json_error(str(exc), 404)
+        except (CryptoError, UnsupportedImageError, ValueError) as exc:
+            return _json_error(str(exc), 400)
+        _audit(store, user.id, "rekey", asset.id)
+        names = [recipient.username for recipient, _wrap in kept]
+        flash(
+            f"Re-keyed in your browser: kept {len(names)} share(s), invalidated "
+            f"{links_revoked} link(s). A key anyone kept from before no longer opens it.",
+            "success",
+        )
+        return jsonify({"ok": True, "kept": names, "links_revoked": links_revoked})
 
     @app.post("/account/private-key")
     @login_required(store)
@@ -1224,6 +1289,7 @@ def _check_sealed_upload(
     ciphertext: bytes,
     *,
     max_pixels: int,
+    replacing: EncryptedAsset | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Validate an envelope sealed in a browser before storing it.
 
@@ -1234,6 +1300,9 @@ def _check_sealed_upload(
     algorithm; a digest that matches the bytes received; and a fresh asset id.
     What it cannot check is that the ciphertext really is that image, which is
     why the browser re-checks the format after decrypting before showing it.
+
+    With ``replacing`` (a re-key), the envelope must seal exactly the context of
+    the image it replaces, under a new key and nonce, instead of a fresh id.
     """
     if not raw_envelope or len(raw_envelope.encode("utf-8")) > MAX_METADATA_BYTES:
         raise ValueError("The envelope is missing or too large.")
@@ -1248,6 +1317,8 @@ def _check_sealed_upload(
         raise CryptoError("End-to-end uploads must seal a complete browser context.")
     if context["owner"] != user.id:
         raise CryptoError("This envelope is sealed to a different account.")
+    if replacing is not None and context != replacing.metadata.get("context"):
+        raise CryptoError("A re-key must seal the same sealed context as the image it replaces.")
     expected_wrap = WRAP_SCRYPT if metadata["algorithm"] == AES_GCM_PASSPHRASE else WRAP_RSA
     if validate_key_wrap(metadata["key_wrap"]) != expected_wrap or context["wrap"] != expected_wrap:
         raise CryptoError("The key wrap does not match the sealed algorithm.")
@@ -1260,9 +1331,59 @@ def _check_sealed_upload(
         raise CryptoError("Encrypted image ciphertext is truncated.")
     if metadata.get("ciphertext_sha256") != sha256(ciphertext).hexdigest():
         raise CryptoError("Ciphertext integrity check failed.")
-    if store.find_asset_by_uuid(context["asset"]) is not None:
+    if replacing is not None:
+        old = replacing.metadata
+        if any(
+            metadata.get(key) == old.get(key)
+            for key in ("ciphertext_sha256", "image_nonce", "key_wrap")
+        ):
+            raise CryptoError("A re-key must encrypt the image again under a new key.")
+    elif store.find_asset_by_uuid(context["asset"]) is not None:
         raise ValueError("An image with this asset id already exists.")
     return metadata, context
+
+
+def _kept_shares(
+    store: VaultStore, asset: EncryptedAsset, raw: str
+) -> list[tuple[User, dict[str, Any]]]:
+    """The shares a re-key keeps: current, unexpired recipients with new wraps."""
+    try:
+        items = json.loads(raw or "[]")
+    except json.JSONDecodeError as exc:
+        raise ValueError("Kept shares must be a JSON list.") from exc
+    if not isinstance(items, list):
+        raise ValueError("Kept shares must be a list.")
+    kept: list[tuple[User, dict[str, Any]]] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("Each kept share needs a username and a key wrap.")
+        username = str(item.get("username", "")).strip().lower()
+        if username in seen:
+            raise ValueError("A recipient is listed more than once.")
+        seen.add(username)
+        recipient = store.get_user_by_username(username)
+        share = store.get_share(asset.id, recipient.id) if recipient is not None else None
+        if recipient is None or share is None or share.is_expired():
+            raise ValueError(f"{username or 'That user'} is not currently shared this image.")
+        key_wrap = item.get("key_wrap")
+        if validate_key_wrap(key_wrap) != WRAP_RSA:
+            raise CryptoError("A kept share must wrap the new key to the recipient's public key.")
+        assert isinstance(key_wrap, dict)
+        kept.append((recipient, key_wrap))
+    return kept
+
+
+def _callers_envelope(
+    store: VaultStore, asset_id: int, user: User
+) -> tuple[EncryptedAsset, dict[str, Any]]:
+    """An image's envelope carrying the caller's own wrap: the owner's, or their share."""
+    asset, share = _accessible_asset(store, asset_id, user)
+    _check_sealed_context(asset, primary_wrap=share is None)
+    metadata = dict(asset.metadata)
+    if share is not None:
+        metadata["key_wrap"] = share.key_wrap
+    return asset, metadata
 
 
 def _throttle(app: Flask, name: str, key: str) -> bool:

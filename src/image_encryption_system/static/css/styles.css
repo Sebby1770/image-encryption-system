@@ -11,6 +11,64 @@
   --amber: #b7791f;
   --red: #b42318;
   --shadow: 0 18px 40px rgba(28, 44, 40, 0.08);
+  --link: #115e59;
+  --on-accent: #ffffff;
+  --accent-glow: rgba(15, 118, 110, 0.2);
+  --focus-ring: rgba(15, 118, 110, 0.16);
+  --topbar-bg: rgba(255, 255, 255, 0.92);
+  --field-bg: #ffffff;
+  --field-line: #bac8c3;
+  --disabled-bg: #edf2f0;
+  --success-line: #a6ddcf;
+  --danger-bg: #fff1f0;
+  --danger-line: #ffd0cc;
+  --warm-bg: #fff8e8;
+  --warm-line: #f1ca7a;
+  --warm-ink: #6f4b00;
+  --badge-line: #9ad8c6;
+  --code-bg: #f0f4f2;
+  --backdrop: rgba(23, 33, 31, 0.35);
+  --backdrop-strong: rgba(23, 33, 31, 0.6);
+  --check-a: #eef2f0;
+  --check-b: #ffffff;
+}
+
+/* Follows the system setting. Every colour above is a token, so this block is
+   the whole dark theme. */
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: #0e1413;
+    --panel: #161f1e;
+    --ink: #e3ebe8;
+    --muted: #9aaca7;
+    --line: #2b3936;
+    --accent: #0f7f74;
+    --accent-strong: #0b675e;
+    --mint: #15352f;
+    --amber: #e5ad4a;
+    --red: #ff8f85;
+    --shadow: 0 18px 40px rgba(0, 0, 0, 0.4);
+    --link: #6fd6c7;
+    --accent-glow: rgba(43, 179, 163, 0.25);
+    --focus-ring: rgba(43, 179, 163, 0.3);
+    --topbar-bg: rgba(22, 31, 30, 0.92);
+    --field-bg: #0f1716;
+    --field-line: #3a4a46;
+    --disabled-bg: #1c2725;
+    --success-line: #2c6457;
+    --danger-bg: #3a1c1a;
+    --danger-line: #6e2f2a;
+    --warm-bg: #33290f;
+    --warm-line: #7a5c1d;
+    --warm-ink: #f2cf86;
+    --badge-line: #2c6457;
+    --code-bg: #0f1716;
+    --backdrop: rgba(0, 0, 0, 0.55);
+    --backdrop-strong: rgba(0, 0, 0, 0.72);
+    --check-a: #222e2c;
+    --check-b: #182220;
+  }
 }
 
 * {
@@ -32,12 +90,12 @@ body {
 }
 
 a {
-  color: var(--accent-strong);
+  color: var(--link);
 }
 
 .topbar {
   align-items: center;
-  background: rgba(255, 255, 255, 0.92);
+  background: var(--topbar-bg);
   border-bottom: 1px solid var(--line);
   display: flex;
   gap: 20px;
@@ -62,7 +120,7 @@ a {
 }
 
 .nav-links a:hover {
-  color: var(--accent-strong);
+  color: var(--link);
 }
 
 .brand {
@@ -102,12 +160,12 @@ a {
 
 .flash-success {
   background: var(--mint);
-  border-color: #a6ddcf;
+  border-color: var(--success-line);
 }
 
 .flash-error {
-  background: #fff1f0;
-  border-color: #ffd0cc;
+  background: var(--danger-bg);
+  border-color: var(--danger-line);
   color: var(--red);
 }
 
@@ -190,8 +248,8 @@ label {
 
 input,
 select {
-  background: #ffffff;
-  border: 1px solid #bac8c3;
+  background: var(--field-bg);
+  border: 1px solid var(--field-line);
   border-radius: 8px;
   color: var(--ink);
   font: inherit;
@@ -200,15 +258,24 @@ select {
   width: 100%;
 }
 
+/* The text-field rule above would stretch these into 44px boxes. */
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--accent);
+  min-height: 0;
+  padding: 0;
+  width: auto;
+}
+
 input:focus,
 select:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.16);
+  box-shadow: 0 0 0 3px var(--focus-ring);
   outline: none;
 }
 
 input:disabled {
-  background: #edf2f0;
+  background: var(--disabled-bg);
   cursor: not-allowed;
 }
 
@@ -233,30 +300,30 @@ input:disabled {
 
 .button-primary {
   background: var(--accent);
-  color: white;
+  color: var(--on-accent);
 }
 
 .button-primary:hover {
   background: var(--accent-strong);
-  box-shadow: 0 10px 24px rgba(15, 118, 110, 0.2);
+  box-shadow: 0 10px 24px var(--accent-glow);
 }
 
 .button-secondary {
-  background: #fff8e8;
-  border-color: #f1ca7a;
-  color: #6f4b00;
+  background: var(--warm-bg);
+  border-color: var(--warm-line);
+  color: var(--warm-ink);
   width: 100%;
 }
 
 .button-ghost {
-  background: #ffffff;
+  background: var(--panel);
   border-color: var(--line);
   color: var(--ink);
 }
 
 .button-danger {
-  background: #fff1f0;
-  border-color: #ffd0cc;
+  background: var(--danger-bg);
+  border-color: var(--danger-line);
   color: var(--red);
 }
 
@@ -399,7 +466,7 @@ input:disabled {
 }
 
 .share-note {
-  color: var(--accent-strong) !important;
+  color: var(--link) !important;
   font-size: 0.86rem;
   margin-top: 8px !important;
 }
@@ -469,7 +536,7 @@ input:disabled {
 }
 
 .share-modal::backdrop {
-  background: rgba(23, 33, 31, 0.35);
+  background: var(--backdrop);
 }
 
 .share-modal form {
@@ -572,8 +639,8 @@ input:disabled {
 
 .badge-e2e {
   background: var(--mint);
-  border: 1px solid #9ad8c6;
-  color: var(--accent-strong);
+  border: 1px solid var(--badge-line);
+  color: var(--link);
 }
 
 .asset-card-e2e {
@@ -602,6 +669,7 @@ input:disabled {
   display: flex;
   flex-direction: row;
   gap: 8px;
+  min-height: 32px; /* the whole row is the tap target */
 }
 
 .mode-option input {
@@ -646,7 +714,7 @@ input:disabled {
 }
 
 .fingerprint {
-  background: #f0f4f2;
+  background: var(--code-bg);
   border-radius: 8px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 0.95rem;
@@ -665,7 +733,7 @@ input:disabled {
 }
 
 .viewer::backdrop {
-  background: rgba(23, 33, 31, 0.6);
+  background: var(--backdrop-strong);
 }
 
 .viewer-head,
@@ -684,7 +752,7 @@ input:disabled {
 
 .viewer img,
 .link-result img {
-  background: repeating-conic-gradient(#eef2f0 0% 25%, #ffffff 0% 50%) 50% / 20px 20px;
+  background: repeating-conic-gradient(var(--check-a) 0% 25%, var(--check-b) 0% 50%) 50% / 20px 20px;
   border-radius: 8px;
   display: block;
   margin: 14px auto;
@@ -705,4 +773,28 @@ input:disabled {
 
 [data-e2e-link] #link-decrypt {
   margin: 10px 0 14px;
+}
+
+.drop-hint {
+  margin-top: -8px;
+}
+
+.upload-panel.is-dropping {
+  outline: 2px dashed var(--accent);
+  outline-offset: 4px;
+}
+
+.keep-list {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 8px 10px;
+}
+
+.keep-list legend {
+  font-size: 0.85rem;
+  font-weight: 800;
+  padding: 0 4px;
 }

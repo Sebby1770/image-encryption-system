@@ -8,7 +8,6 @@ was never given.
 
 from __future__ import annotations
 
-import json
 import re
 from hashlib import sha256
 from io import BytesIO
@@ -16,10 +15,13 @@ from io import BytesIO
 import pytest
 from cryptography.hazmat.primitives import serialization
 from helpers import (
+    BROWSER_PASS,
     PASSWORD,
-    csrf_token,
+    browser_envelope,
     encrypt_png,
     make_app,
+    post_json,
+    post_sealed,
     raw_db,
     register,
     sample_png,
@@ -32,7 +34,6 @@ from image_encryption_system.crypto import (
     MIN_SCRYPT_N,
     RSA_HYBRID,
     decrypt_image_bytes,
-    encrypt_image_bytes,
     load_private_key,
     unpack_ies,
     unwrap_data_key,
@@ -40,46 +41,8 @@ from image_encryption_system.crypto import (
     wrap_data_key_rsa,
 )
 
-IMAGE_PASS = "a browser-side passphrase"
+IMAGE_PASS = BROWSER_PASS
 NEW_PASS = "a rotated browser-side passphrase"
-
-
-def browser_envelope(owner: int, *, algorithm=AES_GCM_PASSPHRASE, public_key=None, **context):
-    """An envelope shaped exactly like ies-crypto.encryptImage's output."""
-    sealed_context = {
-        "owner": owner,
-        "filename": "holiday.png",
-        "mime": "image/png",
-        "format": "PNG",
-        "width": 80,
-        "height": 48,
-        "source": "browser",
-        **context,
-    }
-    result = encrypt_image_bytes(
-        sample_png(),
-        algorithm,
-        passphrase=IMAGE_PASS if algorithm == AES_GCM_PASSPHRASE else None,
-        public_key_pem=public_key,
-        context=sealed_context,
-    )
-    metadata = {**result.metadata, "ciphertext_sha256": sha256(result.ciphertext).hexdigest()}
-    return metadata, result.ciphertext
-
-
-def post_sealed(client, metadata, ciphertext, *, csrf: bool = True):
-    data = {
-        "envelope": json.dumps(metadata),
-        "ciphertext": (BytesIO(ciphertext), "blob"),
-    }
-    if csrf:
-        data["csrf_token"] = csrf_token(client)
-    return client.post("/images/sealed", data=data, content_type="multipart/form-data")
-
-
-def post_json(client, url, payload=None, *, csrf: bool = True):
-    headers = {"X-CSRF-Token": csrf_token(client)} if csrf else {}
-    return client.post(url, json=payload or {}, headers=headers)
 
 
 @pytest.fixture()
