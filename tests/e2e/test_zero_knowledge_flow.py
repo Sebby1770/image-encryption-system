@@ -374,3 +374,80 @@ def test_dropping_files_on_the_upload_panel_selects_them(live_server, browser) -
     assert alice.evaluate("() => document.querySelector('input[name=image]').files.length") == 2
     assert "2 images selected" in alice.inner_text("#drop-hint")
     assert recorder.problems == [], recorder.problems
+
+
+def _real_problems(recorder: Recorder) -> list[str]:
+    """Console errors other than the browser's own note about a refused request."""
+    return [p for p in recorder.problems if "Failed to load resource" not in p]
+
+
+def test_an_expired_session_never_reports_a_false_success(
+    live_server, live_app, browser, tmp_path
+) -> None:
+    """A fetch() after the session ended used to follow the sign-in redirect to
+    an HTML page with status 200 and call it success: "Encrypted 2 of 2" while
+    nothing was stored."""
+    recorder = Recorder()
+    paths = []
+    for index in range(2):
+        path = tmp_path / f"late-{index}.jpg"
+        path.write_bytes(_geotagged_jpeg(size=(30 + index, 20)))
+        paths.append(str(path))
+    alice = _user(browser, live_server, "alice", recorder)
+    store = live_app.extensions["vault_store"]
+    alice_id = store.get_user_by_username("alice").id
+
+    store.delete_user_sessions(alice_id)  # idle timeout, or a sign-out elsewhere
+    alice.set_input_files("input[name=image]", paths)
+    alice.fill("#passphrase-field input", IMAGE_PASS)
+    alice.click("#upload-form button[type=submit]")
+    alice.wait_for_selector("#e2e-status[data-kind='error']", timeout=15_000)
+    assert "session has ended" in alice.inner_text("#e2e-status").lower()
+    assert store.list_assets(alice_id) == []
+
+    # Signing in again shows no leftover success notice either.
+    alice.goto("/")
+    alice.fill("input[name=username]", "alice")
+    alice.fill("input[name=password]", PASSWORD)
+    alice.click("button[type=submit]")
+    alice.wait_for_url("**/dashboard")
+    _wait_for_module(alice)
+    assert alice.is_hidden("#e2e-status")
+    assert "Encrypted 2 of 2" not in alice.inner_text("body")
+    assert _real_problems(recorder) == [], recorder.problems
+
+
+def test_a_truncated_link_key_does_not_spend_a_capped_download(
+    live_server, browser, tmp_path
+) -> None:
+    """Copy-paste that cuts off the end of a link used to spend its only
+    download on a key that could never work."""
+    recorder = Recorder()
+    source = tmp_path / "once.jpg"
+    source.write_bytes(_geotagged_jpeg())
+    alice = _user(browser, live_server, "alice", recorder)
+    alice.set_input_files("input[name=image]", str(source))
+    alice.fill("#passphrase-field input", IMAGE_PASS)
+    _click_expecting_reload(alice, "#upload-form button[type=submit]")
+    card = alice.locator(".vault-list > .asset-list .asset-card").first
+    card.locator("button.e2e-link-open").click()
+    alice.fill("#e2e-link-form input[name=max_downloads]", "1")
+    alice.fill("#e2e-link-form input[name=secret]", IMAGE_PASS)
+    alice.click("#e2e-link-form [data-submit]")
+    alice.wait_for_selector("#e2e-link-form [data-link-output]:not([hidden])")
+    link = alice.input_value("#e2e-link-form [data-link-url]")
+
+    visitor = browser.new_context(accept_downloads=True)
+    cut_short = visitor.new_page()
+    recorder.attach(cut_short)
+    cut_short.goto(link[:-6])
+    assert cut_short.is_disabled("#link-decrypt")
+    assert "incomplete" in cut_short.inner_text("#e2e-status")
+
+    # The whole link still works: the cap of one was not spent.
+    whole = visitor.new_page()
+    recorder.attach(whole)
+    whole.goto(link)
+    whole.click("#link-decrypt")
+    whole.wait_for_function("() => document.querySelector('#link-image')?.naturalWidth > 0")
+    assert recorder.problems == [], recorder.problems

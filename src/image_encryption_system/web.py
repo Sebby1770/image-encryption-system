@@ -1135,7 +1135,7 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.post("/api/token")
     def api_token() -> ResponseReturnValue:
-        payload = request.get_json(silent=True) or {}
+        payload = _json_payload()
         username = str(payload.get("username", ""))
         password = str(payload.get("password", ""))
         blocked = _guard_login(app, username, json_mode=True)
@@ -1186,7 +1186,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     @jwt_required(store)
     def api_share_image(asset_id: int) -> ResponseReturnValue:
         user = g.api_user
-        payload = request.get_json(silent=True) or {}
+        payload = _json_payload()
         try:
             share = _share_asset(
                 store,
@@ -1215,7 +1215,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     @jwt_required(store)
     def api_create_link(asset_id: int) -> ResponseReturnValue:
         user = g.api_user
-        payload = request.get_json(silent=True) or {}
+        payload = _json_payload()
         try:
             token, link = _create_link_share(
                 store,
@@ -1267,8 +1267,25 @@ def create_app(test_config: dict | None = None) -> Flask:
 
 
 def _json_payload() -> dict[str, Any]:
-    payload = request.get_json(silent=True)
+    """The request's JSON object, or ``{}`` for anything else: a list, a
+    scalar, malformed JSON, or nesting deep enough to exhaust the decoder."""
+    try:
+        payload = request.get_json(silent=True)
+    except RecursionError:
+        return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _loads(raw: str, what: str) -> Any:
+    """json.loads for request fields. Python's decoder recurses once per
+    nesting level, so ``"[" * 50000`` raises RecursionError, which would
+    otherwise escape as HTTP 500."""
+    try:
+        return json.loads(raw)
+    except RecursionError as exc:
+        raise ValueError(f"The {what} JSON is nested too deeply.") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"The {what} is not valid JSON.") from exc
 
 
 def _ciphertext_response(blob: bytes, download_name: str) -> Response:
@@ -1306,10 +1323,7 @@ def _check_sealed_upload(
     """
     if not raw_envelope or len(raw_envelope.encode("utf-8")) > MAX_METADATA_BYTES:
         raise ValueError("The envelope is missing or too large.")
-    try:
-        metadata = json.loads(raw_envelope)
-    except json.JSONDecodeError as exc:
-        raise ValueError("The envelope is not valid JSON.") from exc
+    metadata = _loads(raw_envelope, "envelope")
     if validate_envelope(metadata) != ENVELOPE_V3:
         raise CryptoError("End-to-end uploads must use envelope version 3.")
     context = metadata["context"]
@@ -1347,10 +1361,7 @@ def _kept_shares(
     store: VaultStore, asset: EncryptedAsset, raw: str
 ) -> list[tuple[User, dict[str, Any]]]:
     """The shares a re-key keeps: current, unexpired recipients with new wraps."""
-    try:
-        items = json.loads(raw or "[]")
-    except json.JSONDecodeError as exc:
-        raise ValueError("Kept shares must be a JSON list.") from exc
+    items = _loads(raw or "[]", "kept shares")
     if not isinstance(items, list):
         raise ValueError("Kept shares must be a list.")
     kept: list[tuple[User, dict[str, Any]]] = []
@@ -1406,6 +1417,10 @@ def login_required(store: VaultStore) -> Callable[[F], F]:
         @wraps(view)
         def wrapped(*args, **kwargs):
             if not _current_user(store):
+                # A redirect would hand a fetch() caller the sign-in page with
+                # status 200, which the end-to-end page would read as success.
+                if _wants_json():
+                    return _json_error("Your session has ended. Sign in again to continue.", 401)
                 flash("Sign in to continue.", "error")
                 return redirect(url_for("index"))
             return view(*args, **kwargs)

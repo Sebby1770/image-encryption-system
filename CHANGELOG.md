@@ -24,6 +24,33 @@
 - Checkboxes and radios no longer inherit the 44px text-field box, which made
   the Favorites filter a large empty square.
 
+### Fixed (inline review of the end-to-end code)
+Each has a regression test that failed before the fix
+(`tests/test_hostile_requests.py`, `test_rekey.py`, `test_backup.py`,
+`test_private_key_wrap.py`, and two browser tests).
+- **False success after the session ended (medium).** End-to-end `fetch()` calls
+  followed the sign-in redirect, got HTML with status 200, and treated it as
+  success: a batch upload after the idle timeout reported "Encrypted 3 of 3" and
+  stored nothing. `login_required` now answers JSON-accepting requests with a
+  `401`, and the page refuses any redirected or non-JSON answer.
+- **HTTP 500 on deeply nested JSON (low).** `"[" * 50000` exhausted Python's
+  recursive JSON decoder on `/api/token` (no account needed), sealed uploads,
+  re-keys' kept shares, the sealed share/link/rewrap routes, backup restores,
+  and `.ies` headers in the CLI. All now get a clean error.
+- **HTTP 500 on a JSON body that is not an object (low).** `/api/token` (no
+  account needed), `/api/images/<id>/share` and `/api/images/<id>/link` called
+  `.get()` on whatever arrived, so `[1]` crashed them.
+- **A truncated link key spent a capped download (low).** The link page fetched
+  the ciphertext (using up a download) before discovering the key could not
+  work; it now checks the key's shape first.
+- **Restore accepted ciphertext that did not match its digest (low)**, storing
+  an image that could never be opened. The whole backup is now refused.
+- **A re-key of an image deleted meanwhile gave HTTP 500 (low)**; it is now a
+  clean 404 and leaves nothing behind.
+- **Concurrent sign-ins could clobber each other's key upgrade (low).** Both
+  used the same temporary file name, so one could delete the other's
+  half-written key; temporary names are now unique per write.
+
 ### End-to-end mode (phase 3)
 The threat model listed "the server sees plaintext" as its main non-goal and
 promised a client-side mode. It now exists, and it is the default.

@@ -73,14 +73,23 @@ async function busy(button, work) {
   }
 }
 
+const SESSION_ENDED = "Your session has ended. Sign in again to continue.";
+
+// Every successful answer from these routes is JSON. Anything else, above all
+// the sign-in page a redirect leads to (status 200), means the request did not
+// do what it was asked, so it must never be read as success.
 async function readJSON(response) {
+  const isJSON = (response.headers.get("content-type") || "").includes("application/json");
   let data = {};
-  try {
-    data = await response.json();
-  } catch {
-    // fall through to the status-based message
+  if (isJSON) {
+    try {
+      data = await response.json();
+    } catch {
+      // fall through to the status-based message
+    }
   }
   if (!response.ok) throw new Error(data.error || `The server refused the request (${response.status}).`);
+  if (response.redirected || !isJSON) throw new Error(SESSION_ENDED);
   return data;
 }
 
@@ -104,8 +113,13 @@ function postJSON(config, url, body) {
 async function fetchSealed(assetId) {
   const response = await fetch(`/images/${encodeURIComponent(assetId)}/sealed`, {
     credentials: "same-origin",
+    headers: { Accept: "application/octet-stream, application/json" },
   });
   if (!response.ok) await readJSON(response);
+  const type = response.headers.get("content-type") || "";
+  if (response.redirected || !type.startsWith("application/octet-stream")) {
+    throw new Error(SESSION_ENDED);
+  }
   return ies.unpackIES(new Uint8Array(await response.arrayBuffer()));
 }
 

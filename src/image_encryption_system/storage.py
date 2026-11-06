@@ -688,10 +688,13 @@ class VaultStore:
                         (asset_id,),
                     )
                 }
-                db.execute(
+                updated = db.execute(
                     "UPDATE encrypted_assets SET metadata_json = ? WHERE id = ? AND user_id = ?",
                     (json.dumps(stored_meta, sort_keys=True), asset_id, user_id),
                 )
+                if updated.rowcount != 1:
+                    # Deleted (from another tab, say) since it was read above.
+                    raise LookupError("Encrypted image not found.")
                 db.execute("DELETE FROM shares WHERE asset_id = ?", (asset_id,))
                 for recipient_id, key_wrap in shares.items():
                     if recipient_id not in current:
@@ -1327,7 +1330,8 @@ class VaultStore:
                 raise ValueError("Backup is missing manifest.json.")
             try:
                 manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+                # RecursionError: nesting deep enough to exhaust the decoder.
                 raise ValueError("Backup manifest is not valid JSON.") from exc
             assets = manifest.get("assets") if isinstance(manifest, dict) else None
             if not isinstance(assets, list):
@@ -1348,6 +1352,13 @@ class VaultStore:
                 entry["ciphertext"] = archive.read(blob_name)
                 if len(entry["ciphertext"]) < GCM_TAG_BYTES:
                     raise ValueError("Backup ciphertext is truncated.")
+                # Restoring a damaged blob would store an image that can never be
+                # opened; refuse the whole backup instead, like any other bad entry.
+                recorded = entry["metadata"].get("ciphertext_sha256")
+                if recorded is not None and recorded != sha256(entry["ciphertext"]).hexdigest():
+                    raise ValueError(
+                        f"Backup ciphertext {blob_name} does not match its recorded digest."
+                    )
                 pending.append(entry)
 
         restored = 0
@@ -1469,14 +1480,24 @@ def _write_owner_only(path: Path, data: bytes, *, atomic: bool = True) -> None:
     With ``atomic`` the bytes land in a temporary sibling first, so a crash
     never leaves a truncated key behind.
     """
-    target = path.with_name(path.name + ".partial") if atomic else path
-    if target.exists():
-        target.unlink()
-    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(data)
     if atomic:
-        os.replace(target, path)
+        # Unique per call: two sign-ins upgrading one legacy key at once used to
+        # share a temp name, so one could delete the other's half-written file.
+        target = path.with_name(f"{path.name}.{secrets.token_hex(8)}.partial")
+    else:
+        target = path
+        if target.exists():
+            target.unlink()
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        if atomic:
+            os.replace(target, path)
+    except BaseException:
+        if atomic:
+            target.unlink(missing_ok=True)
+        raise
 
 
 def load_or_create_secret(path: Path) -> str:

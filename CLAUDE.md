@@ -161,6 +161,12 @@ Add a new `version` instead and keep a test that decrypts the old one.
   CSP forbids them. Put behaviour in `static/js/` (a test enforces this).
 - Every colour in `styles.css` is a `:root` token with a dark-mode value in the
   `prefers-color-scheme: dark` block. Add new colours to both, never inline.
+- Read request JSON with `web._json_payload()` (bodies) or `web._loads()`
+  (form fields): they turn non-object bodies and nesting deep enough to exhaust
+  Python's recursive decoder into clean 400s instead of 500s.
+- Routes the page calls with `fetch()` sit behind `login_required`, which answers
+  JSON-accepting requests with a 401 instead of a redirect; page modules must
+  treat a redirected or non-JSON answer as failure (`readJSON` in vault-e2e.js).
 - Tests never contain secret-shaped literals (GitHub push protection rejects
   them); build fake keys and tokens at runtime.
 - Update `CHANGELOG.md`, `README.md`, and `docs/SECURITY_MODEL.md` when

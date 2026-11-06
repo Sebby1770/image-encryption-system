@@ -106,7 +106,9 @@ server.
   data key is wrapped under a separate 256-bit secret that the browser puts in
   the URL fragment, which browsers never send. The server counts downloads but
   cannot open what it hands out. Scrypt runs at the floor for link wraps, since
-  their secret is random.
+  their secret is random. The link page checks the key's shape (43 base64url
+  characters) before fetching, so a link cut short in copy-paste does not spend
+  a capped download on a key that cannot work.
 - Rotation re-wraps in the browser and proves the new wrap opens before the
   server replaces the only primary wrap.
 - **Re-keying** (below) re-encrypts the image under a new data key.
@@ -136,6 +138,14 @@ back if anything fails; and the live file is replaced atomically, so a
 concurrent reader gets the old image or the new one, never neither.
 Re-keying cannot recall copies already downloaded, in plaintext or as `.ies`
 files with their old wraps: it protects what the server stores from then on.
+
+**A request can never fail silently.** When the session has ended (idle
+timeout, sign-out elsewhere, password change), the end-to-end routes answer a
+request that accepts JSON with a `401` and a JSON error rather than a redirect,
+and the page treats any answer that is redirected, or is not the JSON or
+ciphertext it asked for, as a failure. Before this, `fetch()` followed the
+redirect to the sign-in page, received status 200, and a batch upload could
+report "Encrypted 3 of 3" having stored nothing.
 
 **After decryption** the browser shows the image only as the allow-listed type
 its bytes really are, and only when that matches the sealed format, through an
@@ -271,7 +281,10 @@ with every XOR mask class and requires decryption to fail.
 
 Salt, nonce, and wrapped-key lengths are checked before use. Malformed input
 raises `CryptoError`, so the CLI exits 1 and the web app returns a clean error
-rather than a traceback.
+rather than a traceback. That includes JSON nested deeply enough to exhaust
+Python's recursive decoder (`"[" * 50000`), in `.ies` headers, envelopes,
+request bodies, kept-share lists, and backup manifests, and request bodies
+that are JSON but not an object.
 
 ## Uploads
 
@@ -379,7 +392,9 @@ validates **every** entry before writing anything:
 - the uncompressed total is at most 64 MiB, with at most 1000 assets;
 - each blob may be referenced only once;
 - each envelope must be well formed, and each asset an allow-listed image whose
-  MIME type matches its format.
+  MIME type matches its format;
+- each blob must match its envelope's `ciphertext_sha256`, so a damaged backup
+  restores nothing instead of an image that can never be opened.
 
 Version 3 assets must be sealed to the restoring account, and one whose asset
 id already exists in this vault is skipped, so restoring twice is harmless.

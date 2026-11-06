@@ -427,3 +427,24 @@ def test_a_commit_that_fails_after_the_swap_restores_the_old_file(vault, monkeyp
     assert decrypt_image_bytes(before, after.metadata, passphrase=BROWSER_PASS) == sample_png()
     leftovers = [p.name for p in store.vault_dir.iterdir() if not p.name.endswith(".enc")]
     assert leftovers == []
+
+
+def test_a_rekey_of_an_image_deleted_meanwhile_is_a_clean_not_found(vault, monkeypatch) -> None:
+    """The owner deletes the image in another tab while a re-key is in flight."""
+    app, _clients = vault
+    store = app.extensions["vault_store"]
+    asset_id, metadata, _old, _link = _shared_vault(vault)
+    new_metadata, new_ciphertext, _key = _rekeyed(metadata)
+    real_transaction = storage.VaultStore._transaction
+
+    @contextmanager
+    def deleted_first(self):
+        store.delete_asset(asset_id, 1)
+        with real_transaction(self) as db:
+            yield db
+
+    monkeypatch.setattr(storage.VaultStore, "_transaction", deleted_first)
+    with pytest.raises(LookupError):
+        store.rekey_asset(asset_id, 1, metadata=new_metadata, ciphertext=new_ciphertext, shares={})
+    monkeypatch.undo()
+    assert list(store.vault_dir.iterdir()) == []  # nothing staged or copied left behind
