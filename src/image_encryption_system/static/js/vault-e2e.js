@@ -73,14 +73,23 @@ async function busy(button, work) {
   }
 }
 
+const SESSION_ENDED = "Your session has ended. Sign in again to continue.";
+
+// Every successful answer from these routes is JSON. Anything else, above all
+// the sign-in page a redirect leads to (status 200), means the request did not
+// do what it was asked, so it must never be read as success.
 async function readJSON(response) {
+  const isJSON = (response.headers.get("content-type") || "").includes("application/json");
   let data = {};
-  try {
-    data = await response.json();
-  } catch {
-    // fall through to the status-based message
+  if (isJSON) {
+    try {
+      data = await response.json();
+    } catch {
+      // fall through to the status-based message
+    }
   }
   if (!response.ok) throw new Error(data.error || `The server refused the request (${response.status}).`);
+  if (response.redirected || !isJSON) throw new Error(SESSION_ENDED);
   return data;
 }
 
@@ -104,9 +113,46 @@ function postJSON(config, url, body) {
 async function fetchSealed(assetId) {
   const response = await fetch(`/images/${encodeURIComponent(assetId)}/sealed`, {
     credentials: "same-origin",
+    headers: { Accept: "application/octet-stream, application/json" },
   });
   if (!response.ok) await readJSON(response);
+  const type = response.headers.get("content-type") || "";
+  if (response.redirected || !type.startsWith("application/octet-stream")) {
+    throw new Error(SESSION_ENDED);
+  }
   return ies.unpackIES(new Uint8Array(await response.arrayBuffer()));
+}
+
+// Only the envelope (with the caller's wrap): sharing, linking, and rotating
+// need the key, not the ciphertext.
+async function fetchEnvelope(config, assetId) {
+  const { metadata } = await getJSON(config, `/images/${encodeURIComponent(assetId)}/envelope`);
+  return metadata;
+}
+
+// A message to show after the reload that follows a batch upload or re-key,
+// when one server flash per request would not tell the whole story.
+const NOTICE_KEY = "ies-notice";
+
+function rememberNotice(text, kind) {
+  try {
+    sessionStorage.setItem(NOTICE_KEY, JSON.stringify({ text, kind }));
+  } catch {
+    // storage unavailable: the cards themselves still show the result
+  }
+}
+
+function showRememberedNotice() {
+  try {
+    const raw = sessionStorage.getItem(NOTICE_KEY);
+    sessionStorage.removeItem(NOTICE_KEY);
+    if (raw) {
+      const { text, kind } = JSON.parse(raw);
+      status(text, kind);
+    }
+  } catch {
+    // nothing remembered
+  }
 }
 
 // The account's private key is opened once per page and kept only as a
@@ -159,42 +205,104 @@ function setUpUpload(config) {
       "The server stores ciphertext it cannot open. TIFF needs server mode.",
     server: "Server mode: the image is sent to the server, stripped of metadata, and encrypted there.",
   };
+  const input = form.querySelector("input[name=image]");
+  const hint = document.querySelector("#drop-hint");
+  const describeSelection = () => {
+    const count = input.files.length;
+    hint.textContent =
+      count > 1 ? `${count} images selected` : browserMode.checked ? "or drop images here" : "or drop an image here";
+  };
   const sync = () => {
     note.textContent = browserMode.checked ? notes.browser : notes.server;
+    // Server mode posts one file per request; the browser loops over a batch.
+    input.multiple = browserMode.checked;
+    describeSelection();
   };
   browserMode.disabled = false;
   browserMode.checked = true;
   browserMode.addEventListener("change", sync);
   serverMode.addEventListener("change", sync);
+  input.addEventListener("change", describeSelection);
   sync();
+
+  form.addEventListener("dragover", (event) => {
+    if (!event.dataTransfer || !Array.from(event.dataTransfer.types).includes("Files")) return;
+    event.preventDefault();
+    form.classList.add("is-dropping");
+  });
+  form.addEventListener("dragleave", (event) => {
+    if (!form.contains(event.relatedTarget)) form.classList.remove("is-dropping");
+  });
+  form.addEventListener("drop", (event) => {
+    if (!event.dataTransfer || !event.dataTransfer.files.length) return;
+    event.preventDefault();
+    form.classList.remove("is-dropping");
+    const files = new DataTransfer();
+    const dropped = Array.from(event.dataTransfer.files);
+    for (const file of input.multiple ? dropped : dropped.slice(0, 1)) files.items.add(file);
+    input.files = files.files;
+    describeSelection();
+  });
 
   form.addEventListener("submit", async (event) => {
     if (!browserMode.checked) return; // plain form post, as before
     event.preventDefault();
     const button = form.querySelector("button[type=submit]");
     try {
-      await busy(button, () => encryptAndUpload(config, form));
-      window.location.reload();
+      const reload = await busy(button, () => encryptBatch(config, form, Array.from(input.files)));
+      if (reload) window.location.reload();
     } catch {
       // already reported in the status line
     }
   });
 }
 
-async function encryptAndUpload(config, form) {
-  const file = form.querySelector("input[name=image]").files[0];
-  if (!file) throw new Error("Choose an image to encrypt.");
-  // Leave room for the envelope and multipart framing under the request cap.
-  if (file.size > config.maxBytes - 64 * 1024) {
-    throw new Error(`File exceeds the ${Math.floor(config.maxBytes / 1048576)} MB upload limit.`);
-  }
+// One file behaves as before (errors stay on the page, the server's flash
+// confirms success). A batch carries on past failures and reports them all.
+async function encryptBatch(config, form, files) {
+  if (!files.length) throw new Error("Choose an image to encrypt.");
   const algorithm = form.querySelector("[name=algorithm]").value;
   const passphrase = form.querySelector("[name=passphrase]").value;
   if (algorithm === ies.AES_GCM_PASSPHRASE && !passphrase) {
     throw new Error("AES-GCM mode requires a passphrase.");
   }
+  let publicKey;
+  if (algorithm === ies.RSA_HYBRID) {
+    const own = await getJSON(config, `/users/${encodeURIComponent(config.username)}/public-key`);
+    publicKey = await ies.importPublicKey(own.public_key);
+  }
+  const options = { algorithm, passphrase, publicKey };
+  if (files.length === 1) {
+    await encryptAndUpload(config, files[0], options, { announce: true, prefix: "" });
+    return true;
+  }
+  const failures = [];
+  for (const [index, file] of files.entries()) {
+    try {
+      await encryptAndUpload(config, file, options, {
+        announce: false,
+        prefix: `${index + 1} of ${files.length} (${file.name}): `,
+      });
+    } catch (error) {
+      failures.push(`${file.name}: ${explain(error)}`);
+    }
+  }
+  const stored = files.length - failures.length;
+  const summary =
+    `Encrypted ${stored} of ${files.length} images in your browser; the server only received ciphertext.` +
+    (failures.length ? ` Not stored: ${failures.join("; ")}` : "");
+  if (!stored) throw new Error(summary);
+  rememberNotice(summary, failures.length ? "error" : "info");
+  return true;
+}
 
-  status("Stripping metadata in your browser…");
+async function encryptAndUpload(config, file, { algorithm, passphrase, publicKey }, { announce, prefix }) {
+  // Leave room for the envelope and multipart framing under the request cap.
+  if (file.size > config.maxBytes - 64 * 1024) {
+    throw new Error(`File exceeds the ${Math.floor(config.maxBytes / 1048576)} MB upload limit.`);
+  }
+
+  status(`${prefix}Stripping metadata in your browser…`);
   const original = new Uint8Array(await file.arrayBuffer());
   let prepared = prepareImage(original);
   if (prepared.format === "JPEG" && prepared.orientation > 1) {
@@ -205,12 +313,7 @@ async function encryptAndUpload(config, form) {
     throw new ImageError(`Image is too large to process (over ${config.maxPixels.toLocaleString()} pixels).`);
   }
 
-  let publicKey;
-  if (algorithm === ies.RSA_HYBRID) {
-    const own = await getJSON(config, `/users/${encodeURIComponent(config.username)}/public-key`);
-    publicKey = own.public_key;
-  }
-  status("Deriving the key and encrypting…");
+  status(`${prefix}Deriving the key and encrypting…`);
   const sealed = await ies.encryptImage(prepared.bytes, {
     algorithm,
     passphrase,
@@ -228,9 +331,10 @@ async function encryptAndUpload(config, form) {
   });
   sealed.dataKey.fill(0);
 
-  status("Uploading ciphertext…");
+  status(`${prefix}Uploading ciphertext…`);
   const body = new FormData();
   body.append("csrf_token", config.csrf);
+  body.append("announce", announce ? "1" : "0");
   body.append("envelope", JSON.stringify(sealed.metadata));
   body.append("ciphertext", new Blob([sealed.ciphertext], { type: "application/octet-stream" }), "sealed.bin");
   await fetch("/images/sealed", {
@@ -384,7 +488,7 @@ function setUpShare(config) {
     try {
       await busy(submit, async () => {
         status("Unwrapping the key in your browser…");
-        const { metadata } = await fetchSealed(form.dataset.assetId);
+        const metadata = await fetchEnvelope(config, form.dataset.assetId);
         const dataKey = await dataKeyFor(config, metadata.key_wrap, fields.get("secret"));
         status(`Fetching ${username}'s public key…`);
         const recipient = await getJSON(config, `/users/${encodeURIComponent(username)}/public-key`);
@@ -446,7 +550,7 @@ function setUpLink(config) {
     try {
       await busy(submit, async () => {
         status("Unwrapping the key in your browser…");
-        const { metadata } = await fetchSealed(form.dataset.assetId);
+        const metadata = await fetchEnvelope(config, form.dataset.assetId);
         const dataKey = await dataKeyFor(config, metadata.key_wrap, fields.get("secret"));
         // 256 random bits: Scrypt's cost adds nothing, so the floor is used.
         const linkSecret = ies.b64urlEncode(ies.randomBytes(32));
@@ -483,7 +587,7 @@ function setUpRotate(config) {
       try {
         await busy(button, async () => {
           status("Re-wrapping the key in your browser…");
-          const { metadata } = await fetchSealed(form.dataset.e2eAsset);
+          const metadata = await fetchEnvelope(config, form.dataset.e2eAsset);
           const dataKey = await ies.unwrapDataKeyPassphrase(metadata.key_wrap, fields.get("old_passphrase"));
           const keyWrap = await ies.wrapDataKeyPassphrase(dataKey, fields.get("new_passphrase"), {
             n: config.scryptN,
@@ -502,6 +606,84 @@ function setUpRotate(config) {
       }
     });
   });
+}
+
+// ---------------------------------------------------------------------------
+// Re-key: revocation that holds even against a recipient who kept the key
+
+function setUpRekey(config) {
+  document.querySelectorAll("form.e2e-rekey").forEach((form) => {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const button = form.querySelector("button[type=submit]");
+      const fields = new FormData(form);
+      try {
+        await busy(button, () => rekey(config, form.dataset.e2eAsset, fields));
+        window.location.reload();
+      } catch {
+        // reported
+      }
+    });
+  });
+}
+
+async function rekey(config, assetId, fields) {
+  const secret = fields.get("secret");
+  const keep = fields.getAll("keep").map(String);
+  status("Fetching ciphertext…");
+  const { ciphertext, metadata } = await fetchSealed(assetId);
+  const oldKey = await dataKeyFor(config, metadata.key_wrap, secret);
+  status("Decrypting and re-encrypting under a new key in your browser…");
+  const plaintext = await ies.decryptImage(ciphertext, metadata, oldKey);
+  oldKey.fill(0);
+
+  let publicKey;
+  if (metadata.algorithm === ies.RSA_HYBRID) {
+    const own = await getJSON(config, `/users/${encodeURIComponent(config.username)}/public-key`);
+    publicKey = own.public_key;
+  }
+  // Same sealed context (asset id, owner, type, size): only the key changes.
+  const sealed = await ies.encryptImage(plaintext, {
+    algorithm: metadata.algorithm,
+    passphrase: secret,
+    publicKey,
+    n: config.scryptN,
+    context: metadata.context,
+  });
+
+  const shares = [];
+  for (const username of keep) {
+    status(`Re-wrapping the new key for ${username}…`);
+    const recipient = await getJSON(config, `/users/${encodeURIComponent(username)}/public-key`);
+    shares.push({ username, key_wrap: await ies.wrapDataKeyRSA(sealed.dataKey, recipient.public_key) });
+  }
+
+  // This replaces the only copy the server holds, which it cannot check, so
+  // prove the new envelope opens to the same image before sending it.
+  const reopened = await ies.decryptImage(
+    sealed.ciphertext,
+    sealed.metadata,
+    await dataKeyFor(config, sealed.metadata.key_wrap, secret),
+  );
+  if ((await ies.sha256Hex(reopened)) !== (await ies.sha256Hex(plaintext))) {
+    throw new Error("The re-encrypted image did not verify; nothing was changed.");
+  }
+  plaintext.fill(0);
+  reopened.fill(0);
+  sealed.dataKey.fill(0);
+
+  status("Replacing the stored ciphertext…");
+  const body = new FormData();
+  body.append("csrf_token", config.csrf);
+  body.append("envelope", JSON.stringify(sealed.metadata));
+  body.append("shares", JSON.stringify(shares));
+  body.append("ciphertext", new Blob([sealed.ciphertext], { type: "application/octet-stream" }), "sealed.bin");
+  await fetch(`/images/${encodeURIComponent(assetId)}/rekey`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { Accept: "application/json" },
+    body,
+  }).then(readJSON);
 }
 
 // ---------------------------------------------------------------------------
@@ -525,6 +707,8 @@ if (root && globalThis.crypto && globalThis.crypto.subtle) {
   setUpShare(config);
   setUpLink(config);
   setUpRotate(config);
+  setUpRekey(config);
+  showRememberedNotice();
   document.querySelectorAll(".e2e-share-open, .e2e-link-open").forEach((button) => {
     button.disabled = false;
   });

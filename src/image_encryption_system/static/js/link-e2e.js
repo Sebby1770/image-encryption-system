@@ -4,6 +4,11 @@
 import * as ies from "./ies-crypto.js";
 import { BROWSER_FORMATS, sniffFormat } from "./ies-image.js";
 
+// Link keys are 32 random bytes in base64url: always 43 characters. Checking
+// the shape before fetching keeps a key cut short in copy-paste from spending a
+// capped download it could never use.
+const LINK_KEY = /^[A-Za-z0-9_-]{43}$/;
+
 const panel = document.querySelector("[data-e2e-link]");
 const button = document.querySelector("#link-decrypt");
 const statusLine = document.querySelector("#e2e-status");
@@ -19,6 +24,13 @@ if (panel && button) {
   if (!secret) {
     button.disabled = true;
     status("This link is missing its key: the part after # was not included when it was copied.", "error");
+  } else if (!LINK_KEY.test(secret)) {
+    button.disabled = true;
+    status(
+      "This link is incomplete: its key (the part after #) was cut short or changed. " +
+        "Ask for the full link again; trying this one would use up a download.",
+      "error",
+    );
   }
   button.addEventListener("click", async () => {
     button.disabled = true;

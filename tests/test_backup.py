@@ -9,6 +9,7 @@ from helpers import (
     make_app,
     register,
     sample_png,
+    with_csrf,
 )
 
 
@@ -102,3 +103,31 @@ def test_backup_requires_owner_and_logs_event(tmp_path) -> None:
     logout(client)
     denied = client.get("/backup", follow_redirects=True)
     assert b"Sign in to continue" in denied.data
+
+
+def test_restore_refuses_ciphertext_that_does_not_match_its_digest(tmp_path) -> None:
+    """A damaged backup used to restore an image that could then never be opened."""
+    app = make_app(tmp_path)
+    client = app.test_client()
+    register(client, "alice")
+    encrypt_png(client)
+    store = app.extensions["vault_store"]
+    archive = client.get("/backup").data
+
+    damaged = BytesIO()
+    with zipfile.ZipFile(BytesIO(archive)) as source, zipfile.ZipFile(damaged, "w") as target:
+        for info in source.infolist():
+            data = source.read(info.filename)
+            if info.filename.startswith("assets/"):
+                data = bytes([data[0] ^ 1]) + data[1:]  # one flipped bit; digest unchanged
+            target.writestr(info.filename, data)
+    store.delete_asset(store.list_assets(1)[0].id, 1)
+
+    response = client.post(
+        "/restore",
+        data=with_csrf(client, {"backup": (BytesIO(damaged.getvalue()), "backup.zip")}),
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert b"does not match its recorded digest" in response.data
+    assert store.list_assets(1) == []

@@ -332,3 +332,17 @@ def test_cli_keygen_writes_the_scrypt_format_and_pem_on_request(tmp_path) -> Non
             == 0
         )
         assert restored.read_bytes() == image.read_bytes()
+
+
+def test_key_writes_never_touch_another_writers_temporary_file(tmp_path) -> None:
+    """Two sign-ins upgrading one legacy key used to share a temp-file name, so
+    one could delete the other's half-written file and swap in a partial key."""
+    from image_encryption_system.storage import _write_owner_only
+
+    target = tmp_path / "user-1-private.key"
+    in_progress = target.with_name(target.name + ".partial")
+    in_progress.write_bytes(b"another writer's half-written key")
+    _write_owner_only(target, b"sealed key")
+    assert target.read_bytes() == b"sealed key"
+    assert in_progress.read_bytes() == b"another writer's half-written key"
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted([target.name, in_progress.name])

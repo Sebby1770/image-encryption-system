@@ -1,12 +1,14 @@
+import json
 import secrets
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from hashlib import sha256
 from io import BytesIO
 
 from PIL import Image
 
-from image_encryption_system.crypto import AES_GCM_PASSPHRASE
+from image_encryption_system.crypto import AES_GCM_PASSPHRASE, encrypt_image_bytes
 from image_encryption_system.web import create_app
 
 PASSWORD = "correct horse battery"
@@ -103,3 +105,46 @@ def bearer_headers(client, username: str, password: str = PASSWORD) -> dict[str,
     response = client.post("/api/token", json={"username": username, "password": password})
     token = response.get_json()["token"]
     return {"Authorization": f"Bearer {token}"}
+
+
+# End-to-end mode: envelopes shaped like the browser's, built with crypto.py.
+
+BROWSER_PASS = "a browser-side passphrase"
+
+
+def browser_envelope(owner: int, *, algorithm=AES_GCM_PASSPHRASE, public_key=None, **context):
+    """An envelope shaped exactly like ies-crypto.encryptImage's output."""
+    sealed_context = {
+        "owner": owner,
+        "filename": "holiday.png",
+        "mime": "image/png",
+        "format": "PNG",
+        "width": 80,
+        "height": 48,
+        "source": "browser",
+        **context,
+    }
+    result = encrypt_image_bytes(
+        sample_png(),
+        algorithm,
+        passphrase=BROWSER_PASS if algorithm == AES_GCM_PASSPHRASE else None,
+        public_key_pem=public_key,
+        context=sealed_context,
+    )
+    metadata = {**result.metadata, "ciphertext_sha256": sha256(result.ciphertext).hexdigest()}
+    return metadata, result.ciphertext
+
+
+def post_sealed(client, metadata, ciphertext, *, csrf: bool = True):
+    data = {
+        "envelope": json.dumps(metadata),
+        "ciphertext": (BytesIO(ciphertext), "blob"),
+    }
+    if csrf:
+        data["csrf_token"] = csrf_token(client)
+    return client.post("/images/sealed", data=data, content_type="multipart/form-data")
+
+
+def post_json(client, url, payload=None, *, csrf: bool = True):
+    headers = {"X-CSRF-Token": csrf_token(client)} if csrf else {}
+    return client.post(url, json=payload or {}, headers=headers)

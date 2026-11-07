@@ -4,6 +4,7 @@ import hmac
 import json
 import os
 import secrets
+import shutil
 import sqlite3
 import time
 import zipfile
@@ -643,6 +644,94 @@ class VaultStore:
             )
         return self.get_asset(asset_id)
 
+    def rekey_asset(
+        self,
+        asset_id: int,
+        user_id: int,
+        *,
+        metadata: dict[str, Any],
+        ciphertext: bytes,
+        shares: dict[int, dict[str, Any]],
+    ) -> int:
+        """Replace an image's ciphertext and envelope with a re-keyed copy.
+
+        Every old wrap unwraps the retired key, so every share not in
+        ``shares`` (recipient id to its new wrap) is deleted, kept shares keep
+        their creation time and expiry, and every link is deleted. Returns how
+        many links went.
+
+        The file swap and the database update succeed or fail together: the
+        previous ciphertext is kept until the transaction has committed, and is
+        put back if anything fails. The live file is replaced atomically and is
+        never absent, so a concurrent reader gets the old image or the new one.
+        Staging names are unique per call, so two overlapping re-keys of one
+        image can never swap in each other's bytes.
+        """
+        asset = self.get_asset(asset_id)
+        if asset.user_id != user_id:
+            raise PermissionError("You do not have access to this encrypted image.")
+        path = self.vault_dir / asset.stored_filename
+        token = secrets.token_hex(8)
+        staged = path.with_name(f"{path.name}.{token}.rekey")
+        previous = path.with_name(f"{path.name}.{token}.previous")
+        staged.write_bytes(ciphertext)
+        stored_meta = dict(metadata)
+        stored_meta.setdefault("ciphertext_sha256", sha256(ciphertext).hexdigest())
+        swapped = False
+        try:
+            with self._transaction() as db:
+                current = {
+                    int(row["recipient_user_id"]): row
+                    for row in db.execute(
+                        "SELECT recipient_user_id, created_at, expires_at FROM shares"
+                        " WHERE asset_id = ?",
+                        (asset_id,),
+                    )
+                }
+                updated = db.execute(
+                    "UPDATE encrypted_assets SET metadata_json = ? WHERE id = ? AND user_id = ?",
+                    (json.dumps(stored_meta, sort_keys=True), asset_id, user_id),
+                )
+                if updated.rowcount != 1:
+                    # Deleted (from another tab, say) since it was read above.
+                    raise LookupError("Encrypted image not found.")
+                db.execute("DELETE FROM shares WHERE asset_id = ?", (asset_id,))
+                for recipient_id, key_wrap in shares.items():
+                    if recipient_id not in current:
+                        raise ValueError("Only current recipients can be kept.")
+                    db.execute(
+                        """
+                        INSERT INTO shares (
+                            asset_id, recipient_user_id, key_wrap_json, created_at, expires_at
+                        )
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            asset_id,
+                            recipient_id,
+                            json.dumps(key_wrap, sort_keys=True),
+                            current[recipient_id]["created_at"],
+                            current[recipient_id]["expires_at"],
+                        ),
+                    )
+                links = db.execute("DELETE FROM link_shares WHERE asset_id = ?", (asset_id,))
+                links_revoked = int(links.rowcount or 0)
+                _keep_copy(path, previous)
+                swapped = True
+                os.replace(staged, path)
+        except BaseException:
+            if swapped and previous.exists():
+                if path.exists() and os.path.samefile(previous, path):
+                    # The new file never landed; renaming one hard link over
+                    # another of the same file is a no-op, so just drop it.
+                    previous.unlink()
+                else:
+                    os.replace(previous, path)
+            staged.unlink(missing_ok=True)
+            raise
+        previous.unlink(missing_ok=True)
+        return links_revoked
+
     def create_share(
         self,
         *,
@@ -1241,7 +1330,8 @@ class VaultStore:
                 raise ValueError("Backup is missing manifest.json.")
             try:
                 manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+                # RecursionError: nesting deep enough to exhaust the decoder.
                 raise ValueError("Backup manifest is not valid JSON.") from exc
             assets = manifest.get("assets") if isinstance(manifest, dict) else None
             if not isinstance(assets, list):
@@ -1262,6 +1352,13 @@ class VaultStore:
                 entry["ciphertext"] = archive.read(blob_name)
                 if len(entry["ciphertext"]) < GCM_TAG_BYTES:
                     raise ValueError("Backup ciphertext is truncated.")
+                # Restoring a damaged blob would store an image that can never be
+                # opened; refuse the whole backup instead, like any other bad entry.
+                recorded = entry["metadata"].get("ciphertext_sha256")
+                if recorded is not None and recorded != sha256(entry["ciphertext"]).hexdigest():
+                    raise ValueError(
+                        f"Backup ciphertext {blob_name} does not match its recorded digest."
+                    )
                 pending.append(entry)
 
         restored = 0
@@ -1366,20 +1463,41 @@ class VaultStore:
             connection.close()
 
 
+def _keep_copy(path: Path, copy: Path) -> None:
+    """Make ``path``'s current contents reachable at ``copy`` without moving it.
+
+    A hard link costs nothing; filesystems without them get a real copy.
+    """
+    try:
+        os.link(path, copy)
+    except OSError:
+        shutil.copyfile(path, copy)
+
+
 def _write_owner_only(path: Path, data: bytes, *, atomic: bool = True) -> None:
     """Write a key file readable by this process's user only (mode 0600).
 
     With ``atomic`` the bytes land in a temporary sibling first, so a crash
     never leaves a truncated key behind.
     """
-    target = path.with_name(path.name + ".partial") if atomic else path
-    if target.exists():
-        target.unlink()
-    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(data)
     if atomic:
-        os.replace(target, path)
+        # Unique per call: two sign-ins upgrading one legacy key at once used to
+        # share a temp name, so one could delete the other's half-written file.
+        target = path.with_name(f"{path.name}.{secrets.token_hex(8)}.partial")
+    else:
+        target = path
+        if target.exists():
+            target.unlink()
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        if atomic:
+            os.replace(target, path)
+    except BaseException:
+        if atomic:
+            target.unlink(missing_ok=True)
+        raise
 
 
 def load_or_create_secret(path: Path) -> str:

@@ -279,7 +279,7 @@ def _parse_private_key(blob: Any) -> dict[str, Any]:
         raise CryptoError("Private key file is not valid.")
     try:
         wrapped = json.loads(blob.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise CryptoError("Private key file is not valid.") from exc
     required = PRIVATE_KEY_FIELDS - {"owner"}
     if not isinstance(wrapped, dict) or not required <= set(wrapped) <= PRIVATE_KEY_FIELDS:
@@ -575,7 +575,8 @@ def unpack_ies(blob: bytes) -> tuple[bytes, dict[str, Any]]:
         raise CryptoError("IES vault file metadata is truncated.")
     try:
         metadata = json.loads(blob[start:end].decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        # RecursionError: nesting deep enough to exhaust the decoder.
         raise CryptoError("IES vault file metadata is invalid.") from exc
     if not isinstance(metadata, dict):
         raise CryptoError("IES vault file metadata is invalid.")

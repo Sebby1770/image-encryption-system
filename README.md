@@ -22,6 +22,11 @@ for TIFF and for clients without JavaScript.
   appended after the image, with every pixel kept.
 - **End-to-end links** keep their key in the URL fragment, which browsers never
   send; the server counts downloads but cannot open what it serves.
+- **Re-key** an end-to-end image to make revocation stick: it is re-encrypted in
+  the browser under a new key, so a key a former recipient kept no longer opens
+  what the server stores.
+- **Batch and drag-and-drop uploads** in end-to-end mode, and a **dark mode**
+  that follows your system setting.
 - **Key fingerprints** for comparing a recipient's key out of band before
   trusting a share.
 - **Account private keys sealed with Scrypt + AES-GCM**, not OpenSSL's 2,048-round
@@ -131,6 +136,9 @@ Choose **In this browser** (the default once the page's module loads):
    their Account page.
 5. **Link** creates a URL whose key is after the `#`. Anyone with the whole link
    can decrypt it in their browser, within its expiry and download cap.
+6. **Re-key** re-encrypts the image under a new key in your browser. Choose which
+   recipients keep access; every other share and every link stops working, and
+   a key anyone saved from before no longer opens the stored ciphertext.
 
 End-to-end mode protects against a server that is curious, compromised later,
 or leaking its storage. It cannot protect against a server that is malicious
