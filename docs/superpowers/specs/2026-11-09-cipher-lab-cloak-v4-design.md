@@ -71,18 +71,27 @@ should be substantial and demonstrable, without weakening the real encryption.
 
 ```text
 src/image_encryption_system/
-  iwt.py               # integer Haar lifting, exact; shared by cloak.py and the lab
+  iwt.py               # integer Haar lifting, exact; used by cloak.py
+  quality.py           # PSNR and SSIM; used by cloak.py and the lab
+  covers.py            # generated landscape covers; used by cloak.py and the lab
+  cloak.py             # embed/extract an .ies file in a cover PNG
   lab/
     __init__.py        # public API: CIPHER_NAMES, make_cipher(), run_lab(), samples
     imaging.py         # prepare lab images; built-in samples; PNG/JPEG data URIs
     keys.py            # per-cipher parameter derivation (HKDF-SHA256 from a 32-byte key)
     chaos.py           # logistic map; hyperchaotic Chen system (RK4, lane-parallel)
-    transforms.py      # modular integer Haar, Walsh–Hadamard, Arnold cat map, FFT helpers
-    ciphers.py         # Ciphertext, LabCipher, and the 11 ciphers
-    metrics.py         # entropy, local entropy, chi-square, correlation, NPCR/UACI, PSNR, SSIM
+    transforms.py      # modular integer Haar, Walsh–Hadamard, Arnold cat map
+    base.py            # Ciphertext, LabCipher, LabDecryptError
+    classic.py         # arnold, logistic-xor, hyperchaos, wavelet
+    linear.py          # wht, drpe
+    neural.py          # neural
+    aes.py             # aes-ecb, aes-ctr-fixed-iv, aes-gcm, aes-gcm-v4
+    ciphers.py         # registry: CIPHER_NAMES, make_cipher()
+    metrics.py         # entropy, local entropy, chi-square, correlation, NPCR/UACI
     attacks.py         # structure, impulse, pattern, determinism, tamper, salamander
     gcm.py             # GF(2^128) arithmetic, GHASH, two-key AES-GCM collision builder
-    report.py          # LabReport model, JSON, standalone HTML
+    runner.py          # run_lab(), CipherResult, LabReport (JSON-safe), verdicts
+    report.py          # standalone HTML report
   lab_routes.py        # /lab and /images/<id>/cloak, registered from create_app()
 ```
 
@@ -171,8 +180,8 @@ pass rule. `N = S·S`.
 | Speed | Cold first encryption (includes keystream generation), MB/s | informational |
 | Expansion | `len(payload) / (3N)` | informational |
 
-PSNR and SSIM (uniform 8×8 windows, the usual constants) are provided
-for the cloak and for scoring attack recoveries. For 256×256, the formulas must give
+PSNR and SSIM (sliding uniform 8×8 windows, the usual constants) live in
+`quality.py`, shared by the cloak and the lab. For 256×256, the formulas must give
 NPCR\* = 99.5693% and UACI ∈ (33.2824%, 33.6447%), matching the published tables.
 
 ### 4.5 Attacks
@@ -241,8 +250,9 @@ determinism, silent tampering or key commitment failed), **Strong** (`aes-gcm`, 
   and renders `lab_report.html`: a scorecard table (✓/✗/n/a with the measured value),
   the image grid (plaintext, cipher view, attacker's recovery, tampered decryption,
   salamander pair) and 64-bin SVG histograms. Server-rendered, no JavaScript.
-  Login required. Throttled per account (`LAB_RUNS_PER_WINDOW` = 6 per
-  `LAB_WINDOW_SECONDS` = 600). The global CSRF hook already covers the POST.
+  Login required. Throttled per account (`LAB_RATE_LIMIT` = 6 per
+  `LAB_RATE_WINDOW_SECONDS` = 600, the app's existing throttle naming). The global
+  CSRF hook already covers the POST.
 - **CLI.** `ies lab list`; `ies lab run [--image PATH | --sample NAME] [--size N]
   [--cipher NAME ...] [--seed TEXT] [--json PATH] [--html PATH]` prints a text
   scorecard and optionally writes JSON and a standalone HTML report (same scorecard
@@ -311,7 +321,7 @@ any other.
   download (`pack_ies(ciphertext, metadata)`), cloaks them and returns
   `<name>.cloaked.png` with `Cache-Control: no-store`. It needs only ciphertext, so
   it works for end-to-end images without touching a key. Throttled per account
-  (`CLOAK_RUNS_PER_WINDOW` = 10 per `CLOAK_WINDOW_SECONDS` = 600). Not audited, like
+  (`CLOAK_RATE_LIMIT` = 10 per `CLOAK_RATE_WINDOW_SECONDS` = 600). Not audited, like
   the `.ies` download. The dashboard gets one "Cloak" link per owned image.
 - **CLI.** `ies cloak IN.ies -o OUT.png [--cover IMG] [--bits auto|1|2|3]
   [--palette NAME] [--seed TEXT]` prints the report; `ies uncloak IN.png -o OUT.ies`;
