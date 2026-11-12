@@ -195,7 +195,7 @@ def test_a_browser_envelope_opens_in_python(name) -> None:
     )
     ciphertext, metadata = unpack_ies(unb64(sealed["ies"]))
     assert metadata["context"]["filename"] == name
-    assert crypto.validate_envelope(metadata) == 3
+    assert crypto.validate_envelope(metadata) == 4
     assert (
         decrypt_image_bytes(ciphertext, metadata, passphrase="a browser passphrase ☕") == plaintext
     )
@@ -228,6 +228,92 @@ def test_a_python_envelope_opens_in_the_browser() -> None:
     assert unb64(opened["plaintext"]) == _png()
     with pytest.raises(RuntimeError, match="Passphrase did not unlock"):
         run_js("decrypt", {"ies": b64(blob), "passphrase": "wrong"})
+
+
+def test_v4_key_derivation_matches_python() -> None:
+    rng = random.Random(4)
+    cases = [
+        (rng.randbytes(32), rng.randbytes(12), rng.randbytes(rng.randrange(0, 300)))
+        for _ in range(20)
+    ]
+    requests = [{"data_key": b64(k), "nonce": b64(n), "aad": b64(a)} for k, n, a in cases]
+
+    derived = run_js("v4keys", requests)
+
+    for (data_key, nonce, aad), keys in zip(cases, derived, strict=True):
+        image_key, commitment = crypto.derive_v4_keys(data_key, nonce, aad)
+        assert unb64(keys["image_key"]) == image_key
+        assert unb64(keys["commitment"]) == commitment
+
+
+def test_the_browser_writes_v4_and_python_checks_its_commitment() -> None:
+    sealed = run_js(
+        "encrypt",
+        {
+            "plaintext": b64(_png()),
+            "algorithm": AES_GCM_PASSPHRASE,
+            "passphrase": "a browser passphrase",
+            "context": _context(),
+            "n": MIN_SCRYPT_N,
+        },
+    )
+    ciphertext, metadata = unpack_ies(unb64(sealed["ies"]))
+    assert metadata["version"] == 4
+    assert crypto.is_key_committing(metadata)
+
+    data_key = crypto.unwrap_data_key(metadata["key_wrap"], passphrase="a browser passphrase")
+    aad = context_aad(metadata["context"], version=4)
+    _image_key, commitment = crypto.derive_v4_keys(data_key, unb64(metadata["image_nonce"]), aad)
+    assert unb64(metadata["key_commitment"]) == commitment
+    assert decrypt_image_bytes(ciphertext, metadata, passphrase="a browser passphrase") == _png()
+
+    # A wrap around any other key must fail Python's commitment check too.
+    swapped = {
+        **metadata,
+        "key_wrap": crypto.wrap_data_key_passphrase(bytes(32), "a browser passphrase"),
+    }
+    with pytest.raises(crypto.CryptoError, match="key commitment"):
+        decrypt_image_bytes(ciphertext, swapped, passphrase="a browser passphrase")
+
+
+def test_version_3_envelopes_still_cross_in_both_directions() -> None:
+    # Python wrote version 3 until version 4 shipped; the browser must still open those.
+    result = encrypt_image_bytes(
+        _png(), AES_GCM_PASSPHRASE, passphrase="server side", context=_context(), version=3
+    )
+    blob = pack_ies(result.ciphertext, result.metadata)
+    assert (
+        unb64(run_js("decrypt", {"ies": b64(blob), "passphrase": "server side"})["plaintext"])
+        == _png()
+    )
+
+    sealed = run_js(
+        "encrypt",
+        {
+            "plaintext": b64(_png()),
+            "algorithm": AES_GCM_PASSPHRASE,
+            "passphrase": "an old page",
+            "context": _context(),
+            "n": MIN_SCRYPT_N,
+            "version": 3,
+        },
+    )
+    ciphertext, metadata = unpack_ies(unb64(sealed["ies"]))
+    assert metadata["version"] == 3
+    assert decrypt_image_bytes(ciphertext, metadata, passphrase="an old page") == _png()
+
+
+def test_a_python_v4_envelope_with_the_wrong_key_is_refused_by_the_browser() -> None:
+    result = encrypt_image_bytes(
+        _png(), AES_GCM_PASSPHRASE, passphrase="server side", context=_context()
+    )
+    metadata = {
+        **result.metadata,
+        "key_wrap": crypto.wrap_data_key_passphrase(bytes(32), "server side"),
+    }
+    blob = pack_ies(result.ciphertext, metadata)
+    with pytest.raises(RuntimeError, match="key commitment"):
+        run_js("decrypt", {"ies": b64(blob), "passphrase": "server side"})
 
 
 def test_rsa_envelopes_and_sealed_private_keys_work_in_both_directions() -> None:

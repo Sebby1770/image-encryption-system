@@ -40,11 +40,12 @@ from . import crypto
 from .config import IMAGE_MIME_TYPES, PLACEHOLDER_SECRETS, Config
 from .crypto import (
     AES_GCM_PASSPHRASE,
-    ENVELOPE_V3,
+    ENVELOPE_V4,
     GCM_TAG_BYTES,
     MAX_METADATA_BYTES,
     MIN_SCRYPT_N,
     RSA_HYBRID,
+    SEALED_CONTEXT_VERSIONS,
     WRAP_RSA,
     WRAP_SCRYPT,
     CryptoError,
@@ -1311,7 +1312,7 @@ def _check_sealed_upload(
     """Validate an envelope sealed in a browser before storing it.
 
     The server can never decrypt it, so everything that can be checked is: a
-    closed version 3 envelope sealed to this account with a complete browser
+    closed version 4 envelope sealed to this account with a complete browser
     context; an allow-listed type the browser can display, within the pixel
     ceiling; a well-formed wrap at today's KDF cost that matches the sealed
     algorithm; a digest that matches the bytes received; and a fresh asset id.
@@ -1324,8 +1325,14 @@ def _check_sealed_upload(
     if not raw_envelope or len(raw_envelope.encode("utf-8")) > MAX_METADATA_BYTES:
         raise ValueError("The envelope is missing or too large.")
     metadata = _loads(raw_envelope, "envelope")
-    if validate_envelope(metadata) != ENVELOPE_V3:
-        raise CryptoError("End-to-end uploads must use envelope version 3.")
+    # Version 4 commits to the key, so one stored ciphertext cannot open as
+    # two different images under two wraps. A page loaded before version 4
+    # shipped still sends version 3: refuse it and say how to fix that.
+    if validate_envelope(metadata) != ENVELOPE_V4:
+        raise CryptoError(
+            "End-to-end uploads must use envelope version 4. "
+            "Reload the page to get the current encryption code."
+        )
     context = metadata["context"]
     if set(context) != END_TO_END_CONTEXT or context["source"] != "browser":
         raise CryptoError("End-to-end uploads must seal a complete browser context.")
@@ -2009,13 +2016,13 @@ def _legacy_aad(asset: EncryptedAsset) -> bytes | None:
 def _check_sealed_context(asset: EncryptedAsset, *, primary_wrap: bool) -> None:
     """Refuse a row whose fields disagree with the context sealed into its AAD.
 
-    Version 3 binds the asset id, owner, algorithm, wrap type, MIME type,
+    Versions 3 and 4 bind the asset id, owner, algorithm, wrap type, MIME type,
     format, and dimensions. Swapping ciphertext and metadata between rows or
     users, or editing a row's recorded type, makes this check fail before any
     key is unwrapped. Version 1 envelopes predate the sealed context.
     """
     metadata = asset.metadata
-    if validate_envelope(metadata) != ENVELOPE_V3:
+    if validate_envelope(metadata) not in SEALED_CONTEXT_VERSIONS:
         return
     context = metadata["context"]
     expected = {

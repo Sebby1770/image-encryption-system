@@ -7,6 +7,7 @@ import {
   canonicalJSON,
   contextAAD,
   decryptImage,
+  deriveV4Keys,
   encryptImage,
   openPrivateKey,
   packIES,
@@ -37,13 +38,14 @@ const ops = {
   aad(contexts) {
     return contexts.map((context) => b64encode(contextAAD(context)));
   },
-  async encrypt({ plaintext, algorithm, passphrase, public_key: publicKey, context, n }) {
+  async encrypt({ plaintext, algorithm, passphrase, public_key: publicKey, context, n, version }) {
     const sealed = await encryptImage(b64decode(plaintext), {
       algorithm,
       passphrase,
       publicKey,
       context,
       n,
+      ...(version === undefined ? {} : { version }),
     });
     return {
       ies: b64encode(packIES(sealed.ciphertext, sealed.metadata)),
@@ -55,6 +57,14 @@ const ops = {
     const secret = privateKey ? await openPrivateKey(privateKey, password, { owner }) : passphrase;
     const dataKey = await unwrapDataKey(metadata.key_wrap, secret);
     return { plaintext: b64encode(await decryptImage(ciphertext, metadata, dataKey)) };
+  },
+  async v4keys(requests) {
+    const out = [];
+    for (const { data_key: dataKey, nonce, aad } of requests) {
+      const keys = await deriveV4Keys(b64decode(dataKey), b64decode(nonce), b64decode(aad));
+      out.push({ image_key: b64encode(keys.imageKey), commitment: b64encode(keys.commitment) });
+    }
+    return out;
   },
   prepare({ image }) {
     const prepared = prepareImage(b64decode(image));

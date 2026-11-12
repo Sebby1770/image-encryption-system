@@ -113,7 +113,7 @@ _DELETE = object()
         (_mutate(["key_wrap", "salt"], "AAAA"), "salt"),
         (_mutate(["key_wrap", "n"], 2**30), "Scrypt"),
         (_mutate(["unexpected"], 1), "unexpected fields"),
-        (_mutate(["version"], 1), "version 3"),
+        (_mutate(["version"], 1), "version 4"),
         (lambda m, c: (m, c[:8]), "integrity|truncated"),
     ],
     ids=[

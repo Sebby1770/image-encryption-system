@@ -10,6 +10,8 @@ export const RSA_HYBRID = "RSA-HYBRID";
 export const WRAP_SCRYPT = "scrypt-aes-gcm";
 export const WRAP_RSA = "rsa-oaep-sha256";
 export const ENVELOPE_V3 = 3;
+export const ENVELOPE_V4 = 4;
+export const KEY_COMMITMENT_BYTES = 32;
 export const AES_KEY_BYTES = 32;
 export const GCM_NONCE_BYTES = 12;
 export const GCM_TAG_BYTES = 16;
@@ -30,7 +32,16 @@ export const MAX_METADATA_BYTES = 64 * 1024;
 export const MAX_CONTEXT_BYTES = 4096;
 export const PRIVATE_KEY_FORMAT = "ies-private-key";
 
-const CONTEXT_AAD_PREFIX = "IES-CONTEXT-V3\u0000";
+const CONTEXT_AAD_PREFIXES = {
+  [ENVELOPE_V3]: "IES-CONTEXT-V3\u0000",
+  [ENVELOPE_V4]: "IES-CONTEXT-V4\u0000",
+};
+// Version 4 (see crypto.py): AES-GCM is not key-committing, so the GCM key is
+// derived from the data key with HKDF and the envelope stores a commitment
+// over the data key, the nonce, and the sealed context.
+const V4_HKDF_SALT = "IES-V4";
+const V4_IMAGE_KEY_INFO = "IES-V4\u0000image-key";
+const V4_COMMITMENT_INFO = "IES-V4\u0000key-commitment\u0000";
 const PRIVATE_KEY_AAD_PREFIX = "IES-PRIVATE-KEY-V1\u0000";
 const DATA_KEY_AAD = "image-data-key";
 const V3_ENVELOPE_KEYS = new Set([
@@ -41,6 +52,7 @@ const V3_ENVELOPE_KEYS = new Set([
   "context",
   "ciphertext_sha256",
 ]);
+const V4_ENVELOPE_KEYS = new Set([...V3_ENVELOPE_KEYS, "key_commitment"]);
 const WRAP_KEYS = {
   [WRAP_SCRYPT]: ["n", "nonce", "p", "r", "salt", "type", "wrapped_key"],
   [WRAP_RSA]: ["type", "wrapped_key"],
@@ -173,8 +185,14 @@ function compareCodePoints(a, b) {
   return left.length - right.length;
 }
 
-export function contextAAD(context) {
-  return utf8(CONTEXT_AAD_PREFIX + canonicalJSON(context));
+// Each sealed-context version has its own prefix, so a context sealed under
+// one version is never valid AAD for the other.
+export function contextAAD(context, version = ENVELOPE_V3) {
+  const prefix = CONTEXT_AAD_PREFIXES[version];
+  if (prefix === undefined) {
+    throw new CryptoError(`Envelope version ${version} has no sealed context.`);
+  }
+  return utf8(prefix + canonicalJSON(context));
 }
 
 export async function sha256Hex(bytes) {
@@ -464,10 +482,46 @@ export function validateKeyWrap(wrap) {
 // ---------------------------------------------------------------------------
 // Envelopes
 
-// Version 3 envelope, as crypto.encrypt_image_bytes writes it, plus the
-// ciphertext digest the server checks on upload. Returns the data key too, so
-// the caller can create shares or links without unwrapping again.
-export async function encryptImage(plaintext, { algorithm, passphrase, publicKey, context, n }) {
+// The version 4 image key and key commitment, byte for byte what
+// crypto.derive_v4_keys computes: both come from the data key through
+// HKDF-SHA256, and the commitment also binds the nonce and the AAD.
+export async function deriveV4Keys(dataKey, nonce, aad) {
+  if (!(dataKey instanceof Uint8Array) || dataKey.length !== AES_KEY_BYTES) {
+    throw new CryptoError("A version 4 data key must be 32 bytes.");
+  }
+  const key = await subtle.importKey("raw", dataKey, "HKDF", false, ["deriveBits"]);
+  const derive = async (info) => {
+    const params = { name: "HKDF", hash: "SHA-256", salt: utf8(V4_HKDF_SALT), info };
+    return new Uint8Array(await subtle.deriveBits(params, key, 256));
+  };
+  const aadDigest = new Uint8Array(await subtle.digest("SHA-256", aad));
+  return {
+    imageKey: await derive(utf8(V4_IMAGE_KEY_INFO)),
+    commitment: await derive(concatBytes(utf8(V4_COMMITMENT_INFO), nonce, aadDigest)),
+  };
+}
+
+// Compares every byte whatever the outcome, so timing does not say how much
+// of a commitment matched.
+function constantTimeEqual(left, right) {
+  if (left.length !== right.length) return false;
+  let difference = 0;
+  for (let i = 0; i < left.length; i += 1) difference |= left[i] ^ right[i];
+  return difference === 0;
+}
+
+// A sealed-context envelope, as crypto.encrypt_image_bytes writes it, plus the
+// ciphertext digest the server checks on upload. Version 4 (key-committing)
+// unless a caller asks for 3, which only tests of the legacy path do. Returns
+// the data key too, so the caller can create shares or links without
+// unwrapping again.
+export async function encryptImage(
+  plaintext,
+  { algorithm, passphrase, publicKey, context, n, version = ENVELOPE_V4 },
+) {
+  if (version !== ENVELOPE_V3 && version !== ENVELOPE_V4) {
+    throw new CryptoError(`Cannot write encrypted image envelope version ${version}.`);
+  }
   if (!(plaintext instanceof Uint8Array) || !plaintext.length) {
     throw new CryptoError("Image bytes cannot be empty.");
   }
@@ -485,20 +539,29 @@ export async function encryptImage(plaintext, { algorithm, passphrase, publicKey
       ? await wrapDataKeyPassphrase(dataKey, passphrase, { n: n ?? SCRYPT_N })
       : await wrapDataKeyRSA(dataKey, publicKey);
   const imageNonce = randomBytes(GCM_NONCE_BYTES);
-  const ciphertext = await aesGcmEncrypt(dataKey, imageNonce, plaintext, contextAAD(sealed));
+  const aad = contextAAD(sealed, version);
+  let imageKey = dataKey;
+  let commitment = null;
+  if (version === ENVELOPE_V4) {
+    ({ imageKey, commitment } = await deriveV4Keys(dataKey, imageNonce, aad));
+  }
+  const ciphertext = await aesGcmEncrypt(imageKey, imageNonce, plaintext, aad);
   const metadata = {
-    version: ENVELOPE_V3,
+    version,
     algorithm,
     image_nonce: b64encode(imageNonce),
     key_wrap: keyWrap,
     context: sealed,
     ciphertext_sha256: await sha256Hex(ciphertext),
   };
+  if (commitment) metadata.key_commitment = b64encode(commitment);
   return { ciphertext, metadata, dataKey };
 }
 
-// Version 3 only: the browser never needs the legacy path, and refusing it
-// keeps every envelope it opens fully sealed.
+// Versions 3 and 4 only: the browser never needs the version 1 path, and
+// refusing it keeps every envelope it opens fully sealed. A version 4 envelope
+// opens only under the data key its commitment names; any other key is
+// refused before AES-GCM runs.
 export async function decryptImage(ciphertext, metadata, dataKey) {
   validateEnvelope(metadata);
   if (!(ciphertext instanceof Uint8Array) || ciphertext.length < GCM_TAG_BYTES) {
@@ -509,11 +572,21 @@ export async function decryptImage(ciphertext, metadata, dataKey) {
       throw new CryptoError("Ciphertext integrity check failed.");
     }
   }
+  const nonce = b64decode(metadata.image_nonce);
+  const aad = contextAAD(metadata.context, metadata.version);
+  let imageKey = dataKey;
+  if (metadata.version === ENVELOPE_V4) {
+    const derived = await deriveV4Keys(dataKey, nonce, aad);
+    if (!constantTimeEqual(derived.commitment, b64decode(metadata.key_commitment))) {
+      throw new CryptoError("This key does not match the image's key commitment.");
+    }
+    imageKey = derived.imageKey;
+  }
   return aesGcmDecrypt(
-    dataKey,
-    b64decode(metadata.image_nonce),
+    imageKey,
+    nonce,
     ciphertext,
-    contextAAD(metadata.context),
+    aad,
     "Decryption failed. The key, passphrase, or ciphertext is invalid.",
   );
 }
@@ -522,12 +595,21 @@ export function validateEnvelope(metadata) {
   if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
     throw new CryptoError("Encrypted image metadata must be an object.");
   }
-  if (metadata.version !== ENVELOPE_V3) {
-    throw new CryptoError("Only version 3 envelopes can be opened in the browser.");
+  if (metadata.version !== ENVELOPE_V3 && metadata.version !== ENVELOPE_V4) {
+    throw new CryptoError("Only version 3 and 4 envelopes can be opened in the browser.");
   }
+  const allowed = metadata.version === ENVELOPE_V4 ? V4_ENVELOPE_KEYS : V3_ENVELOPE_KEYS;
   for (const key of Object.keys(metadata)) {
-    if (!V3_ENVELOPE_KEYS.has(key)) {
+    if (!allowed.has(key)) {
       throw new CryptoError("Encrypted image metadata has unexpected fields.");
+    }
+  }
+  if (metadata.version === ENVELOPE_V4) {
+    if (!("key_commitment" in metadata)) {
+      throw new CryptoError("A version 4 envelope must carry a key commitment.");
+    }
+    if (b64decode(metadata.key_commitment).length !== KEY_COMMITMENT_BYTES) {
+      throw new CryptoError("Encrypted image key commitment has an invalid length.");
     }
   }
   const { algorithm } = metadata;

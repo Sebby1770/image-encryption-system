@@ -14,6 +14,7 @@ from .crypto import (
     decrypt_image_bytes,
     encrypt_image_bytes,
     generate_rsa_key_pair,
+    is_key_committing,
     pack_ies,
     unpack_ies,
     unwrap_data_key,
@@ -190,6 +191,17 @@ def _inspect(args: argparse.Namespace) -> int:
     )
     digest = sha256(ciphertext).hexdigest()
     print(f"version: {metadata.get('version', '')}")
+    # Only version 4 commits to its key: an older envelope can be built to open
+    # as two different images under two keys. `inspect` prints what it is given
+    # without validating it, so an envelope that does not validate says so here
+    # rather than failing the whole command.
+    try:
+        committing = (
+            "yes" if is_key_committing(metadata) else f"no (version {metadata.get('version', 1)})"
+        )
+    except CryptoError:
+        committing = "unknown (the envelope does not validate)"
+    print(f"key commitment: {committing}")
     print(f"algorithm: {metadata.get('algorithm', '')}")
     if wrap_type:
         print(f"wrap: {wrap_type}")

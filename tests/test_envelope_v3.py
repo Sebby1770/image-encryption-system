@@ -51,7 +51,7 @@ def test_web_upload_seals_owner_asset_type_and_dimensions(tmp_path) -> None:
 
     context = asset.metadata["context"]
 
-    assert asset.metadata["version"] == 3
+    assert asset.metadata["version"] == 4
     assert context == {
         "asset": asset.stored_filename.removesuffix(".enc"),
         "algorithm": "AES-GCM",
@@ -131,17 +131,17 @@ def test_v3_backup_cannot_be_restored_into_a_different_account(tmp_path) -> None
     assert _store(app).list_assets(2) == []
 
 
-def test_backup_manifest_carries_the_v3_envelope(tmp_path) -> None:
+def test_backup_manifest_carries_the_sealed_envelope(tmp_path) -> None:
     app = make_app(tmp_path)
     client = app.test_client()
     register(client, "alice")
     encrypt_png(client)
     with zipfile.ZipFile(BytesIO(client.get("/backup").data)) as archive:
         manifest = json.loads(archive.read("manifest.json"))
-    assert manifest["assets"][0]["metadata"]["version"] == 3
+    assert manifest["assets"][0]["metadata"]["version"] == 4
 
 
-def test_cli_writes_v3_with_a_cli_context(tmp_path) -> None:
+def test_cli_writes_a_sealed_cli_context(tmp_path) -> None:
     from image_encryption_system.cli import main
 
     source = tmp_path / "note.png"
@@ -151,7 +151,7 @@ def test_cli_writes_v3_with_a_cli_context(tmp_path) -> None:
 
     _ciphertext, metadata = unpack_ies(out.read_bytes())
 
-    assert metadata["version"] == 3
+    assert metadata["version"] == 4
     assert metadata["context"]["source"] == "cli"
     assert metadata["context"]["filename"] == "note.png"
 
