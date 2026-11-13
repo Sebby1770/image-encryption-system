@@ -46,7 +46,12 @@ def _interleave_rows(top: Band, bottom: Band) -> Band:
     return out
 
 
-def inverse(ll: Band, lh: Band, hl: Band, hh: Band) -> Band:
+def inverse(
+    ll: NDArray[np.integer],
+    lh: NDArray[np.integer],
+    hl: NDArray[np.integer],
+    hh: NDArray[np.integer],
+) -> Band:
     """The exact inverse of :func:`forward`."""
     s = _interleave_rows(*_unlift(ll.astype(np.int32), lh.astype(np.int32)))
     d = _interleave_rows(*_unlift(hl.astype(np.int32), hh.astype(np.int32)))

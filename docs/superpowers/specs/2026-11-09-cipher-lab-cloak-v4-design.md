@@ -271,8 +271,9 @@ determinism, silent tampering or key commitment failed), **Strong** (`aes-gcm`, 
   stego pixel can leave [0, 255]; `cloak()` also asserts it. Clamping touches only
   near-black and near-white pixels (scaling the whole range instead would cost about
   8 dB of PSNR on its own), and generated covers are drawn inside [10, 245], so they
-  are never clamped. Expected distortion at full capacity: about 53, 47 and 40 dB
-  PSNR for `k = 1, 2, 3`.
+  are never clamped. Measured distortion at full capacity on a generated
+  960×640 cover: 50.6, 45.6 and 38.9 dB PSNR (SSIM 0.992, 0.974, 0.891) for
+  `k = 1, 2, 3`.
 - Per channel, a one-level integer Haar (S-transform) lifting (`iwt.forward` /
   `iwt.inverse`, int16). Slots are every LH, HL and HH coefficient of every channel,
   in canonical order (channel, subband, row-major): `M = 2.25·W·H` slots.

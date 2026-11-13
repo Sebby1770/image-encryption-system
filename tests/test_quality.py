@@ -45,3 +45,15 @@ def test_shapes_must_match() -> None:
         psnr(np.zeros((4, 4, 3), np.uint8), np.zeros((4, 5, 3), np.uint8))
     with pytest.raises(ValueError):
         ssim(np.zeros((4, 4), np.uint8), np.zeros((5, 4), np.uint8))
+
+
+def test_banding_does_not_change_the_scores(monkeypatch) -> None:
+    from image_encryption_system import quality
+
+    rng = np.random.default_rng(9)
+    a = rng.integers(0, 256, (70, 50, 3), dtype=np.uint8)
+    b = np.clip(a.astype(int) + rng.integers(-9, 10, a.shape), 0, 255).astype(np.uint8)
+    whole = (psnr(a, b), ssim(a, b))
+    monkeypatch.setattr(quality, "_BAND", 3)
+    assert psnr(a, b) == pytest.approx(whole[0], rel=1e-12)
+    assert ssim(a, b) == pytest.approx(whole[1], rel=1e-12)
