@@ -69,6 +69,15 @@ class Config:
     DECRYPT_RATE_WINDOW_SECONDS = int(os.getenv("IES_DECRYPT_RATE_WINDOW", 300))
     LINK_RATE_LIMIT = int(os.getenv("IES_LINK_RATE_LIMIT", 20))
     LINK_RATE_WINDOW_SECONDS = int(os.getenv("IES_LINK_RATE_WINDOW", 300))
+    # The Cipher Lab and cloaked exports are CPU-heavy (a lab run encrypts and
+    # attacks one image eleven ways; a cloak re-encodes a picture of up to
+    # CLOAK_MAX_PIXELS), so each is throttled per account.
+    LAB_RATE_LIMIT = int(os.getenv("IES_LAB_RATE_LIMIT", 6))
+    LAB_RATE_WINDOW_SECONDS = int(os.getenv("IES_LAB_RATE_WINDOW", 600))
+    LAB_IMAGE_SIZE = int(os.getenv("IES_LAB_IMAGE_SIZE", 256))
+    CLOAK_RATE_LIMIT = int(os.getenv("IES_CLOAK_RATE_LIMIT", 10))
+    CLOAK_RATE_WINDOW_SECONDS = int(os.getenv("IES_CLOAK_RATE_WINDOW", 600))
+    CLOAK_MAX_PIXELS = int(os.getenv("IES_CLOAK_MAX_PIXELS", 24_000_000))
     ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"}
     # Decoded formats we are willing to load. The extension allow-list above is
     # only a filename check; this is matched against what Pillow actually

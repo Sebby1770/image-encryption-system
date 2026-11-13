@@ -206,6 +206,8 @@ def test_templates_contain_no_inline_script_or_handlers() -> None:
         text = template.read_text()
         assert not re.search(r"<script(?![^>]*\bsrc=)", text), template.name
         assert not re.search(r"\son[a-z]+=", text), template.name
+        # The page CSP (style-src 'self') would block inline styles too.
+        assert not re.search(r"\sstyle=", text), template.name
 
 
 def test_password_change_ends_other_browser_sessions(tmp_path) -> None:

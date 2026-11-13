@@ -187,7 +187,13 @@ def create_app(test_config: dict | None = None) -> Flask:
             limit=int(app.config.get(f"{name.upper()}_RATE_LIMIT", limit)),
             window_seconds=int(app.config.get(f"{name.upper()}_RATE_WINDOW_SECONDS", window)),
         )
-        for name, limit, window in (("register", 5, 3600), ("decrypt", 30, 300), ("link", 20, 300))
+        for name, limit, window in (
+            ("register", 5, 3600),
+            ("decrypt", 30, 300),
+            ("link", 20, 300),
+            ("lab", 6, 600),
+            ("cloak", 10, 600),
+        )
     }
 
     @app.context_processor
@@ -1264,6 +1270,10 @@ def create_app(test_config: dict | None = None) -> Flask:
             }
         )
 
+    # The Cipher Lab and cloaked exports live in their own module.
+    from .lab_routes import register as register_lab_routes
+
+    register_lab_routes(app, store)
     return app
 
 

@@ -9,7 +9,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-CSS = Path(__file__).resolve().parents[1] / "src/image_encryption_system/static/css/styles.css"
+CSS_DIR = Path(__file__).resolve().parents[1] / "src/image_encryption_system/static/css"
+CSS = CSS_DIR / "styles.css"
 COLOUR = re.compile(r"#[0-9a-fA-F]{3,8}\b|\b(?:rgb|rgba|hsl|hsla)\(|\b(?:white|black)\b")
 TOKEN = re.compile(r"^\s*(--[a-z0-9-]+)\s*:", re.MULTILINE)
 # Readable on the accent colour in both themes, so it needs no dark value.
@@ -27,11 +28,20 @@ def _blocks(text: str) -> tuple[str, str]:
 
 def test_no_colour_is_written_outside_a_token() -> None:
     inline = [
-        line.strip()
-        for line in CSS.read_text().splitlines()
+        f"{sheet.name}: {line.strip()}"
+        for sheet in sorted(CSS_DIR.glob("*.css"))
+        for line in sheet.read_text().splitlines()
         if COLOUR.search(line) and not line.strip().startswith("--")
     ]
     assert inline == []
+
+
+def test_only_styles_css_defines_tokens() -> None:
+    # Other sheets (lab.css) use the shared tokens, so dark mode stays one block.
+    assert len(list(CSS_DIR.glob("*.css"))) >= 2
+    for sheet in CSS_DIR.glob("*.css"):
+        if sheet.name != "styles.css":
+            assert TOKEN.findall(sheet.read_text()) == [], sheet.name
 
 
 def test_every_token_has_a_dark_value() -> None:
