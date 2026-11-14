@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from collections.abc import Sequence
 from getpass import getpass
 from hashlib import sha256
 from pathlib import Path
 
+from .cloak import BITS, CloakError, cloak, is_png, load_cover, uncloak
+from .covers import PALETTES
 from .crypto import (
     AES_GCM_PASSPHRASE,
     RSA_HYBRID,
@@ -88,6 +91,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     hash_parser = subparsers.add_parser("hash", help="Print SHA-256 of the ciphertext payload.")
     hash_parser.add_argument("input", type=Path, help="Input vault file")
 
+    cloak_parser = subparsers.add_parser(
+        "cloak", help="Hide an .ies vault file inside an ordinary-looking PNG."
+    )
+    cloak_parser.add_argument("input", type=Path, help="Input vault file")
+    cloak_parser.add_argument("--out", "-o", type=Path, required=True, help="Output PNG")
+    cloak_parser.add_argument(
+        "--cover", type=Path, help="Your own cover picture (default: a generated landscape)"
+    )
+    cloak_parser.add_argument(
+        "--bits",
+        choices=["auto", *(str(k) for k in BITS)],
+        default="auto",
+        help="Low bits used per wavelet coefficient (auto: as few as fit)",
+    )
+    cloak_parser.add_argument(
+        "--palette", choices=PALETTES, default="dusk", help="Generated landscape style"
+    )
+    cloak_parser.add_argument(
+        "--seed", help="Seed for the generated landscape (default: a new one each time)"
+    )
+
+    uncloak_parser = subparsers.add_parser(
+        "uncloak", help="Recover the .ies vault file hidden in a cloaked PNG."
+    )
+    uncloak_parser.add_argument("input", type=Path, help="Cloaked PNG")
+    uncloak_parser.add_argument("--out", "-o", type=Path, required=True, help="Output vault file")
+
     args = parser.parse_args(list(argv) if argv is not None else None)
     try:
         if args.command == "encrypt":
@@ -104,6 +134,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _rewrap(args)
         if args.command == "hash":
             return _hash(args)
+        if args.command == "cloak":
+            return _cloak(args)
+        if args.command == "uncloak":
+            return _uncloak(args)
     except (CryptoError, OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -149,7 +183,7 @@ def _decrypt(args: argparse.Namespace) -> int:
     source: Path = args.input
     if not source.is_file():
         raise ValueError(f"input file not found: {source}")
-    ciphertext, metadata = unpack_ies(source.read_bytes())
+    ciphertext, metadata = unpack_ies(_read_vault_file(source))
     validate_envelope(metadata)
 
     passphrase = args.passphrase
@@ -182,7 +216,7 @@ def _inspect(args: argparse.Namespace) -> int:
     source: Path = args.input
     if not source.is_file():
         raise ValueError(f"input file not found: {source}")
-    ciphertext, metadata = unpack_ies(source.read_bytes())
+    ciphertext, metadata = unpack_ies(_read_vault_file(source))
     wrap = metadata.get("key_wrap")
     wrap_type = wrap.get("type") if isinstance(wrap, dict) else None
     context = metadata.get("context")
@@ -222,7 +256,7 @@ def _verify(args: argparse.Namespace) -> int:
     source: Path = args.input
     if not source.is_file():
         raise ValueError(f"input file not found: {source}")
-    _ciphertext, metadata = unpack_ies(source.read_bytes())
+    _ciphertext, metadata = unpack_ies(_read_vault_file(source))
     validate_envelope(metadata)
     key_wrap = metadata["key_wrap"]
 
@@ -247,7 +281,7 @@ def _rewrap(args: argparse.Namespace) -> int:
     source: Path = args.input
     if not source.is_file():
         raise ValueError(f"input file not found: {source}")
-    ciphertext, metadata = unpack_ies(source.read_bytes())
+    ciphertext, metadata = unpack_ies(_read_vault_file(source))
     validate_envelope(metadata)
     key_wrap = metadata["key_wrap"]
     old_passphrase = args.old_passphrase or getpass("Current AES passphrase: ")
@@ -263,8 +297,75 @@ def _hash(args: argparse.Namespace) -> int:
     source: Path = args.input
     if not source.is_file():
         raise ValueError(f"input file not found: {source}")
-    ciphertext, _metadata = unpack_ies(source.read_bytes())
+    ciphertext, _metadata = unpack_ies(_read_vault_file(source))
     print(sha256(ciphertext).hexdigest())
+    return 0
+
+
+# Leading bytes of the other image formats the vault accepts. A vault file
+# handed over as one of these is almost always a cloaked PNG that something
+# recompressed, which destroys what it carried.
+_OTHER_IMAGE_SIGNATURES = (
+    b"\xff\xd8\xff",  # JPEG
+    b"GIF87a",
+    b"GIF89a",
+    b"BM",
+    b"II*\x00",  # TIFF, little-endian
+    b"MM\x00*",  # TIFF, big-endian
+)
+
+
+def _read_vault_file(source: Path) -> bytes:
+    """An .ies file's bytes, uncloaking a cloaked PNG on the way."""
+    data = source.read_bytes()
+    if is_png(data):
+        return uncloak(data)
+    if data.startswith(_OTHER_IMAGE_SIGNATURES) or (data[:4] == b"RIFF" and data[8:12] == b"WEBP"):
+        raise CloakError(
+            "This image does not carry a vault file, or it was recompressed or edited "
+            "(a cloaked file must stay a PNG)."
+        )
+    return data
+
+
+def _cloak(args: argparse.Namespace) -> int:
+    source: Path = args.input
+    if not source.is_file():
+        raise ValueError(f"input file not found: {source}")
+    payload = _read_vault_file(source)
+    _ciphertext, metadata = unpack_ies(payload)
+    validate_envelope(metadata)
+    cover = None
+    if args.cover is not None:
+        if not args.cover.is_file():
+            raise ValueError(f"cover file not found: {args.cover}")
+        cover = load_cover(args.cover.read_bytes())
+    seed = args.seed.encode("utf-8") if args.seed else os.urandom(16)
+    bits = None if args.bits == "auto" else int(args.bits)
+    png, report = cloak(payload, cover=cover, bits=bits, seed=seed, palette=args.palette)
+    args.out.write_bytes(png)
+    origin = f"your picture {args.cover.name}" if args.cover else f"generated, {args.palette}"
+    print(f"cloaked: {args.out}")
+    print(f"cover: {report.width}x{report.height} ({origin})")
+    print(f"bits per coefficient: {report.bits}")
+    print(f"payload: {report.payload_bytes:,} of {report.capacity_bytes:,} bytes")
+    print(f"PSNR: {report.psnr:.1f} dB  SSIM: {report.ssim:.4f}")
+    return 0
+
+
+def _uncloak(args: argparse.Namespace) -> int:
+    source: Path = args.input
+    if not source.is_file():
+        raise ValueError(f"input file not found: {source}")
+    data = source.read_bytes()
+    if not is_png(data):
+        raise CloakError(
+            "This image does not carry a vault file, or it was recompressed or edited."
+        )
+    payload = uncloak(data)
+    _ciphertext, metadata = unpack_ies(payload)
+    validate_envelope(metadata)
+    args.out.write_bytes(payload)
     return 0
 
 
