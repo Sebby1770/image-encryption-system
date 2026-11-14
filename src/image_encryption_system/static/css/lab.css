@@ -99,3 +99,230 @@
     padding: 16px;
   }
 }
+
+/* Lab form */
+
+.lab-checks {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 8px 16px;
+}
+
+.lab-checks .lab-choice {
+  align-items: flex-start;
+  font-weight: 500;
+}
+
+.lab-family {
+  display: block;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 500;
+}
+
+/* Scorecard */
+
+.lab-lesson {
+  margin: 0 0 20px;
+  padding: 16px 20px;
+  border: 1px solid var(--warm-line);
+  border-radius: 12px;
+  background: var(--warm-bg);
+  color: var(--warm-ink);
+}
+
+.lab-lesson h2 {
+  margin: 0 0 6px;
+  font-size: 1rem;
+}
+
+.lab-lesson p {
+  margin: 0;
+  line-height: 1.55;
+}
+
+.lab-table-wrap {
+  overflow-x: auto;
+  margin: 0 0 20px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+}
+
+.lab-scorecard,
+.lab-detail {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92rem;
+}
+
+.lab-scorecard caption,
+.lab-detail caption {
+  padding: 12px 14px 4px;
+  color: var(--muted);
+  font-weight: 600;
+  text-align: left;
+}
+
+.lab-scorecard th,
+.lab-scorecard td,
+.lab-detail th,
+.lab-detail td {
+  padding: 10px 14px;
+  border-top: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+
+.lab-scorecard thead th,
+.lab-detail thead th {
+  color: var(--muted);
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.lab-scorecard tbody th a {
+  color: var(--link);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.lab-why {
+  min-width: 260px;
+  color: var(--muted);
+}
+
+.lab-number {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.lab-verdict,
+.lab-outcome,
+.lab-mark {
+  display: inline-block;
+  padding: 2px 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 0.8rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.lab-verdict-broken,
+.lab-outcome-bad,
+.lab-mark-fail {
+  border-color: var(--danger-line);
+  background: var(--danger-bg);
+  color: var(--red);
+}
+
+.lab-verdict-leaks {
+  border-color: var(--warm-line);
+  background: var(--warm-bg);
+  color: var(--warm-ink);
+}
+
+.lab-verdict-strong,
+.lab-outcome-good,
+.lab-mark-pass {
+  border-color: var(--badge-line);
+  background: var(--mint);
+  color: var(--accent-strong);
+}
+
+.lab-verdict-committing {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.lab-outcome-na,
+.lab-mark-info {
+  background: var(--code-bg);
+  color: var(--muted);
+}
+
+/* Figures */
+
+.lab-original,
+.lab-figures {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 16px;
+  margin: 0 0 20px;
+}
+
+.lab-original figure,
+.lab-figures figure {
+  margin: 0;
+}
+
+.lab-original img,
+.lab-figures img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--check-a);
+  image-rendering: pixelated;
+}
+
+figcaption {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.lab-histogram {
+  display: block;
+  width: 100%;
+  height: 96px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--code-bg);
+}
+
+.lab-bar {
+  fill: var(--accent);
+}
+
+/* One cipher's details */
+
+.lab-cipher {
+  margin: 0 0 14px;
+  padding: 0 18px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+}
+
+.lab-cipher[open] {
+  padding-bottom: 6px;
+  box-shadow: var(--shadow);
+}
+
+.lab-cipher summary {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 0;
+  cursor: pointer;
+}
+
+.lab-cipher-title {
+  font-weight: 700;
+}
+
+@media (max-width: 600px) {
+  .lab-why {
+    min-width: 180px;
+  }
+
+  .lab-cipher {
+    padding: 0 12px;
+  }
+}

@@ -11,7 +11,10 @@ from pathlib import Path
 
 CSS_DIR = Path(__file__).resolve().parents[1] / "src/image_encryption_system/static/css"
 CSS = CSS_DIR / "styles.css"
-COLOUR = re.compile(r"#[0-9a-fA-F]{3,8}\b|\b(?:rgb|rgba|hsl|hsla)\(|\b(?:white|black)\b")
+# Colour keywords count only as whole values: "white-space" is a property name.
+COLOUR = re.compile(
+    r"#[0-9a-fA-F]{3,8}\b|\b(?:rgb|rgba|hsl|hsla)\(|(?<![\w-])(?:white|black)(?![\w-])"
+)
 TOKEN = re.compile(r"^\s*(--[a-z0-9-]+)\s*:", re.MULTILINE)
 # Readable on the accent colour in both themes, so it needs no dark value.
 SAME_IN_BOTH = {"--on-accent"}

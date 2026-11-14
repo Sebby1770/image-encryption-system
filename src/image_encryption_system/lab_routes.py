@@ -12,13 +12,24 @@ from __future__ import annotations
 import os
 from io import BytesIO
 
-from flask import Flask, flash, redirect, render_template, request, send_file, url_for
+from flask import (
+    Flask,
+    flash,
+    make_response,
+    redirect,
+    render_template,
+    request,
+    send_file,
+    url_for,
+)
 from flask.typing import ResponseReturnValue
 
 from . import web
 from .cloak import BITS, CloakError, cloak, load_cover
 from .covers import PALETTES
 from .crypto import pack_ies
+from .lab import LAB_SIZES, SAMPLES, prepare, run_lab, sample
+from .lab.ciphers import CIPHER_INFO, CIPHER_NAMES
 from .storage import VaultStore
 
 MAX_SEED_CHARACTERS = 64
@@ -120,5 +131,64 @@ def register(app: Flask, store: VaultStore) -> None:
             as_attachment=True,
             download_name=f"{asset.original_filename}.cloaked.png",
         )
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    def lab_size() -> int:
+        size = int(app.config.get("LAB_IMAGE_SIZE", 256))
+        return size if size in LAB_SIZES else 256
+
+    def lab_page(error: str | None = None, status: int = 200) -> ResponseReturnValue:
+        page = render_template(
+            "lab.html",
+            samples=SAMPLES,
+            ciphers=CIPHER_INFO,
+            size=lab_size(),
+            error=error,
+        )
+        return page, status
+
+    @app.get("/lab")
+    @web.login_required(store)
+    def lab_form() -> ResponseReturnValue:
+        return lab_page()
+
+    @app.post("/lab")
+    @web.login_required(store)
+    def lab_run() -> ResponseReturnValue:
+        user = web._require_user(store)
+        if not web._throttle(app, "lab", f"user:{user.id}"):
+            return lab_page("Too many lab runs. Try again in a few minutes.", 429)
+        try:
+            names = request.form.getlist("cipher")
+            if not names:
+                raise ValueError("Choose at least one cipher.")
+            unknown = [name for name in names if name not in CIPHER_NAMES]
+            if unknown:
+                raise ValueError("Unknown cipher: choose from the list.")
+            size = lab_size()
+            source = request.form.get("source") or "sample"
+            if source == "sample":
+                chosen = request.form.get("sample") or ""
+                if chosen not in SAMPLES:
+                    raise ValueError("Choose one of the built-in images.")
+                image, label = sample(chosen, size), chosen.replace("-", " ")
+            elif source == "upload":
+                upload = request.files.get("image")
+                raw = upload.read() if upload is not None else b""
+                if not raw:
+                    raise ValueError("Choose an image to upload.")
+                web._inspect_image(
+                    raw,
+                    allowed_formats=set(app.config["ALLOWED_IMAGE_FORMATS"]),
+                    max_pixels=int(app.config["MAX_IMAGE_PIXELS"]),
+                )
+                image, label = prepare(raw, size), "your upload"
+            else:
+                raise ValueError("Choose a built-in image or upload one.")
+            report = run_lab(image, ciphers=names, source=label)
+        except ValueError as exc:  # UnsupportedImageError is a ValueError
+            return lab_page(str(exc), 400)
+        response = make_response(render_template("lab_report.html", report=report.to_dict()))
         response.headers["Cache-Control"] = "no-store"
         return response

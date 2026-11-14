@@ -39,6 +39,8 @@ _CLASSES: dict[str, type[LabCipher]] = {
     )
 }
 IMPLEMENTED = tuple(name for name in CIPHER_NAMES if name in _CLASSES)
+# (name, title, family) for every cipher, in display order: what a form needs.
+CIPHER_INFO = tuple((name, _CLASSES[name].title, _CLASSES[name].family) for name in IMPLEMENTED)
 
 
 def make_cipher(name: str, key: bytes) -> LabCipher:

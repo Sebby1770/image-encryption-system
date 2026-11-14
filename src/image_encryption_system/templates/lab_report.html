@@ -1,0 +1,20 @@
+{% extends "layout.html" %}
+
+{% block title %}Cipher Lab results - Image Encryption System{% endblock %}
+
+{% block styles %}
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/lab.css') }}">
+{% endblock %}
+
+{% block content %}
+  <section class="lab-hero" aria-labelledby="lab-results-title">
+    <p class="lab-eyebrow">Cipher Lab</p>
+    <h1 id="lab-results-title">Results</h1>
+    <p class="lab-lede">
+      Image: {{ report.source }}, {{ report.size }}&times;{{ report.size }} pixels, encrypted under a
+      fresh random key. Nothing here was saved: leave this page and it is gone.
+      <a href="{{ url_for('lab_form') }}">Run the lab again</a>.
+    </p>
+  </section>
+  {% include "_lab_scorecard.html" %}
+{% endblock %}
