@@ -26,6 +26,11 @@ from . import keys
 from .base import Ciphertext, Image, LabCipher, LabDecryptError, byte_ciphertext
 
 
+def _new_nonce() -> bytes:
+    """A fresh 96-bit nonce (tests replace this to make runs repeatable)."""
+    return os.urandom(GCM_NONCE_BYTES)
+
+
 def _as_pixels(body: bytes, shape: tuple[int, int, int]) -> Image:
     return np.frombuffer(body, dtype=np.uint8).reshape(shape).copy()
 
@@ -97,7 +102,7 @@ class AesGcmCipher(LabCipher):
         return nonce + sealed
 
     def _encrypt(self, image: Image, size: int, nonce: bytes | None) -> Ciphertext:
-        nonce = os.urandom(GCM_NONCE_BYTES) if nonce is None else nonce
+        nonce = _new_nonce() if nonce is None else nonce
         sealed = AESGCM(self.gcm_key_for(nonce)).encrypt(nonce, image.tobytes(), self.AAD)
         payload = self.pack(nonce, sealed)
         return byte_ciphertext(_as_pixels(sealed[:-GCM_TAG_BYTES], image.shape), payload)
