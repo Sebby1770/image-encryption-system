@@ -50,6 +50,7 @@ addopts = "--strict-markers"
 markers = [
   "e2e: drives a real browser against a live server (needs Playwright + Chromium)",
   "production_kdf: run at the production Scrypt cost instead of the fast test cost",
+  "slow: a full-size Cipher Lab run (seconds, not milliseconds)",
 ]
 
 [tool.ruff]

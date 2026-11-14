@@ -167,3 +167,20 @@ def test_small_images_skip_the_size_dependent_tests() -> None:
     assert scored["entropy"].passed is None
     assert scored["local_entropy"].passed is None and scored["local_entropy"].value is None
     assert math.isfinite(scored["entropy"].value)
+
+
+def test_hyperchaos_passes_the_differential_test_like_a_good_cipher() -> None:
+    # The lab's lesson is that a cipher can pass these statistics and still be
+    # weak; its stand-in must therefore pass them at the 95% a 5% test allows.
+    # XOR-and-add diffusion alone keeps differences in the low bits (UACI too low).
+    image = imaging.sample("landscape", 256)
+    nudged = image.copy()
+    nudged[128, 128, 0] = (int(nudged[128, 128, 0]) + 1) % 256
+    floor = metrics.npcr_critical(image.size)
+    low, high = metrics.uaci_critical(image.size)
+    passes = 0
+    for i in range(20):
+        cipher = make_cipher("hyperchaos", bytes([i]) * 32)
+        npcr, uaci = metrics.npcr_uaci(cipher.encrypt(image).view, cipher.encrypt(nudged).view)
+        passes += npcr >= floor and low < uaci < high
+    assert passes >= 16, passes

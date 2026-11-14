@@ -70,8 +70,12 @@ def _logistic_keystream(key: bytes, size: int) -> Image:
     return stream
 
 
-# The four diffusion passes, in encryption order: (axis scanned, direction).
-_PASSES = ((1, 1), (0, 1), (1, -1), (0, -1))
+# Two rounds of four diffusion passes, in encryption order: (axis scanned,
+# direction). One round is not enough: each pass is a single chain per row or
+# column, and when a difference happens to cancel where the changed region
+# ends (1 time in 256), the rest of that chain stays unchanged. The second
+# round revives such runs, because by then nearly every input byte differs.
+_PASSES = ((1, 1), (0, 1), (1, -1), (0, -1)) * 2
 
 
 def _scan(m: Image, axis: int) -> Image:
@@ -79,19 +83,25 @@ def _scan(m: Image, axis: int) -> Image:
     return m if axis == 0 else m.T
 
 
-def _diffuse(m: Image, k1: Image, k2: Image, axis: int, direction: int) -> Image:
-    """``y_t = x_t ^ k1_t ^ ((y_prev + k2_t) mod 256)``, scanning along ``axis``."""
+def _diffuse(m: Image, k1: Image, k2: Image, sbox: Image, axis: int, direction: int) -> Image:
+    """``y_t = S[x_t ^ k1_t ^ ((y_prev + k2_t) mod 256)]``, scanning along ``axis``.
+
+    The chaotic S-box ``S`` matters: with XOR and addition alone, a small
+    plaintext difference stays in the low bits and the UACI test fails.
+    """
     x, a, b = _scan(m, axis), _scan(k1, axis), _scan(k2, axis)
     y = np.empty_like(x)
     previous = np.zeros(x.shape[1], dtype=np.uint8)
     order = range(x.shape[0]) if direction > 0 else range(x.shape[0] - 1, -1, -1)
     for t in order:
-        previous = x[t] ^ a[t] ^ (previous + b[t])
+        previous = sbox[x[t] ^ a[t] ^ (previous + b[t])]
         y[t] = previous
     return np.ascontiguousarray(_scan(y, axis))
 
 
-def _undiffuse(m: Image, k1: Image, k2: Image, axis: int, direction: int) -> Image:
+def _undiffuse(
+    m: Image, k1: Image, k2: Image, inverse_sbox: Image, axis: int, direction: int
+) -> Image:
     """The inverse pass. It needs no loop: each step's ``y_prev`` is ciphertext."""
     y, a, b = _scan(m, axis), _scan(k1, axis), _scan(k2, axis)
     previous = np.zeros_like(y)
@@ -99,7 +109,7 @@ def _undiffuse(m: Image, k1: Image, k2: Image, axis: int, direction: int) -> Ima
         previous[1:] = y[:-1]
     else:
         previous[:-1] = y[1:]
-    return np.ascontiguousarray(_scan(y ^ a ^ (previous + b), axis))
+    return np.ascontiguousarray(_scan(inverse_sbox[y] ^ a ^ (previous + b), axis))
 
 
 class HyperchaosCipher(LabCipher):
@@ -109,45 +119,53 @@ class HyperchaosCipher(LabCipher):
     title = "Hyperchaotic permutation + diffusion"
     family = "chaos"
     summary = (
-        "A hyperchaotic Chen system shuffles the pixels, then four diffusion passes "
-        "chain every byte to every other."
+        "A hyperchaotic Chen system shuffles the pixels, then two rounds of four "
+        "diffusion passes through a chaotic S-box chain every byte to every other."
     )
     key_note = (
         "Five doubles from the key. The Gao-Chen design this follows was broken with "
         "chosen plaintexts (Rhouma & Belghith, 2008)."
     )
 
-    def _keys_for(self, size: int) -> tuple[NDArray[np.int64], Image]:
+    def _keys_for(self, size: int) -> tuple[NDArray[np.int64], Image, Image, Image]:
         return self._memo(size, lambda: _hyperchaos_material(self.key, size))
 
     def _encrypt(self, image: Image, size: int, nonce: bytes | None) -> Ciphertext:
-        order, passes = self._keys_for(size)
+        order, passes, sbox, _inverse = self._keys_for(size)
         m = image.reshape(-1, 3)[order].reshape(size, 3 * size)
         for index, (axis, direction) in enumerate(_PASSES):
-            m = _diffuse(m, passes[2 * index], passes[2 * index + 1], axis, direction)
+            m = _diffuse(m, passes[2 * index], passes[2 * index + 1], sbox, axis, direction)
         return byte_ciphertext(m.reshape(image.shape))
 
     def _decrypt(self, ct: Ciphertext) -> Image:
         size = ct.shape[0]
-        order, passes = self._keys_for(size)
+        order, passes, _sbox, inverse = self._keys_for(size)
         m = payload_pixels(ct).reshape(size, 3 * size)
         for index in reversed(range(len(_PASSES))):
             axis, direction = _PASSES[index]
-            m = _undiffuse(m, passes[2 * index], passes[2 * index + 1], axis, direction)
+            m = _undiffuse(m, passes[2 * index], passes[2 * index + 1], inverse, axis, direction)
         flat = np.empty((size * size, 3), dtype=np.uint8)
         flat[order] = m.reshape(-1, 3)
         return flat.reshape(ct.shape)
 
 
-def _hyperchaos_material(key: bytes, size: int) -> tuple[NDArray[np.int64], Image]:
+def _hyperchaos_material(key: bytes, size: int) -> tuple[NDArray[np.int64], Image, Image, Image]:
     f = keys.unit_floats(key, "hyperchaos", 5)
     state0 = (10 * f[0] - 5, 10 * f[1] - 5, 10 * f[2] - 5, 10 * f[3] - 5)
-    values = chaos.chen_sequence(state0, 1.4 * f[4] - 0.7, 25 * size * size)
-    order = np.argsort(values[: size * size], kind="stable")
-    passes = chaos.chaos_bytes(values[size * size :]).reshape(8, size, 3 * size)
-    order.setflags(write=False)
-    passes.setflags(write=False)
-    return order, passes
+    pixels = size * size
+    streams = 2 * len(_PASSES)  # k1 and k2 for every pass
+    end = pixels + streams * 3 * pixels
+    values = chaos.chen_sequence(state0, 1.4 * f[4] - 0.7, end + 256)
+    order = np.argsort(values[:pixels], kind="stable")
+    passes = chaos.chaos_bytes(values[pixels:end]).reshape(streams, size, 3 * size)
+    # Rank the low digits, not the raw values: neighbouring lanes start close
+    # together, and ranking raw values would give a smooth, weak S-box.
+    digits = np.floor(np.abs(values[end:]) * 1e14) % 2**24
+    sbox = np.argsort(digits, kind="stable").astype(np.uint8)
+    inverse = np.argsort(sbox, kind="stable").astype(np.uint8)
+    for array in (order, passes, sbox, inverse):
+        array.setflags(write=False)
+    return order, passes, sbox, inverse
 
 
 class WaveletCipher(LabCipher):
