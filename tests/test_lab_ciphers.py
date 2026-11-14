@@ -170,3 +170,43 @@ def test_key_material_is_cached_per_instance_not_forever(monkeypatch) -> None:
     assert len(calls) == 1
     make_cipher("logistic-xor", KEY).encrypt(image)
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize(("name", "bytes_per_value"), [("wht", 8), ("drpe", 16)])
+def test_float_payload_sizes(name, bytes_per_value) -> None:
+    ciphertext = make_cipher(name, KEY).encrypt(_random_image(6, 64))
+    assert len(ciphertext.payload) == bytes_per_value * 3 * 64 * 64
+    assert ciphertext.pixels is None
+
+
+@pytest.mark.parametrize("name", ["wht", "drpe"])
+def test_tampering_a_float_ciphertext_shows_in_the_image(name) -> None:
+    image = _random_image(7)
+    cipher = make_cipher(name, KEY)
+    ciphertext = cipher.encrypt(image)
+    index, mask = cipher.tamper_position(ciphertext)
+    damaged = bytearray(ciphertext.payload)
+    damaged[index] ^= mask
+    opened = cipher.decrypt(Ciphertext(bytes(damaged), ciphertext.shape, None, ciphertext.view))
+    assert opened.dtype == np.uint8
+    assert (opened != image).any()
+
+
+def test_neural_cipher_maps_equal_patches_equally() -> None:
+    image = np.zeros((32, 32, 3), np.uint8)
+    image[0:4, 0:4] = (10, 20, 30)
+    image[8:12, 16:20] = (10, 20, 30)
+    pixels = make_cipher("neural", KEY).encrypt(image).pixels
+    assert np.array_equal(pixels[0:4, 0:4], pixels[8:12, 16:20])
+    assert not np.array_equal(pixels[0:4, 0:4], pixels[4:8, 0:4])
+
+
+def test_neural_cipher_mixes_within_a_patch() -> None:
+    image = _random_image(8)
+    nudged = image.copy()
+    nudged[1, 1, 0] ^= 1
+    cipher = make_cipher("neural", KEY)
+    before, after = cipher.encrypt(image).pixels, cipher.encrypt(nudged).pixels
+    changed = np.argwhere(np.any(before != after, axis=-1))
+    assert changed.size and (changed < 4).all()  # only that 4x4 patch changes...
+    assert np.sum(before[:4, :4] != after[:4, :4]) > 24  # ...but most of it does

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from .base import LabCipher
 from .classic import ArnoldCipher, HyperchaosCipher, LogisticXorCipher, WaveletCipher
+from .linear import DrpeCipher, WalshHadamardCipher
+from .neural import NeuralCipher
 
 CIPHER_NAMES = (
     "arnold",
@@ -20,7 +22,16 @@ CIPHER_NAMES = (
 )
 
 _CLASSES: dict[str, type[LabCipher]] = {
-    cls.name: cls for cls in (ArnoldCipher, LogisticXorCipher, HyperchaosCipher, WaveletCipher)
+    cls.name: cls
+    for cls in (
+        ArnoldCipher,
+        LogisticXorCipher,
+        HyperchaosCipher,
+        WaveletCipher,
+        WalshHadamardCipher,
+        DrpeCipher,
+        NeuralCipher,
+    )
 }
 IMPLEMENTED = tuple(name for name in CIPHER_NAMES if name in _CLASSES)
 
