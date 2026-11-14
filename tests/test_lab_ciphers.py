@@ -210,3 +210,68 @@ def test_neural_cipher_mixes_within_a_patch() -> None:
     changed = np.argwhere(np.any(before != after, axis=-1))
     assert changed.size and (changed < 4).all()  # only that 4x4 patch changes...
     assert np.sum(before[:4, :4] != after[:4, :4]) > 24  # ...but most of it does
+
+
+def test_every_registered_name_is_implemented() -> None:
+    assert IMPLEMENTED == CIPHER_NAMES
+
+
+def test_aes_ecb_matches_cryptography() -> None:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    from image_encryption_system.lab import keys
+
+    image = _random_image(9)
+    encryptor = Cipher(algorithms.AES(keys.derive(KEY, "aes-ecb", 32)), modes.ECB()).encryptor()
+    expected = encryptor.update(image.tobytes()) + encryptor.finalize()
+    assert make_cipher("aes-ecb", KEY).encrypt(image).payload == expected
+
+
+def test_ctr_reuses_its_iv_for_every_image() -> None:
+    cipher = make_cipher("aes-ctr-fixed-iv", KEY)
+    a, b = _random_image(10), _random_image(11)
+    stream_a = np.frombuffer(cipher.encrypt(a).payload, np.uint8) ^ a.ravel()
+    stream_b = np.frombuffer(cipher.encrypt(b).payload, np.uint8) ^ b.ravel()
+    assert np.array_equal(stream_a, stream_b)
+
+
+@pytest.mark.parametrize(("name", "overhead"), [("aes-gcm", 12 + 16), ("aes-gcm-v4", 12 + 32 + 16)])
+def test_gcm_payload_layouts(name, overhead) -> None:
+    image = _random_image(12, 64)
+    cipher = make_cipher(name, KEY)
+    first, second = cipher.encrypt(image), cipher.encrypt(image)
+    assert len(first.payload) == 3 * 64 * 64 + overhead
+    assert first.payload != second.payload  # a fresh nonce every time
+    assert cipher.randomized and cipher.authenticated
+    fixed = cipher.encrypt(image, nonce=bytes(12))
+    assert fixed.payload == cipher.encrypt(image, nonce=bytes(12)).payload
+
+
+@pytest.mark.parametrize("name", ["aes-gcm", "aes-gcm-v4"])
+def test_gcm_ciphers_refuse_any_tampering(name) -> None:
+    image = _random_image(13)
+    cipher = make_cipher(name, KEY)
+    ciphertext = cipher.encrypt(image)
+    for index in (0, 13, len(ciphertext.payload) // 2, len(ciphertext.payload) - 1):
+        damaged = bytearray(ciphertext.payload)
+        damaged[index] ^= 0x01
+        with pytest.raises(LabDecryptError):
+            cipher.decrypt(Ciphertext(bytes(damaged), ciphertext.shape, None, ciphertext.view))
+
+
+def test_v4_lab_cipher_uses_the_vault_construction() -> None:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    from image_encryption_system.crypto import derive_v4_keys
+    from image_encryption_system.lab import keys
+
+    image = _random_image(14)
+    cipher = make_cipher("aes-gcm-v4", KEY)
+    payload = cipher.encrypt(image).payload
+    nonce, commitment, sealed = payload[:12], payload[12:44], payload[44:]
+    data_key = keys.derive(KEY, "aes-gcm-v4", 32)
+    image_key, expected_commitment = derive_v4_keys(data_key, nonce, cipher.AAD)
+    assert commitment == expected_commitment
+    assert AESGCM(image_key).decrypt(nonce, sealed, cipher.AAD) == image.tobytes()
+    assert cipher.gcm_key_for(nonce) == image_key
+    assert cipher.pack(nonce, sealed) == payload

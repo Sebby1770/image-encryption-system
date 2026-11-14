@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from .aes import AesCtrFixedIvCipher, AesEcbCipher, AesGcmCipher, AesGcmV4Cipher
 from .base import LabCipher
 from .classic import ArnoldCipher, HyperchaosCipher, LogisticXorCipher, WaveletCipher
 from .linear import DrpeCipher, WalshHadamardCipher
@@ -31,6 +32,10 @@ _CLASSES: dict[str, type[LabCipher]] = {
         WalshHadamardCipher,
         DrpeCipher,
         NeuralCipher,
+        AesEcbCipher,
+        AesCtrFixedIvCipher,
+        AesGcmCipher,
+        AesGcmV4Cipher,
     )
 }
 IMPLEMENTED = tuple(name for name in CIPHER_NAMES if name in _CLASSES)
