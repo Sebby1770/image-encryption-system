@@ -3,14 +3,46 @@
 **Live site:** [https://sebby1770.github.io/image-encryption-system/](https://sebby1770.github.io/image-encryption-system/)
 
 A Flask image vault that encrypts photos with **AES-256-GCM** before they touch
-disk. Per-image data keys are wrapped with Scrypt+AES or RSA-OAEP.
+disk. Per-image data keys are wrapped with Scrypt+AES or RSA-OAEP, and every new
+envelope is **key-committing** (version 4), so one ciphertext can only ever open
+as one image.
 
 **End-to-end mode** (the default) encrypts in your browser: metadata is stripped,
 the image sealed, shared, linked, and decrypted in the page, and the server only
 ever stores ciphertext and key wraps it cannot open. Server mode is still there
 for TIFF and for clients without JavaScript.
 
+**Cloaked exports** hide an encrypted image inside an ordinary-looking picture,
+and the **Cipher Lab** puts chaotic, wavelet, Fourier and neural image ciphers
+next to the vault's AES-256-GCM, scores them with the statistics papers report,
+and breaks the weak ones with real attacks.
+
 ## Features
+
+- **Key-committing envelopes (version 4).** AES-GCM alone lets one ciphertext
+  carry a valid tag under two different keys, so an owner could give two share
+  recipients two keys that open the same stored image as two different
+  pictures. Version 4 derives the GCM key and a 32-byte commitment from the data
+  key with HKDF-SHA256 and refuses any other key before decrypting, in Python,
+  the CLI and the browser alike. A test builds that two-key forgery for real:
+  version 3 opens it under both keys, version 4 under one. Re-keying upgrades an
+  older image.
+- **Cloaked exports.** Download any vault image hidden in a PNG that looks like
+  a landscape (generated, four styles) or a photo of your own: the encrypted
+  `.ies` file goes into the low bits of the picture's integer-wavelet detail
+  coefficients, about 45 dB PSNR at 2 bits. It needs only ciphertext, so it works
+  for end-to-end images; `ies uncloak` or `ies decrypt` on the PNG gets it back,
+  and any recompression is reported, never a wrong file.
+- **Cipher Lab** (`/lab` and `ies lab`). Eleven lossless image ciphers: Arnold
+  cat map, logistic-map XOR, a hyperchaotic Chen cipher, integer-wavelet
+  scrambling, a Walsh-Hadamard mask, Fourier double random phase encoding, a
+  keyed integer neural network, AES-ECB, AES-CTR with a reused IV, and the
+  vault's AES-GCM as version 3 and 4. Each is scored (entropy, local entropy,
+  chi-square, correlation, NPCR/UACI, key sensitivity) and attacked: one chosen
+  image breaks the cat map, logistic XOR and reused-IV CTR, three break the
+  wavelet scrambler, one impulse breaks Walsh-Hadamard and DRPE, ECB and the
+  neural network act as codebooks, and only GCM refuses tampering. See
+  [docs/CIPHER_LAB.md](docs/CIPHER_LAB.md).
 
 - **End-to-end encryption in the browser.** WebCrypto AES-256-GCM, a pure
   JavaScript Scrypt in a Web Worker, and RSA-OAEP, producing the same `.ies`
@@ -46,9 +78,10 @@ for TIFF and for clients without JavaScript.
 - Change password: new hash, RSA private key re-encrypted, `token_version`
   bumped so other sessions and JWTs stop working.
 - Delete account (`POST /account/delete`) with password confirmation.
-- Envelope version 3 seals the image's owner, asset id, algorithm, wrap type,
-  MIME type, format, and dimensions into the AES-GCM AAD, so ciphertext cannot
-  be swapped between records or accounts. Version 1 files stay decryptable.
+- Envelopes (version 3, and version 4 on top of key commitment) seal the image's
+  owner, asset id, algorithm, wrap type, MIME type, format, and dimensions into
+  the AES-GCM AAD, so ciphertext cannot be swapped between records or accounts.
+  Version 1 files stay decryptable.
 - Capture metadata is stripped before encryption: EXIF (including GPS), XMP,
   IPTC, PNG text chunks, and JPEG/GIF comments.
 - Uploads are identified from their header and bounded (format allow-list,
@@ -110,6 +143,12 @@ ies rewrap out.bin --old-passphrase 'a long secret' --new-passphrase 'rotated' -
 ies keygen --passphrase 'account password' --out-private key.key --out-public pub.pem
 ies encrypt IN.png --public-key pub.pem --out photo.ies
 ies decrypt photo.ies --private-key key.key --passphrase 'account password' --out restored.png
+ies cloak photo.ies -o photo.png --palette alpine      # hide it in a landscape
+ies cloak photo.ies -o beach.png --cover beach.jpg --bits 1
+ies uncloak photo.png -o photo.ies                     # or: ies decrypt photo.png ...
+ies lab list
+ies lab run --sample test-card --size 256 --html lab.html --json lab.json
+ies lab run --image mine.jpg --cipher hyperchaos --cipher aes-gcm-v4 --seed demo
 ```
 
 The CLI talks only to `crypto.py`. It does not start Flask or write decrypted
@@ -117,7 +156,40 @@ images unless you pass `--out`. `inspect` prints algorithm and version only.
 `verify` unwraps the data key and exits 0 or 1. `keygen` seals the private key
 with Scrypt; `--pem` writes OpenSSL-compatible PKCS#8 instead, which is far
 cheaper to brute-force. A `.ies` downloaded from an end-to-end image opens in
-the CLI like any other.
+the CLI like any other, and every command that reads an `.ies` also reads a
+cloaked PNG. `inspect` says whether an envelope is key-committing.
+
+## Cloaked exports
+
+**Cloak** on any image you own downloads it as an ordinary PNG: a generated
+landscape (dusk, alpine, desert or ocean, with an optional seed) or your own
+picture, enlarged if it is too small. The vault file is written into the low 1-3
+bits of the picture's integer Haar wavelet detail coefficients, spread evenly by
+a golden-ratio slot order, behind a whitened header with its length and SHA-256.
+
+| Bits per coefficient | Capacity at 960x640 | PSNR at full capacity |
+| --- | --- | --- |
+| 1 | 172,756 bytes | 50.6 dB |
+| 2 | 345,512 bytes | 45.6 dB |
+| 3 | 518,268 bytes | 38.9 dB |
+
+The cloak is not a secret: the AES-256-GCM envelope inside is what protects the
+image. It hides from a casual viewer that a picture carries a vault file; it
+does not resist steganalysis, and recompressing, resizing or editing the PNG
+destroys what it carries (`uncloak` then says so instead of returning a wrong
+file).
+
+## Cipher Lab
+
+`/lab` (and `ies lab run`) encrypts one image eleven ways and reports, for each
+cipher, a verdict decided by attacks (Broken, Leaks, "Strong, not
+key-committing", "Strong + committing"), the evidence images, and the statistics
+image-encryption papers use, each with its pass rule. Uploads are processed in
+memory and never stored. The main lesson is printed on the page: the
+hyperchaotic cipher passes every statistic and is still deterministic and
+unauthenticated, so statistics alone never show that a cipher is secure.
+[docs/CIPHER_LAB.md](docs/CIPHER_LAB.md) explains every cipher, metric and
+attack, with references.
 
 ## End-to-end mode
 
@@ -187,9 +259,9 @@ account: vault blobs, shares, RSA keys, audit rows, and the user.
 - `GET /backup` downloads a zip of your encrypted blobs plus `manifest.json`.
 - `POST /restore` (dashboard form) imports that zip into the current account.
   Every entry is validated first, so a bad backup restores nothing. Restoring
-  the same backup twice does not duplicate images. Images in the current
-  (version 3) format can only be restored into the account that exported
-  them; version 1 images can be restored anywhere.
+  the same backup twice does not duplicate images. Images in a sealed-context
+  format (versions 3 and 4) can only be restored into the account that
+  exported them; version 1 images can be restored anywhere.
 - Private keys and password hashes are never included.
 - Each vault item can also be downloaded as a portable `.ies` file.
 
@@ -208,6 +280,10 @@ account: vault blobs, shares, RSA keys, audit rows, and the user.
 | `IES_REGISTER_RATE_LIMIT` / `_WINDOW` | Registrations per address per window (default 5 / 3600 s) |
 | `IES_DECRYPT_RATE_LIMIT` / `_WINDOW` | Decrypt attempts per account per window (default 30 / 300 s) |
 | `IES_LINK_RATE_LIMIT` / `_WINDOW` | Capability-link requests per address per window (default 20 / 300 s) |
+| `IES_LAB_RATE_LIMIT` / `_WINDOW` | Cipher Lab runs per account per window (default 6 / 600 s) |
+| `IES_CLOAK_RATE_LIMIT` / `_WINDOW` | Cloaked downloads per account per window (default 10 / 600 s) |
+| `IES_LAB_IMAGE_SIZE` | Side of the square the lab works at (default 256; 32-512, powers of two) |
+| `IES_CLOAK_MAX_PIXELS` | Largest cover the cloak will draw or accept (default 24,000,000) |
 
 A throttle limit of `0` disables that throttle.
 
@@ -223,6 +299,10 @@ The selected algorithm controls how that data key is protected:
 - `AES-GCM passphrase`: Scrypt derives a wrapping key, then AES-GCM wraps the
   data key.
 - `RSA hybrid`: RSA-OAEP-SHA256 wraps the data key with the user's public key.
+
+Version 4 envelopes never use the data key directly: HKDF-SHA256 derives the
+image's AES-GCM key and a 32-byte key commitment (over the nonce and the sealed
+context) from it, and decryption checks the commitment before AES-GCM runs.
 
 The decrypted image is streamed to the authorized user and is **not** written to
 disk by the web app.
@@ -264,6 +344,9 @@ mypy
 pytest
 ```
 
+The Cipher Lab and cloak tests run in seconds; `pytest -m "not slow"` skips the
+one full-size lab run.
+
 The suite includes Hypothesis property tests (`tests/test_properties.py`):
 flipping any byte of an `.ies` file must make decryption fail, CLI and web
 uploads must round-trip, and out-of-bounds KDF parameters must be rejected
@@ -297,17 +380,22 @@ tests in their own job, and a `pip-audit` dependency scan.
 ```text
 image-encryption-system/
   src/image_encryption_system/
-    crypto.py          # AES-GCM, RSA-OAEP, .ies container, key re-wrap
+    crypto.py          # AES-GCM, RSA-OAEP, .ies container, key re-wrap, v4 commitment
     storage.py         # SQLite, shares, audit, backup zip
     web.py             # Flask app, auth, share, revoke, audit, API
+    lab_routes.py      # /lab and /images/<id>/cloak
     cli.py             # ies console script
     security.py        # login guard, request throttles, password policy
+    iwt.py, quality.py # integer Haar lifting; PSNR and SSIM
+    covers.py          # generated landscape covers
+    cloak.py           # hide an .ies file in a PNG, and get it back
+    lab/               # Cipher Lab: ciphers, metrics, attacks, runner, report
     templates/         # HTML views
     static/css/        # UI styling
     static/js/         # ies-crypto.js, ies-image.js, scrypt worker, page modules
   tests/               # pytest coverage
   tests/js/            # node --test suite and the harness Python tests drive
-  docs/                # Threat model
+  docs/                # Threat model, Cipher Lab guide, design spec and plan
 ```
 
 ## Docker
