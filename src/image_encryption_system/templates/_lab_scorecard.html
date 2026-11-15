@@ -42,9 +42,9 @@
           </th>
           <td><span class="lab-verdict lab-verdict-{{ r.verdict_slug }}">{{ r.verdict }}</span></td>
           <td class="lab-why">{{ r.headline }}</td>
-          <td>{{ r.statistics.passed }} / {{ r.statistics.judged }}</td>
-          <td>{{ r.key_bits }}-bit</td>
-          <td>{{ (r.metrics|selectattr('key', 'equalto', 'expansion')|first).display }}</td>
+          <td class="lab-number">{{ r.statistics.passed }} / {{ r.statistics.judged }}</td>
+          <td class="lab-number">{{ r.key_bits }}-bit</td>
+          <td class="lab-number">{{ (r.metrics|selectattr('key', 'equalto', 'expansion')|first).display }}</td>
         </tr>
       {% endfor %}
     </tbody>
