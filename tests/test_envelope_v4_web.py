@@ -214,3 +214,65 @@ def test_cli_inspect_reports_key_commitment(tmp_path, capsys) -> None:
 
     assert cli_main(["inspect", str(FIXTURES / "legacy-v1-cli.ies")]) == 0
     assert "key commitment: no (version 1)" in capsys.readouterr().out
+
+
+def _restore_backup(client, archive: bytes):
+    return client.post(
+        "/restore",
+        data=with_csrf(client, {"backup": (BytesIO(archive), "backup.zip")}),
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+
+
+def _share_and_link(app, client, asset_id: int):
+    from helpers import post_json
+
+    from image_encryption_system.crypto import (
+        unwrap_data_key,
+        wrap_data_key_passphrase,
+        wrap_data_key_rsa,
+    )
+
+    store = app.extensions["vault_store"]
+    metadata = store.get_asset(asset_id).metadata
+    data_key = unwrap_data_key(metadata["key_wrap"], passphrase=BROWSER_PASS)
+    share = post_json(
+        client,
+        f"/images/{asset_id}/shares/sealed",
+        {"username": "bob", "key_wrap": wrap_data_key_rsa(data_key, store.read_public_key(2))},
+    )
+    link = post_json(
+        client,
+        f"/images/{asset_id}/links/sealed",
+        {"key_wrap": wrap_data_key_passphrase(data_key, "a link secret 0123456789abcdef")},
+    )
+    return share, link
+
+
+def test_a_restored_v3_image_cannot_be_shared_until_rekeyed(vault) -> None:
+    # Restore must keep accepting old backups, but a version 3 envelope does not
+    # commit to its key: an owner could restore a crafted one and give each
+    # recipient a different key that opens it as a different picture. New
+    # browser-made shares and links therefore need version 4; re-keying upgrades.
+    app, alice = vault
+    register(app.test_client(), "bob")
+    store = app.extensions["vault_store"]
+    asset, metadata, _ciphertext = _store_v3_browser_image(app)
+    archive = alice.get("/backup").data
+    store.delete_asset(asset.id, 1)
+    assert b"Restored 1 encrypted image" in _restore_backup(alice, archive).data
+    restored = store.list_assets(1)[0]
+    assert restored.metadata["version"] == 3
+
+    share, link = _share_and_link(app, alice, restored.id)
+    for refused in (share, link):
+        assert refused.status_code == 400
+        assert "Re-key" in refused.get_json()["error"]
+    assert store.get_share(restored.id, 2) is None
+
+    new_metadata, new_ciphertext = _reencrypted(metadata)
+    assert _post_rekey(alice, restored.id, new_metadata, new_ciphertext).status_code == 200
+    share, link = _share_and_link(app, alice, restored.id)
+    assert share.status_code == 200, share.get_json()
+    assert link.status_code == 200, link.get_json()

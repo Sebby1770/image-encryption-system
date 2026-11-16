@@ -1038,6 +1038,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         try:
             asset = _owned_asset(store, asset_id, user)
             _require_end_to_end(asset)
+            _require_key_commitment(asset)
             recipient = _resolve_recipient(store, user, str(payload.get("username", "")))
             key_wrap = payload.get("key_wrap")
             if validate_key_wrap(key_wrap) != WRAP_RSA:
@@ -1076,6 +1077,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         try:
             asset = _owned_asset(store, asset_id, user)
             _require_end_to_end(asset)
+            _require_key_commitment(asset)
             key_wrap = payload.get("key_wrap")
             # Link keys are 256-bit random values, so the KDF floor is plenty.
             if validate_key_wrap(key_wrap, min_scrypt_n=MIN_SCRYPT_N) != WRAP_SCRYPT:
@@ -1611,6 +1613,22 @@ def _resolve_recipient(store: VaultStore, owner: User, username: str) -> User:
     if recipient is None:
         raise LookupError("No account exists with that username.")
     return recipient
+
+
+def _require_key_commitment(asset: EncryptedAsset) -> None:
+    """Refuse to hand out new wraps of an end-to-end key that is not committed.
+
+    The owner's browser chooses the key in every share and link wrap. Under a
+    version 3 envelope (an image stored before version 4, or one restored from
+    an old backup) a crafted ciphertext can open under two keys as two
+    different pictures, so new recipients are only added once a re-key has
+    upgraded the image to version 4.
+    """
+    if validate_envelope(asset.metadata) != ENVELOPE_V4:
+        raise CryptoError(
+            "This image predates key commitment. Re-key it to upgrade it before "
+            "sharing it or creating a link."
+        )
 
 
 def _require_server_side(asset: EncryptedAsset) -> None:

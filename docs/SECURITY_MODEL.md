@@ -15,7 +15,8 @@ test together.
 - **One image per ciphertext.** A version 4 envelope opens under exactly one
   data key, so nobody who controls the wraps (an owner choosing what each
   recipient gets, say) can make one stored ciphertext show different pictures
-  to different people.
+  to different people. Recipients are only ever added to version 4 images (see
+  "Key commitment").
 - **Access control.** Only the owner, recipients the owner shares with, and
   holders of an unexpired capability link can decrypt.
 - **Capture metadata.** GPS and camera metadata are removed before encryption.
@@ -253,9 +254,16 @@ version 3 envelope opens for both keys as two different images; under version
 the second key fails the commitment. The browser twin is checked against
 Python in both directions (`tests/test_browser_crypto.py`).
 
-Version 1 and 3 images remain readable, so an image stored before version 4
-keeps version 3's weaker guarantee until its owner re-keys it; the server only
-accepts version 4 for new browser uploads and re-keys.
+Version 1 and 3 images remain readable, and restore still accepts them, so
+old backups keep working. That is also a way in: an owner could restore a
+crafted version 3 envelope today. So the server refuses to add a recipient to
+an end-to-end image that is not version 4: new browser-made shares and links
+are refused with a request to re-key first, and re-keying upgrades the image
+(`tests/test_envelope_v4_web.py::test_a_restored_v3_image_cannot_be_shared_until_rekeyed`).
+Server-mode shares need no such rule, because the server wraps the owner's own
+data key, so every recipient gets the same key. What remains: shares created on
+a version 3 image before this release keep version 3's guarantee until the
+owner re-keys.
 
 ### Envelope versions and AAD
 

@@ -146,8 +146,10 @@ route that takes a passphrase or account password calls
 `web._require_server_side()`. Wraps a browser sends are checked with
 `crypto.validate_key_wrap()` (structure only; the server cannot open them).
 New browser uploads and re-keys must be version 4 (a stale page sending version
-3 is told to reload); stored version 3 images still open, and a re-key upgrades
-them.
+3 is told to reload); stored version 3 images still open and still restore, and
+a re-key upgrades them. Because restore can bring in a crafted version 3
+envelope, browser-made shares and links (`_require_key_commitment`) are refused
+on anything but version 4.
 
 Account private keys are `user-<id>-private.key`, sealed by
 `crypto.wrap_private_key()` (Scrypt + AES-GCM over PKCS#8 DER, owner in the
