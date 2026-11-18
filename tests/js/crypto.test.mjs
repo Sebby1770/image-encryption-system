@@ -12,7 +12,10 @@ import {
   b64urlDecode,
   b64urlEncode,
   canonicalJSON,
+  concatBytes,
+  contextAAD,
   decryptImage,
+  deriveV4Keys,
   encryptImage,
   packIES,
   scrypt,
@@ -112,7 +115,7 @@ test("passphrase envelopes round-trip and seal their context", async () => {
     context: CONTEXT,
     n: MIN_SCRYPT_N,
   });
-  assert.equal(sealed.metadata.version, 3);
+  assert.equal(sealed.metadata.version, 4);
   assert.equal(sealed.metadata.context.wrap, "scrypt-aes-gcm");
   assert.match(sealed.metadata.context.asset, /^[0-9a-f]{32}$/);
 
@@ -123,7 +126,8 @@ test("passphrase envelopes round-trip and seal their context", async () => {
   await assert.rejects(unwrapDataKey(metadata.key_wrap, "the wrong passphrase"), CryptoError);
   const moved = structuredClone(metadata);
   moved.context.owner = 5;
-  await assert.rejects(decryptImage(ciphertext, moved, dataKey), /Decryption failed/);
+  // The commitment binds the sealed context, so an edited context fails there first.
+  await assert.rejects(decryptImage(ciphertext, moved, dataKey), /key commitment/);
   const flipped = ciphertext.slice();
   flipped[0] ^= 1;
   await assert.rejects(decryptImage(flipped, metadata, dataKey), /integrity/);
@@ -137,6 +141,81 @@ test("RSA envelopes round-trip through a public key PEM", async () => {
   assert.equal(sealed.metadata.key_wrap.type, "rsa-oaep-sha256");
   const dataKey = await unwrapDataKey(sealed.metadata.key_wrap, privateKey);
   assert.deepEqual(await decryptImage(sealed.ciphertext, sealed.metadata, dataKey), utf8("pixels"));
+});
+
+// Version 4: AES-GCM alone lets one ciphertext authenticate under two keys, so
+// the envelope commits to its data key and the browser checks that first.
+async function sealV4(plaintext, options = {}) {
+  return encryptImage(plaintext, {
+    algorithm: AES_GCM_PASSPHRASE,
+    passphrase: "a long image passphrase",
+    context: CONTEXT,
+    n: MIN_SCRYPT_N,
+    ...options,
+  });
+}
+
+test("version 4 envelopes carry a key commitment built as the spec says", async () => {
+  const plaintext = utf8("committed pixels");
+  const { metadata, ciphertext, dataKey } = await sealV4(plaintext);
+  assert.equal(metadata.version, 4);
+  assert.equal(b64decode(metadata.key_commitment).length, 32);
+
+  const nonce = b64decode(metadata.image_nonce);
+  const aad = contextAAD(metadata.context, 4);
+  assert.deepEqual(aad.subarray(0, 15), utf8("IES-CONTEXT-V4\u0000"));
+  assert.deepEqual(contextAAD(metadata.context).subarray(0, 15), utf8("IES-CONTEXT-V3\u0000"));
+
+  // HKDF-SHA256 straight from WebCrypto, with the constants written out.
+  const hkdf = async (info) => {
+    const key = await subtle.importKey("raw", dataKey, "HKDF", false, ["deriveBits"]);
+    const params = { name: "HKDF", hash: "SHA-256", salt: utf8("IES-V4"), info };
+    return new Uint8Array(await subtle.deriveBits(params, key, 256));
+  };
+  const digest = new Uint8Array(await subtle.digest("SHA-256", aad));
+  const commitment = await hkdf(concatBytes(utf8("IES-V4\u0000key-commitment\u0000"), nonce, digest));
+  const imageKey = await hkdf(utf8("IES-V4\u0000image-key"));
+
+  assert.deepEqual(b64decode(metadata.key_commitment), commitment);
+  assert.deepEqual(await deriveV4Keys(dataKey, nonce, aad), { imageKey, commitment });
+  assert.deepEqual(await decryptImage(ciphertext, metadata, dataKey), plaintext);
+
+  // The image is sealed under the derived key, not the data key itself.
+  const raw = await subtle.importKey("raw", imageKey, "AES-GCM", false, ["decrypt"]);
+  const opened = await subtle.decrypt({ name: "AES-GCM", iv: nonce, additionalData: aad }, raw, ciphertext);
+  assert.deepEqual(new Uint8Array(opened), plaintext);
+});
+
+test("a key that fails the commitment is refused", async () => {
+  const { metadata, ciphertext, dataKey } = await sealV4(utf8("committed pixels"));
+
+  await assert.rejects(decryptImage(ciphertext, metadata, new Uint8Array(32).fill(7)), /key commitment/);
+
+  const edited = structuredClone(metadata);
+  const commitment = b64decode(edited.key_commitment);
+  commitment[0] ^= 1;
+  edited.key_commitment = b64encode(commitment);
+  await assert.rejects(decryptImage(ciphertext, edited, dataKey), /key commitment/);
+
+  const { key_commitment: _dropped, ...missing } = metadata;
+  await assert.rejects(decryptImage(ciphertext, missing, dataKey), CryptoError);
+  const short = { ...metadata, key_commitment: b64encode(new Uint8Array(31)) };
+  await assert.rejects(decryptImage(ciphertext, short, dataKey), CryptoError);
+  // Relabelled as version 3, the key and the AAD prefix are both wrong.
+  await assert.rejects(decryptImage(ciphertext, { ...missing, version: 3 }, dataKey), /Decryption failed/);
+});
+
+test("version 3 envelopes can still be written and opened", async () => {
+  const plaintext = utf8("legacy pixels");
+  const sealed = await sealV4(plaintext, { version: 3 });
+  assert.equal(sealed.metadata.version, 3);
+  assert.equal("key_commitment" in sealed.metadata, false);
+  assert.deepEqual(await decryptImage(sealed.ciphertext, sealed.metadata, sealed.dataKey), plaintext);
+  const stray = { ...sealed.metadata, key_commitment: b64encode(new Uint8Array(32)) };
+  await assert.rejects(decryptImage(sealed.ciphertext, stray, sealed.dataKey), /unexpected fields/);
+  for (const version of [1, 2, 5, "4"]) {
+    await assert.rejects(sealV4(plaintext, { version }), CryptoError);
+  }
 });
 
 test("key wraps are closed and length-checked", async () => {

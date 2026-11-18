@@ -17,6 +17,7 @@ from cryptography.exceptions import InvalidTag, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
 AES_GCM_PASSPHRASE = "AES-GCM"
@@ -55,13 +56,29 @@ WRAP_TYPES = (WRAP_SCRYPT, WRAP_RSA)
 
 # Envelope versions this code can open. Version 1 is the original format whose
 # AAD is rebuilt from the legacy ``aad`` dict. Version 3 seals a structured
-# ``context``. Version 2 is deliberately skipped: the discarded v1.0 lineage of
+# ``context``. Version 4 seals the same context and also commits to the key
+# (below). Version 2 is deliberately skipped: the discarded v1.0 lineage of
 # this project wrote ``"version": 2`` with an incompatible layout.
 ENVELOPE_V1 = 1
 ENVELOPE_V3 = 3
-CURRENT_ENVELOPE_VERSION = ENVELOPE_V3
-SUPPORTED_ENVELOPE_VERSIONS = frozenset({ENVELOPE_V1, ENVELOPE_V3})
+ENVELOPE_V4 = 4
+CURRENT_ENVELOPE_VERSION = ENVELOPE_V4
+SUPPORTED_ENVELOPE_VERSIONS = frozenset({ENVELOPE_V1, ENVELOPE_V3, ENVELOPE_V4})
+# Versions whose AAD is a sealed ``context``; the only versions ever written.
+SEALED_CONTEXT_VERSIONS = frozenset({ENVELOPE_V3, ENVELOPE_V4})
 CONTEXT_AAD_PREFIX = b"IES-CONTEXT-V3\x00"
+CONTEXT_AAD_PREFIX_V4 = b"IES-CONTEXT-V4\x00"
+_CONTEXT_AAD_PREFIXES = {ENVELOPE_V3: CONTEXT_AAD_PREFIX, ENVELOPE_V4: CONTEXT_AAD_PREFIX_V4}
+# AES-GCM is not key-committing: one ciphertext can be built to authenticate
+# under two different keys, so an owner could give two share recipients two
+# keys that open the same stored blob as two different pictures. Version 4
+# derives the GCM key from the data key with HKDF and stores a commitment over
+# the data key, the nonce, and the sealed context; a key that does not
+# reproduce the commitment is refused before GCM runs.
+KEY_COMMITMENT_BYTES = 32
+V4_HKDF_SALT = b"IES-V4"
+V4_IMAGE_KEY_INFO = b"IES-V4\x00image-key"
+V4_COMMITMENT_INFO = b"IES-V4\x00key-commitment\x00"
 MAX_METADATA_BYTES = 64 * 1024
 MAX_CONTEXT_BYTES = 4096
 CONTEXT_SOURCES = frozenset({"web", "cli", "browser"})
@@ -73,6 +90,7 @@ _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 V3_ENVELOPE_KEYS = frozenset(
     {"version", "algorithm", "image_nonce", "key_wrap", "context", "ciphertext_sha256"}
 )
+V4_ENVELOPE_KEYS = V3_ENVELOPE_KEYS | {"key_commitment"}
 WRAP_KEYS = {
     WRAP_SCRYPT: frozenset({"type", "salt", "nonce", "wrapped_key", "n", "r", "p"}),
     WRAP_RSA: frozenset({"type", "wrapped_key"}),
@@ -310,8 +328,27 @@ def _check_key_owner(owner: Any) -> None:
 
 
 def new_asset_id() -> str:
-    """Random identifier sealed into every version 3 envelope."""
+    """Random identifier sealed into every version 3 and 4 envelope."""
     return uuid4().hex
+
+
+def derive_v4_keys(data_key: bytes, nonce: bytes, aad: bytes) -> tuple[bytes, bytes]:
+    """The version 4 image key and key commitment for one envelope.
+
+    Both come from the 32-byte data key through HKDF-SHA256. The commitment
+    also binds the nonce and the AAD (the sealed context), so a key, nonce, or
+    context that differs from the one sealed cannot reproduce it.
+    """
+    if not isinstance(data_key, bytes) or len(data_key) != AES_KEY_BYTES:
+        raise CryptoError("A version 4 data key must be 32 bytes.")
+    image_key = _hkdf_sha256(data_key, V4_IMAGE_KEY_INFO)
+    commitment = _hkdf_sha256(data_key, V4_COMMITMENT_INFO + nonce + hashlib.sha256(aad).digest())
+    return image_key, commitment
+
+
+def is_key_committing(metadata: Any) -> bool:
+    """True when an envelope commits to its key (version 4)."""
+    return validate_envelope(metadata) == ENVELOPE_V4
 
 
 def encrypt_image_bytes(
@@ -321,13 +358,18 @@ def encrypt_image_bytes(
     passphrase: str | None = None,
     public_key_pem: bytes | None = None,
     context: Mapping[str, Any] | None = None,
+    version: int = CURRENT_ENVELOPE_VERSION,
 ) -> EncryptionResult:
-    """Encrypt into a version 3 envelope whose AAD is the sealed ``context``.
+    """Encrypt into a sealed-context envelope whose AAD is the ``context``.
 
     ``context`` may carry ``asset``, ``owner``, ``filename``, ``mime``,
     ``format``, ``width``, ``height`` and ``source``. ``algorithm`` and ``wrap``
     are always filled in here, and ``asset`` defaults to a fresh random id.
+    ``version`` is 4 (key-committing) unless a caller needs a version 3
+    envelope, which only tests of the legacy path do.
     """
+    if isinstance(version, bool) or version not in SEALED_CONTEXT_VERSIONS:
+        raise CryptoError(f"Cannot write encrypted image envelope version {version}.")
     if algorithm not in SUPPORTED_ALGORITHMS:
         raise CryptoError(f"Unsupported algorithm: {algorithm}")
     if not image_bytes:
@@ -346,15 +388,22 @@ def encrypt_image_bytes(
         key_wrap = _wrap_key_with_passphrase(data_key, passphrase)
     else:
         key_wrap = _wrap_key_with_rsa(data_key, public_key_pem)
-    ciphertext = AESGCM(data_key).encrypt(image_nonce, image_bytes, context_aad(sealed))
+    aad = context_aad(sealed, version=version)
+    image_key = data_key
+    commitment: bytes | None = None
+    if version == ENVELOPE_V4:
+        image_key, commitment = derive_v4_keys(data_key, image_nonce, aad)
+    ciphertext = AESGCM(image_key).encrypt(image_nonce, image_bytes, aad)
 
     metadata: dict[str, Any] = {
-        "version": CURRENT_ENVELOPE_VERSION,
+        "version": version,
         "algorithm": algorithm,
         "image_nonce": _b64encode(image_nonce),
         "key_wrap": key_wrap,
         "context": sealed,
     }
+    if commitment is not None:
+        metadata["key_commitment"] = _b64encode(commitment)
     return EncryptionResult(ciphertext=ciphertext, metadata=metadata)
 
 
@@ -370,8 +419,10 @@ def decrypt_image_bytes(
     """Decrypt an envelope of any supported version.
 
     The AAD is rebuilt from the envelope itself. ``aad`` is only for version 1
-    callers that know the context out of band; for version 3 the sealed context
-    is authoritative and a conflicting ``aad`` is refused.
+    callers that know the context out of band; for versions 3 and 4 the sealed
+    context is authoritative and a conflicting ``aad`` is refused. A version 4
+    envelope is opened only by the data key its commitment names: any other key
+    is refused before AES-GCM runs.
     """
     version = validate_envelope(metadata)
     derived = aad_from_metadata(metadata)
@@ -396,10 +447,14 @@ def decrypt_image_bytes(
         private_key_passphrase=private_key_passphrase,
     )
 
+    nonce = _b64decode(metadata["image_nonce"])
+    image_key = data_key
+    if version == ENVELOPE_V4:
+        image_key, commitment = derive_v4_keys(data_key, nonce, effective_aad)
+        if not hmac.compare_digest(commitment, _b64decode(metadata["key_commitment"])):
+            raise CryptoError("This key does not match the image's key commitment.")
     try:
-        return AESGCM(data_key).decrypt(
-            _b64decode(metadata["image_nonce"]), ciphertext, effective_aad
-        )
+        return AESGCM(image_key).decrypt(nonce, ciphertext, effective_aad)
     except InvalidTag as exc:
         raise CryptoError(
             "Decryption failed. The key, passphrase, or ciphertext is invalid."
@@ -427,9 +482,15 @@ def validate_envelope(metadata: Any) -> int:
     key_wrap = metadata.get("key_wrap")
     if not isinstance(key_wrap, dict) or key_wrap.get("type") not in WRAP_TYPES:
         raise CryptoError("Encrypted image key wrapping metadata is invalid.")
-    if version == ENVELOPE_V3:
-        if not set(metadata) <= V3_ENVELOPE_KEYS:
+    if version in SEALED_CONTEXT_VERSIONS:
+        allowed = V4_ENVELOPE_KEYS if version == ENVELOPE_V4 else V3_ENVELOPE_KEYS
+        if not set(metadata) <= allowed:
             raise CryptoError("Encrypted image metadata has unexpected fields.")
+        if version == ENVELOPE_V4:
+            if "key_commitment" not in metadata:
+                raise CryptoError("A version 4 envelope must carry a key commitment.")
+            if len(_b64decode(metadata["key_commitment"])) != KEY_COMMITMENT_BYTES:
+                raise CryptoError("Encrypted image key commitment has an invalid length.")
         if set(key_wrap) != WRAP_KEYS[key_wrap["type"]]:
             raise CryptoError("Encrypted image key wrapping metadata has unexpected fields.")
         recorded = metadata.get("ciphertext_sha256")
@@ -445,13 +506,22 @@ def validate_envelope(metadata: Any) -> int:
     return int(version)
 
 
-def context_aad(context: Mapping[str, Any]) -> bytes:
-    """Canonical AAD bytes for a version 3 context.
+def context_aad(context: Mapping[str, Any], *, version: int = ENVELOPE_V3) -> bytes:
+    """Canonical AAD bytes for a version 3 or 4 context.
 
     Sorted keys, no whitespace, UTF-8 (not ASCII-escaped), so a browser's
     ``JSON.stringify`` over the same sorted object produces identical bytes.
+    Each version has its own prefix, so a context sealed under one version is
+    never valid AAD for the other.
     """
-    return CONTEXT_AAD_PREFIX + canonical_json(dict(context))
+    prefix = _CONTEXT_AAD_PREFIXES.get(version)
+    if prefix is None:
+        raise CryptoError(f"Envelope version {version} has no sealed context.")
+    return prefix + canonical_json(dict(context))
+
+
+def _hkdf_sha256(key: bytes, info: bytes) -> bytes:
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=V4_HKDF_SALT, info=info).derive(key)
 
 
 def _validate_context(context: Any, *, algorithm: str) -> None:
@@ -594,13 +664,14 @@ def web_aad(user_id: int, original_filename: str, mime_type: str) -> bytes:
 def aad_from_metadata(metadata: dict[str, Any]) -> bytes:
     """Rebuild the AAD an envelope was sealed with from the envelope itself.
 
-    Version 3 seals the canonical ``context``. Version 1 web uploads recorded
-    ``user_id``/``original_filename``/``mime_type`` under ``aad``; version 1 CLI
-    encryptions recorded ``source="cli"`` and ``filename``. Any other version 1
-    envelope was sealed without associated data.
+    Versions 3 and 4 seal the canonical ``context`` under their own prefix.
+    Version 1 web uploads recorded ``user_id``/``original_filename``/``mime_type``
+    under ``aad``; version 1 CLI encryptions recorded ``source="cli"`` and
+    ``filename``. Any other version 1 envelope was sealed without associated data.
     """
-    if validate_envelope(metadata) == ENVELOPE_V3:
-        return context_aad(metadata["context"])
+    version = validate_envelope(metadata)
+    if version in SEALED_CONTEXT_VERSIONS:
+        return context_aad(metadata["context"], version=version)
     context = metadata.get("aad")
     if not isinstance(context, dict):
         return b""

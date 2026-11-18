@@ -214,6 +214,7 @@
                     {% if asset.end_to_end %}disabled{% endif %}
                   >Link</button>
                   <a class="button button-ghost" href="{{ url_for('download_ciphertext', asset_id=asset.id) }}">.ies</a>
+                  <a class="button button-ghost" href="{{ url_for('cloak_form', asset_id=asset.id) }}">Cloak</a>
                   <form method="post" action="{{ url_for('delete_image', asset_id=asset.id) }}" data-confirm="Delete this ciphertext permanently?">
                     {{ csrf_field }}
                     <button class="button button-danger" type="submit">Delete</button>

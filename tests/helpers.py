@@ -112,8 +112,13 @@ def bearer_headers(client, username: str, password: str = PASSWORD) -> dict[str,
 BROWSER_PASS = "a browser-side passphrase"
 
 
-def browser_envelope(owner: int, *, algorithm=AES_GCM_PASSPHRASE, public_key=None, **context):
-    """An envelope shaped exactly like ies-crypto.encryptImage's output."""
+def browser_envelope(
+    owner: int, *, algorithm=AES_GCM_PASSPHRASE, public_key=None, version=None, **context
+):
+    """An envelope shaped exactly like ies-crypto.encryptImage's output.
+
+    ``version=3`` builds what a page loaded before version 4 shipped would send.
+    """
     sealed_context = {
         "owner": owner,
         "filename": "holiday.png",
@@ -130,6 +135,7 @@ def browser_envelope(owner: int, *, algorithm=AES_GCM_PASSPHRASE, public_key=Non
         passphrase=BROWSER_PASS if algorithm == AES_GCM_PASSPHRASE else None,
         public_key_pem=public_key,
         context=sealed_context,
+        **({} if version is None else {"version": version}),
     )
     metadata = {**result.metadata, "ciphertext_sha256": sha256(result.ciphertext).hexdigest()}
     return metadata, result.ciphertext

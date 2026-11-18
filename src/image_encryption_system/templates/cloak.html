@@ -1,0 +1,91 @@
+{% extends "layout.html" %}
+
+{% block title %}Cloak {{ asset.original_filename }} - Image Encryption System{% endblock %}
+
+{% block styles %}
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/lab.css') }}">
+{% endblock %}
+
+{% block content %}
+  <section class="lab-hero" aria-labelledby="cloak-title">
+    <p class="lab-eyebrow">Cloaked export</p>
+    <h1 id="cloak-title">Hide <span class="lab-name">{{ asset.original_filename }}</span> in an ordinary picture</h1>
+    <p class="lab-lede">
+      The cloak writes this image's encrypted vault file ({{ "{:,}".format(payload_bytes) }} bytes)
+      into the finest detail of a landscape or a photo of your own. The download looks
+      like that picture. The image inside is still protected by AES-256-GCM.
+    </p>
+  </section>
+
+  <div class="lab-grid">
+    <form class="lab-panel form-stack" method="post" enctype="multipart/form-data"
+          action="{{ url_for('cloak_download', asset_id=asset.id) }}">
+      {{ csrf_field }}
+      <fieldset class="lab-fieldset">
+        <legend>Cover</legend>
+        <label class="lab-choice">
+          <input type="radio" name="cover" value="generated" checked>
+          A generated landscape
+        </label>
+        <label>
+          Style
+          <select name="palette">
+            {% for palette in palettes %}
+              <option value="{{ palette }}">{{ palette|capitalize }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Seed (optional)
+          <input name="seed" type="text" maxlength="{{ max_seed }}" autocomplete="off"
+                 placeholder="Leave blank for a new landscape each time">
+        </label>
+        <p class="field-note">The same seed and style draw the same landscape.</p>
+        <label class="lab-choice">
+          <input type="radio" name="cover" value="upload">
+          My own picture
+        </label>
+        <label>
+          Picture
+          <input name="cover_file" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp,image/tiff">
+        </label>
+        <p class="field-note">
+          A picture that is too small is enlarged to fit. Only its pixels are used,
+          so its own metadata is not carried over.
+        </p>
+      </fieldset>
+
+      <label>
+        Bits per coefficient
+        <select name="bits">
+          <option value="auto" selected>Automatic (as few as fit)</option>
+          <option value="1">1 bit: least visible</option>
+          <option value="2">2 bits: balanced</option>
+          <option value="3">3 bits: smallest picture</option>
+        </select>
+      </label>
+
+      <button class="button button-primary" type="submit">Download cloaked PNG</button>
+      <a class="button button-ghost" href="{{ url_for('dashboard') }}">Back to the vault</a>
+    </form>
+
+    <aside class="lab-panel lab-facts" aria-label="What the cloak does">
+      <h2>What it does</h2>
+      <ul>
+        <li>Hides from a casual viewer that the picture carries a vault file.</li>
+        <li>Gives back exactly the same <code>.ies</code> file: <code>ies uncloak</code>, or <code>ies decrypt</code> on the PNG itself.</li>
+        <li>Changes each pixel by a few levels at most (about 45 dB PSNR at 2 bits).</li>
+      </ul>
+      <h2>What it does not do</h2>
+      <ul>
+        <li>It adds no secrecy: the encryption inside is what protects the image.</li>
+        <li>Steganalysis tools can still tell the picture has been cloaked.</li>
+        <li>
+          Any recompression, resizing or editing destroys the hidden file. Share the PNG
+          as a file, not through apps that recompress photos.
+        </li>
+      </ul>
+      <p class="field-note">Covers are limited to {{ "{:,}".format(max_pixels) }} pixels.</p>
+    </aside>
+  </div>
+{% endblock %}

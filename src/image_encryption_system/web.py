@@ -40,11 +40,12 @@ from . import crypto
 from .config import IMAGE_MIME_TYPES, PLACEHOLDER_SECRETS, Config
 from .crypto import (
     AES_GCM_PASSPHRASE,
-    ENVELOPE_V3,
+    ENVELOPE_V4,
     GCM_TAG_BYTES,
     MAX_METADATA_BYTES,
     MIN_SCRYPT_N,
     RSA_HYBRID,
+    SEALED_CONTEXT_VERSIONS,
     WRAP_RSA,
     WRAP_SCRYPT,
     CryptoError,
@@ -186,7 +187,13 @@ def create_app(test_config: dict | None = None) -> Flask:
             limit=int(app.config.get(f"{name.upper()}_RATE_LIMIT", limit)),
             window_seconds=int(app.config.get(f"{name.upper()}_RATE_WINDOW_SECONDS", window)),
         )
-        for name, limit, window in (("register", 5, 3600), ("decrypt", 30, 300), ("link", 20, 300))
+        for name, limit, window in (
+            ("register", 5, 3600),
+            ("decrypt", 30, 300),
+            ("link", 20, 300),
+            ("lab", 6, 600),
+            ("cloak", 10, 600),
+        )
     }
 
     @app.context_processor
@@ -1031,6 +1038,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         try:
             asset = _owned_asset(store, asset_id, user)
             _require_end_to_end(asset)
+            _require_key_commitment(asset)
             recipient = _resolve_recipient(store, user, str(payload.get("username", "")))
             key_wrap = payload.get("key_wrap")
             if validate_key_wrap(key_wrap) != WRAP_RSA:
@@ -1069,6 +1077,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         try:
             asset = _owned_asset(store, asset_id, user)
             _require_end_to_end(asset)
+            _require_key_commitment(asset)
             key_wrap = payload.get("key_wrap")
             # Link keys are 256-bit random values, so the KDF floor is plenty.
             if validate_key_wrap(key_wrap, min_scrypt_n=MIN_SCRYPT_N) != WRAP_SCRYPT:
@@ -1263,6 +1272,10 @@ def create_app(test_config: dict | None = None) -> Flask:
             }
         )
 
+    # The Cipher Lab and cloaked exports live in their own module.
+    from .lab_routes import register as register_lab_routes
+
+    register_lab_routes(app, store)
     return app
 
 
@@ -1311,7 +1324,7 @@ def _check_sealed_upload(
     """Validate an envelope sealed in a browser before storing it.
 
     The server can never decrypt it, so everything that can be checked is: a
-    closed version 3 envelope sealed to this account with a complete browser
+    closed version 4 envelope sealed to this account with a complete browser
     context; an allow-listed type the browser can display, within the pixel
     ceiling; a well-formed wrap at today's KDF cost that matches the sealed
     algorithm; a digest that matches the bytes received; and a fresh asset id.
@@ -1324,8 +1337,14 @@ def _check_sealed_upload(
     if not raw_envelope or len(raw_envelope.encode("utf-8")) > MAX_METADATA_BYTES:
         raise ValueError("The envelope is missing or too large.")
     metadata = _loads(raw_envelope, "envelope")
-    if validate_envelope(metadata) != ENVELOPE_V3:
-        raise CryptoError("End-to-end uploads must use envelope version 3.")
+    # Version 4 commits to the key, so one stored ciphertext cannot open as
+    # two different images under two wraps. A page loaded before version 4
+    # shipped still sends version 3: refuse it and say how to fix that.
+    if validate_envelope(metadata) != ENVELOPE_V4:
+        raise CryptoError(
+            "End-to-end uploads must use envelope version 4. "
+            "Reload the page to get the current encryption code."
+        )
     context = metadata["context"]
     if set(context) != END_TO_END_CONTEXT or context["source"] != "browser":
         raise CryptoError("End-to-end uploads must seal a complete browser context.")
@@ -1594,6 +1613,22 @@ def _resolve_recipient(store: VaultStore, owner: User, username: str) -> User:
     if recipient is None:
         raise LookupError("No account exists with that username.")
     return recipient
+
+
+def _require_key_commitment(asset: EncryptedAsset) -> None:
+    """Refuse to hand out new wraps of an end-to-end key that is not committed.
+
+    The owner's browser chooses the key in every share and link wrap. Under a
+    version 3 envelope (an image stored before version 4, or one restored from
+    an old backup) a crafted ciphertext can open under two keys as two
+    different pictures, so new recipients are only added once a re-key has
+    upgraded the image to version 4.
+    """
+    if validate_envelope(asset.metadata) != ENVELOPE_V4:
+        raise CryptoError(
+            "This image predates key commitment. Re-key it to upgrade it before "
+            "sharing it or creating a link."
+        )
 
 
 def _require_server_side(asset: EncryptedAsset) -> None:
@@ -2009,13 +2044,13 @@ def _legacy_aad(asset: EncryptedAsset) -> bytes | None:
 def _check_sealed_context(asset: EncryptedAsset, *, primary_wrap: bool) -> None:
     """Refuse a row whose fields disagree with the context sealed into its AAD.
 
-    Version 3 binds the asset id, owner, algorithm, wrap type, MIME type,
+    Versions 3 and 4 bind the asset id, owner, algorithm, wrap type, MIME type,
     format, and dimensions. Swapping ciphertext and metadata between rows or
     users, or editing a row's recorded type, makes this check fail before any
     key is unwrapped. Version 1 envelopes predate the sealed context.
     """
     metadata = asset.metadata
-    if validate_envelope(metadata) != ENVELOPE_V3:
+    if validate_envelope(metadata) not in SEALED_CONTEXT_VERSIONS:
         return
     context = metadata["context"]
     expected = {

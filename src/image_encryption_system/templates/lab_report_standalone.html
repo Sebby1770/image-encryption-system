@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Cipher Lab report</title>
+    <style>
+{{ css }}
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="lab-hero">
+        <p class="lab-eyebrow">Image Encryption System · Cipher Lab</p>
+        <h1>Eleven image ciphers, scored and attacked</h1>
+        <p class="lab-lede">
+          Image: {{ report.source }}, {{ report.size }}&times;{{ report.size }} pixels. Generated {{ report.created }}.
+        </p>
+      </section>
+      {% include "_lab_scorecard.html" %}
+    </main>
+  </body>
+</html>

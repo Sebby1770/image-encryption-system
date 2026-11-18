@@ -1,0 +1,84 @@
+{% extends "layout.html" %}
+
+{% block title %}Cipher Lab - Image Encryption System{% endblock %}
+
+{% block styles %}
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/lab.css') }}">
+{% endblock %}
+
+{% block content %}
+  <section class="lab-hero" aria-labelledby="lab-title">
+    <p class="lab-eyebrow">Cipher Lab</p>
+    <h1 id="lab-title">How strong is an image cipher, really?</h1>
+    <p class="lab-lede">
+      Encrypt one image eleven ways, from pixel shuffling, chaotic maps and wavelet or Fourier
+      scrambling to a keyed neural network and this vault's own AES-256-GCM. Each cipher is
+      scored with the statistics image-encryption papers report, then attacked for real.
+    </p>
+  </section>
+
+  {% if error %}
+    <div class="flash flash-error" role="alert">{{ error }}</div>
+  {% endif %}
+
+  <div class="lab-grid">
+    <form class="lab-panel form-stack" method="post" enctype="multipart/form-data" action="{{ url_for('lab_run') }}">
+      {{ csrf_field }}
+      <fieldset class="lab-fieldset">
+        <legend>Image</legend>
+        <label class="lab-choice">
+          <input type="radio" name="source" value="sample" checked>
+          A built-in image
+        </label>
+        <label>
+          Image
+          <select name="sample">
+            {% for name in samples %}
+              <option value="{{ name }}">{{ name|replace('-', ' ')|capitalize }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label class="lab-choice">
+          <input type="radio" name="source" value="upload">
+          My own picture
+        </label>
+        <label>
+          Picture
+          <input name="image" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp,image/tiff">
+        </label>
+        <p class="field-note">
+          It is cropped to a square and resized to {{ size }}&times;{{ size }} pixels, processed in
+          memory on the server, and never stored. Use a picture you would not mind the server seeing.
+        </p>
+      </fieldset>
+
+      <fieldset class="lab-fieldset">
+        <legend>Ciphers</legend>
+        <div class="lab-checks">
+          {% for name, title, family in ciphers %}
+            <label class="lab-choice">
+              <input type="checkbox" name="cipher" value="{{ name }}" checked>
+              <span>{{ title }} <span class="lab-family">{{ family }}</span></span>
+            </label>
+          {% endfor %}
+        </div>
+      </fieldset>
+
+      <button class="button button-primary" type="submit">Run the lab</button>
+    </form>
+
+    <aside class="lab-panel lab-facts" aria-label="About the lab">
+      <h2>What you will see</h2>
+      <ul>
+        <li>A verdict for every cipher, decided by attacks that recover your image, not by statistics.</li>
+        <li>The statistics papers report: entropy, histograms, neighbour correlation, NPCR/UACI and key sensitivity.</li>
+        <li>The evidence: ciphertexts, the outline that survives ECB, a one-bit tamper, and one AES-GCM ciphertext that opens under two keys.</li>
+      </ul>
+      <h2>This is a lab</h2>
+      <ul>
+        <li>None of these ciphers protect your vault. Every vault image is sealed with AES-256-GCM, and new ones are key-committing (envelope version 4).</li>
+        <li>A run takes a few seconds and is limited to a few per account every ten minutes.</li>
+      </ul>
+    </aside>
+  </div>
+{% endblock %}

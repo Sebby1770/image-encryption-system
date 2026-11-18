@@ -23,8 +23,8 @@ from werkzeug.utils import secure_filename
 
 from .config import IMAGE_MIME_TYPES
 from .crypto import (
-    ENVELOPE_V3,
     GCM_TAG_BYTES,
+    SEALED_CONTEXT_VERSIONS,
     SUPPORTED_ALGORITHMS,
     CryptoError,
     generate_rsa_key_pair,
@@ -1312,8 +1312,8 @@ class VaultStore:
 
         Every entry is validated before anything is written, so a bad backup
         restores nothing. Entries must be allow-listed images with a well-formed
-        envelope; each blob may be referenced once; version 3 envelopes must be
-        sealed to this account. Re-restoring an asset already in this vault is
+        envelope; each blob may be referenced once; version 3 and 4 envelopes must
+        be sealed to this account. Re-restoring an asset already in this vault is
         skipped rather than duplicated.
         """
         buffer = BytesIO(archive_bytes)
@@ -1393,7 +1393,7 @@ class VaultStore:
             raise ValueError("Backup asset dimensions are invalid.")
 
         asset_uuid: str | None = None
-        if version == ENVELOPE_V3:
+        if version in SEALED_CONTEXT_VERSIONS:
             context = metadata["context"]
             if context.get("owner") != user_id:
                 raise ValueError(

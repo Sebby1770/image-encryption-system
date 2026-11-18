@@ -2,6 +2,45 @@
 
 ## [Unreleased]
 
+### Key-committing envelopes, cloaked exports, and the Cipher Lab
+- **Envelope version 4: AES-GCM that commits to its key.** AES-GCM alone lets
+  one ciphertext authenticate under two keys (the "invisible salamander"
+  attack), so an owner could give two share recipients two keys that open one
+  stored image as two different pictures. Version 4 derives the GCM key and a
+  32-byte commitment over the nonce and the sealed context from the data key
+  with HKDF-SHA256, and refuses every other key before AES-GCM runs. The
+  server, the CLI and the browser write version 4; versions 1 and 3 still open
+  and still restore. New browser uploads and re-keys must be version 4 (a page
+  loaded before this release is told to reload), so re-keying upgrades an older
+  image. `ies inspect` reports whether an envelope is key-committing.
+  `tests/test_key_commitment.py` builds the two-key forgery for real: a version
+  3 envelope opens for both recipients as two images, version 4 for one.
+- **Cloaked exports.** A Cloak link on every owned image downloads it hidden in
+  an ordinary PNG: a generated landscape or the owner's own picture, with the
+  `.ies` bytes in the low 1-3 bits of its integer-wavelet detail coefficients
+  (45.6 dB PSNR at 2 bits, full capacity). It needs only ciphertext, so
+  end-to-end images work without a key. `ies cloak` / `ies uncloak`, and every
+  CLI command that reads an `.ies` also reads a cloaked PNG. Recompression or
+  editing is reported as a clean error, never a wrong file. Throttled per
+  account.
+- **Cipher Lab** (`/lab`, `ies lab`). Eleven lossless image ciphers (Arnold cat
+  map, logistic-map XOR, hyperchaotic Chen, integer-wavelet scrambling,
+  Walsh-Hadamard mask, Fourier double random phase encoding, a keyed integer
+  neural network, AES-ECB, AES-CTR with a reused IV, and the vault's AES-GCM as
+  versions 3 and 4) scored with entropy, local entropy, chi-square, correlation,
+  NPCR/UACI and key sensitivity, and attacked with a chosen-plaintext structure
+  attack, an impulse attack on linear ciphers, a codebook (pattern) test,
+  determinism, a one-bit tamper, and the two-key forgery. Verdicts come from the
+  attacks. Uploads are processed in memory and never stored; runs are throttled.
+- **Statistics checked, not copied.** NPCR/UACI critical values reproduce Wu,
+  Noonan & Agaian's published table; chi-square 293.2478 is checked against the
+  incomplete gamma function. The local-entropy interval commonly quoted for 30
+  blocks equals mean +/- z*sd/30 and passes truly random data only ~28% of the
+  time; the lab uses mean +/- z*sd/sqrt(blocks) with constants from two million
+  simulated blocks (95% pass rate).
+- numpy is now a dependency. The style test checks every stylesheet and no
+  template may carry an inline `style` attribute.
+
 ### Re-keying, batch uploads, and dark mode
 - **Revocation that holds against a recipient who kept the key.** Revoking a
   share only deletes its wrap; the data key still opened the stored ciphertext.

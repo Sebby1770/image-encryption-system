@@ -1,0 +1,142 @@
+{#- The Cipher Lab scorecard, shared by the web page and the standalone report.
+    Expects `report`, a LabReport.to_dict(). -#}
+{% macro histogram(values, label) -%}
+  <svg class="lab-histogram" viewBox="0 0 64 24" preserveAspectRatio="none" role="img" aria-label="{{ label }}">
+    {%- for value in values %}
+    <rect class="lab-bar" x="{{ loop.index0 }}" y="{{ '%.3f' % (24 - value * 24) }}" width="0.82" height="{{ '%.3f' % (value * 24) }}"></rect>
+    {%- endfor %}
+  </svg>
+{%- endmacro %}
+
+<section class="lab-lesson" aria-labelledby="lab-lesson-title">
+  <h2 id="lab-lesson-title">How to read this report</h2>
+  <p>
+    Every cipher is scored with the statistics image-encryption papers report, then attacked.
+    The verdict comes from the attacks. Statistics are necessary, not sufficient: the
+    hyperchaotic cipher below passes them and is still deterministic and unauthenticated, and
+    the design family it follows was broken with chosen plaintexts (Rhouma &amp; Belghith, 2008;
+    see also Preishuber et al., 2018). Each statistical row is also a 5% test, so even a strong
+    cipher misses one now and then by chance.
+  </p>
+</section>
+
+<div class="lab-table-wrap">
+  <table class="lab-scorecard">
+    <caption>{{ report.results|length }} cipher{{ 's' if report.results|length != 1 }} on a {{ report.size }}&times;{{ report.size }} image</caption>
+    <thead>
+      <tr>
+        <th scope="col">Cipher</th>
+        <th scope="col">Verdict</th>
+        <th scope="col">Why</th>
+        <th scope="col">Statistics passed</th>
+        <th scope="col">Key</th>
+        <th scope="col">Size</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in report.results %}
+        <tr>
+          <th scope="row">
+            <a href="#cipher-{{ r.name }}">{{ r.title }}</a>
+            <span class="lab-family">{{ r.family }}</span>
+          </th>
+          <td><span class="lab-verdict lab-verdict-{{ r.verdict_slug }}">{{ r.verdict }}</span></td>
+          <td class="lab-why">{{ r.headline }}</td>
+          <td class="lab-number">{{ r.statistics.passed }} / {{ r.statistics.judged }}</td>
+          <td class="lab-number">{{ r.key_bits }}-bit</td>
+          <td class="lab-number">{{ (r.metrics|selectattr('key', 'equalto', 'expansion')|first).display }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="lab-original">
+  <figure>
+    <img src="{{ report.plaintext }}" width="{{ report.size }}" height="{{ report.size }}" alt="The image every cipher encrypted">
+    <figcaption>The image every cipher encrypted</figcaption>
+  </figure>
+  <figure>
+    {{ histogram(report.plaintext_histogram, "Histogram of the original image") }}
+    <figcaption>Its histogram (64 bins)</figcaption>
+  </figure>
+</div>
+
+{% for r in report.results %}
+  <details class="lab-cipher" id="cipher-{{ r.name }}">
+    <summary>
+      <span class="lab-cipher-title">{{ r.title }}</span>
+      <span class="lab-verdict lab-verdict-{{ r.verdict_slug }}">{{ r.verdict }}</span>
+    </summary>
+    <p>{{ r.summary }}</p>
+    <p class="field-note">Key: {{ r.key_note }}</p>
+
+    <div class="lab-figures">
+      <figure>
+        <img src="{{ r.images.cipher }}" width="{{ report.size }}" height="{{ report.size }}" alt="{{ r.title }} ciphertext">
+        <figcaption>Ciphertext{% if r.name in ['wht', 'drpe'] %} (rendered from floating point){% endif %}</figcaption>
+      </figure>
+      <figure>
+        {{ histogram(r.histogram, "Histogram of the " ~ r.title ~ " ciphertext") }}
+        <figcaption>Ciphertext histogram</figcaption>
+      </figure>
+      {% if r.images.pattern %}
+        <figure>
+          <img src="{{ r.images.pattern }}" width="{{ report.size }}" height="{{ report.size }}" alt="The test card encrypted with {{ r.title }}">
+          <figcaption>The test card, encrypted: the outline survives</figcaption>
+        </figure>
+      {% endif %}
+      {% if r.images.tampered %}
+        <figure>
+          <img src="{{ r.images.tampered }}" width="{{ report.size }}" height="{{ report.size }}" alt="Decrypted after one flipped bit">
+          <figcaption>Decrypted after one flipped bit, without complaint</figcaption>
+        </figure>
+      {% endif %}
+      {% if r.images['salamander-1'] %}
+        <figure>
+          <img src="{{ r.images['salamander-1'] }}" width="{{ report.size }}" height="{{ report.size }}" alt="The forged ciphertext under the first key">
+          <figcaption>Forged ciphertext, first key</figcaption>
+        </figure>
+      {% endif %}
+      {% if r.images['salamander-2'] %}
+        <figure>
+          <img src="{{ r.images['salamander-2'] }}" width="{{ report.size }}" height="{{ report.size }}" alt="The same ciphertext under the second key">
+          <figcaption>The same ciphertext, second key</figcaption>
+        </figure>
+      {% endif %}
+    </div>
+
+    <div class="lab-table-wrap">
+      <table class="lab-detail">
+        <caption>Attacks</caption>
+        <thead><tr><th scope="col">Attack</th><th scope="col">Outcome</th><th scope="col">Finding</th></tr></thead>
+        <tbody>
+          {% for a in r.attacks %}
+            <tr>
+              <th scope="row">{{ a.label }}</th>
+              <td><span class="lab-outcome lab-outcome-{{ 'bad' if a.success else 'good' if a.applicable else 'na' }}">{{ a.outcome }}</span></td>
+              <td>{{ a.finding }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="lab-table-wrap">
+      <table class="lab-detail">
+        <caption>Statistics</caption>
+        <thead><tr><th scope="col">Metric</th><th scope="col">Value</th><th scope="col">Result</th><th scope="col">Rule</th></tr></thead>
+        <tbody>
+          {% for m in r.metrics %}
+            <tr>
+              <th scope="row">{{ m.label }}</th>
+              <td class="lab-number">{{ m.display }}</td>
+              <td><span class="lab-mark lab-mark-{{ m.mark }}">{{ {'pass': 'Pass', 'fail': 'Fail', 'info': '–'}[m.mark] }}</span></td>
+              <td>{{ m.detail }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </details>
+{% endfor %}

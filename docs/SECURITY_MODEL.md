@@ -12,6 +12,11 @@ test together.
   in the browser are never seen by the server, in plaintext or as a key.
 - **Image integrity and binding.** A ciphertext cannot be edited, or moved to a
   different vault record or account, without decryption failing.
+- **One image per ciphertext.** A version 4 envelope opens under exactly one
+  data key, so nobody who controls the wraps (an owner choosing what each
+  recipient gets, say) can make one stored ciphertext show different pictures
+  to different people. Recipients are only ever added to version 4 images (see
+  "Key commitment").
 - **Access control.** Only the owner, recipients the owner shares with, and
   holders of an unexpired capability link can decrypt.
 - **Capture metadata.** GPS and camera metadata are removed before encryption.
@@ -58,7 +63,7 @@ claiming to encrypt locally; the server also refuses a plain upload that says
 it came from end-to-end mode.
 
 **What the browser does.** It strips capture metadata (below), generates the
-data key and nonce with `crypto.getRandomValues`, seals a version 3 envelope
+data key and nonce with `crypto.getRandomValues`, seals a version 4 envelope
 with WebCrypto AES-256-GCM, and wraps the data key either with Scrypt (a pure
 JavaScript implementation, run in a Web Worker, checked against RFC 7914 and
 `hashlib.scrypt`) or with RSA-OAEP-SHA256 to the account's public key. The
@@ -69,7 +74,9 @@ modules under Node and checks both directions.
 **What the server receives and checks.** Only ciphertext and the envelope. It
 cannot decrypt them, so it checks everything else before storing anything:
 
-- a closed version 3 envelope whose context is complete, marked
+- a closed version 4 envelope (key-committing; a version 3 one from a page
+  loaded before version 4 shipped is refused with a request to reload) whose
+  context is complete, marked
   `source: "browser"`, and sealed to the uploading account;
 - an allow-listed format the browser can display again (PNG, JPEG, WebP, GIF,
   BMP; TIFF is server-mode only) with a matching MIME type, within the pixel
@@ -220,15 +227,54 @@ Sharing unwraps the data key in memory and wraps it again to the recipient's
 RSA public key. A capability link wraps it with Scrypt, using the 256-bit link
 token as the passphrase. Neither touches the ciphertext.
 
+### Key commitment (version 4)
+
+AES-GCM is not key-committing: knowing two keys, anyone can solve one
+GF(2^128) equation and build a single ciphertext whose tag verifies under both,
+each decrypting to different bytes (Dodis et al. 2018; Albertini et al. 2022).
+In this vault that would let an owner wrap one key for Alice and another for
+Bob, so that the same stored ciphertext, with the same digest, shows each a
+different picture. Every wrap of an image (owner, shares, links) carries a key
+the owner chose.
+
+Version 4 closes that. From the 32-byte data key `DK`, nonce `N` and AAD `A`:
+
+```text
+image_key  = HKDF-SHA256(DK, salt="IES-V4", info="IES-V4\0image-key")
+commitment = HKDF-SHA256(DK, salt="IES-V4", info="IES-V4\0key-commitment\0" || N || SHA-256(A))
+```
+
+The image is sealed under `image_key` and the 32-byte `commitment` is stored as
+`key_commitment`. Decryption recomputes it from the unwrapped key and compares
+in constant time before AES-GCM runs; any other key is refused there. The AAD
+prefix is `IES-CONTEXT-V4\0`, so a context sealed under one version is never
+valid AAD for the other. `tests/test_key_commitment.py` builds the forgery: a
+version 3 envelope opens for both keys as two different images; under version
+4 the same forgery against the derived GCM keys still satisfies AES-GCM, but
+the second key fails the commitment. The browser twin is checked against
+Python in both directions (`tests/test_browser_crypto.py`).
+
+Version 1 and 3 images remain readable, and restore still accepts them, so
+old backups keep working. That is also a way in: an owner could restore a
+crafted version 3 envelope today. So the server refuses to add a recipient to
+an end-to-end image that is not version 4: new browser-made shares and links
+are refused with a request to re-key first, and re-keying upgrades the image
+(`tests/test_envelope_v4_web.py::test_a_restored_v3_image_cannot_be_shared_until_rekeyed`).
+Server-mode shares need no such rule, because the server wraps the owner's own
+data key, so every recipient gets the same key. What remains: shares created on
+a version 3 image before this release keep version 3's guarantee until the
+owner re-keys.
+
 ### Envelope versions and AAD
 
 | Version | Written by | AAD |
 | --- | --- | --- |
 | 1 | Everything before the phase 1 review | web: `user=<id>\|filename=<name>\|mime=<mime>`; CLI: `cli\|filename=<name>`; rebuilt from the envelope's own `aad` dict |
 | 2 | Never by this codebase (reserved: the discarded v1.0 lineage used it) | — |
-| 3 | Current web, browser, and CLI | `b"IES-CONTEXT-V3\0"` + canonical JSON of `context` |
+| 3 | Web, browser, and CLI before key commitment; still read and restored | `b"IES-CONTEXT-V3\0"` + canonical JSON of `context` |
+| 4 | Current web, browser, CLI, and re-keys | `b"IES-CONTEXT-V4\0"` + canonical JSON of `context`, plus `key_commitment` |
 
-A version 3 `context` seals:
+A version 3 or 4 `context` seals:
 
 | Field | Web | CLI |
 | --- | --- | --- |
@@ -273,7 +319,8 @@ lengths and total size. Base64 is decoded strictly, and metadata is capped at
 | A wrap that omits `n` uses `2^14` (`LEGACY_SCRYPT_N`) | Such wraps predate explicit parameters; falling back to the *current* default would derive the wrong key |
 | `128 * n * r <= 256 MiB`, `1 <= r <= 32`, `1 <= p <= 16` | Bounds the allocation |
 
-Version 3 envelopes are closed. Unknown top-level or wrap keys are rejected,
+Version 3 and 4 envelopes are closed (version 4 adds exactly `key_commitment`,
+32 bytes of canonical base64). Unknown top-level or wrap keys are rejected,
 so renaming a key cannot make a default value apply. Base64 must be canonical,
 and `ciphertext_sha256` is verified, so every byte of a `.ies` header
 influences decryption. A Hypothesis property test flips every byte position
@@ -400,6 +447,46 @@ Version 3 assets must be sealed to the restoring account, and one whose asset
 id already exists in this vault is skipped, so restoring twice is harmless.
 Restores never overwrite existing files, because vault filenames are the random
 asset ids.
+
+## Cloaked exports
+
+`POST /images/<id>/cloak` (owner only, CSRF, throttled per account) returns the
+image's `.ies` bytes, the same ones the `.ies` download returns, hidden in a PNG
+(`cloak.py`). It touches no key, so it adds nothing to what the owner could
+already download, and it works for end-to-end images.
+
+- **What it is not.** The cloak adds no confidentiality or integrity: the
+  AES-GCM envelope inside provides both. Its slot order and header are public,
+  and the header is whitened with a public ChaCha20 key only so the embedded
+  bits are not JSON-shaped. Steganalysis can tell that a picture is cloaked.
+- **Covers.** A generated landscape, or a picture of the owner's that first
+  passes the upload checks (allow-list, pixel ceiling, decompression-bomb
+  handling); only its pixels are used, so its metadata is never carried over.
+  Covers are limited to `CLOAK_MAX_PIXELS` (12 MP; automatic bits step up
+  to 3 rather than exceed it), each process cloaks one image at a time, and
+  requests are throttled per account, so a cloak's few hundred megabytes of
+  working memory cannot stack up.
+- **Extraction** (`ies uncloak`, and every CLI command that reads an `.ies`)
+  refuses anything that is not a PNG within the pixel ceiling before decoding,
+  bounds the declared length by the capacity and 64 MiB before allocating, and
+  checks the payload's SHA-256, so recompression, resizing or editing gives a
+  clean error and never a wrong file (`tests/test_cloak.py`). What comes out
+  is an ordinary `.ies` file and is validated like one.
+
+## Cipher Lab
+
+`/lab` and `ies lab` run deliberately weak image ciphers for comparison. They
+are not a security boundary and never touch vault data: the lab has no access
+to rows, blobs or keys, and its ciphers use keys generated for the run.
+
+- Uploads pass the same image checks as vault uploads, are cropped and resized
+  in memory, and are never written to disk, stored in the database, or audited
+  (`tests/test_lab_web.py`). They do reach the server, as server-mode uploads
+  do; the page says so.
+- A run encrypts and attacks one image eleven ways (a few seconds of CPU), so
+  it is login-only and throttled per account (`LAB_RATE_LIMIT`, default 6 per
+  10 minutes), and its size is fixed by `LAB_IMAGE_SIZE`.
+- Results are rendered once with `Cache-Control: no-store`; nothing is kept.
 
 ## Audit log
 
