@@ -56,7 +56,9 @@ HEADER_SLOTS = HEADER_BYTES * 8
 BITS = (1, 2, 3)
 MARGINS = {1: 2, 2: 5, 3: 10}
 MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
-DEFAULT_MAX_PIXELS = 24_000_000
+# One cloak's memory grows with the cover: at 12 MP and int16 coefficients an
+# 8 MiB vault file stays well inside a 1 GB container shared by two workers.
+DEFAULT_MAX_PIXELS = 12_000_000
 DEFAULT_MAX_INPUT_PIXELS = 64_000_000
 MIN_GENERATED_WIDTH, MIN_GENERATED_HEIGHT = 960, 640
 COVER_FORMATS = ("PNG", "JPEG", "WEBP", "GIF", "BMP", "TIFF")
@@ -195,27 +197,34 @@ def _plan(
     palette: str,
     max_pixels: int,
 ) -> tuple[RGB, int]:
+    # Automatic bits prefer 2 and step up to 3 when that keeps the cover under
+    # the pixel ceiling (a full 8 MiB vault file needs about 15 MP at 2 bits).
+    candidates = (bits,) if bits is not None else (2, 3)
     if cover is None:
         if palette not in PALETTES:
             raise CloakError(f"Unknown palette {palette!r}; choose one of {', '.join(PALETTES)}.")
-        chosen = bits or 2
-        width, height = _generated_size(length, chosen)
-        if width * height > max_pixels:
-            raise _too_big(length, chosen)
-        return generate_cover(width, height, seed=seed, palette=palette), chosen
+        for chosen in candidates:
+            width, height = _generated_size(length, chosen)
+            if width * height <= max_pixels:
+                return generate_cover(width, height, seed=seed, palette=palette), chosen
+        raise _too_big(length, candidates[-1])
 
     rgb = _validated_cover(cover)
     height, width = rgb.shape[:2]
     if width * height > max_pixels:
         raise CloakError(f"The cover is larger than {max_pixels:,} pixels; use a smaller picture.")
-    if bits is None:
-        chosen = next((k for k in BITS if capacity(width, height, k) >= length), 2)
+    allowed = BITS if bits is None else (bits,)
+    fitting = [k for k in allowed if capacity(width, height, k) >= length]
+    if fitting:
+        chosen = fitting[0]
     else:
-        chosen = bits
-    if capacity(width, height, chosen) < length:
-        width, height = _size_to_fit(max(width, 2), max(height, 2), length, chosen)
-        if width * height > max_pixels:
-            raise _too_big(length, chosen)
+        for chosen in candidates:
+            grown = _size_to_fit(max(width, 2), max(height, 2), length, chosen)
+            if grown[0] * grown[1] <= max_pixels:
+                break
+        else:
+            raise _too_big(length, candidates[-1])
+        width, height = grown
         rgb = _resize(rgb, width, height)
     if rgb.shape[0] < 2 or rgb.shape[1] < 2:
         raise CloakError("The cover is too small.")
@@ -223,11 +232,18 @@ def _plan(
 
 
 def _symbols(data: bytes, bits: int) -> NDArray[np.uint8]:
-    """``data``'s bits, most significant first, grouped ``bits`` to a slot."""
+    """``data``'s bits, most significant first, grouped ``bits`` to a slot.
+
+    Built with shifts in uint8: a weighted sum would promote to 8 bytes per slot.
+    """
     stream = np.unpackbits(np.frombuffer(data, np.uint8))
-    stream = np.concatenate([stream, np.zeros(-stream.size % bits, np.uint8)])
-    weights = (1 << np.arange(bits - 1, -1, -1)).astype(np.uint8)
-    return (stream.reshape(-1, bits) * weights).sum(axis=1).astype(np.uint8)
+    if bits == 1:
+        return stream
+    grouped = np.concatenate([stream, np.zeros(-stream.size % bits, np.uint8)]).reshape(-1, bits)
+    symbols = np.zeros(grouped.shape[0], dtype=np.uint8)
+    for column in range(bits):
+        symbols |= grouped[:, column] << np.uint8(bits - 1 - column)
+    return symbols
 
 
 def _unsymbols(symbols: NDArray[np.integer], bits: int, length: int) -> bytes:
@@ -236,15 +252,26 @@ def _unsymbols(symbols: NDArray[np.integer], bits: int, length: int) -> bytes:
     return np.packbits(stream[: length * 8]).tobytes()
 
 
-def _forward(rgb: RGB) -> tuple[list[NDArray[np.int16]], NDArray[np.int16]]:
-    """Per-channel LL bands, and every detail coefficient in slot order (flat)."""
+def _forward(rgb: RGB, margin: int = 0) -> tuple[list[NDArray[np.int16]], NDArray[np.int16]]:
+    """Per-channel LL bands, and every detail coefficient in slot order (flat).
+
+    Pixels are clamped to ``[margin, 255 - margin]`` one channel at a time, and
+    the detail array is allocated once and filled in place.
+    """
+    height, width = rgb.shape[:2]
+    quarter = (height // 2) * (width // 2)
     lows: list[NDArray[np.int16]] = []
-    details: list[NDArray[np.int16]] = []
+    details = np.empty(9 * quarter, dtype=np.int16)
     for channel in range(3):
-        ll, lh, hl, hh = iwt.forward(rgb[..., channel])
-        lows.append(ll.astype(np.int16))
-        details.extend(band.astype(np.int16).ravel() for band in (lh, hl, hh))
-    return lows, np.concatenate(details)
+        plane = rgb[..., channel]
+        if margin:
+            plane = np.clip(plane, margin, 255 - margin)
+        ll, lh, hl, hh = iwt.forward(plane, dtype=np.int16)
+        lows.append(ll.astype(np.int16, copy=False))
+        for band_index, band in enumerate((lh, hl, hh)):
+            start = (3 * channel + band_index) * quarter
+            details[start : start + quarter] = band.ravel()
+    return lows, details
 
 
 def _embed(details: NDArray[np.int16], symbols: NDArray[np.uint8], bits: int) -> None:
@@ -284,8 +311,6 @@ def cloak(
         raise CloakError("Bits per coefficient must be 1, 2, or 3.")
     rgb, chosen = _plan(len(payload), cover, bits, seed, palette, max_pixels)
     height, width = rgb.shape[:2]
-    margin = MARGINS[chosen]
-    clamped = np.clip(rgb, margin, 255 - margin).astype(np.uint8)
 
     stream = _whitening(HEADER_BYTES + len(payload))
     header = _HEADER.pack(
@@ -297,19 +322,20 @@ def cloak(
             _symbols(_xor(payload, stream[HEADER_BYTES:]), chosen),
         ]
     )
-    lows, details = _forward(clamped)
+    lows, details = _forward(rgb, MARGINS[chosen])
     _embed(details, symbols, chosen)
+    del symbols
 
     quarter = (height // 2) * (width // 2)
     shape = (height // 2, width // 2)
-    stego = np.empty_like(clamped)
+    stego = np.empty_like(rgb)
     for channel in range(3):
         offset = channel * 3 * quarter
         bands = [
             details[offset + i * quarter : offset + (i + 1) * quarter].reshape(shape)
             for i in range(3)
         ]
-        pixels = iwt.inverse(lows[channel], *bands)
+        pixels = iwt.inverse(lows[channel], *bands, dtype=np.int16)
         if int(np.min(pixels)) < 0 or int(np.max(pixels)) > 255:  # the margins rule this out
             raise CloakError("Internal error: a cloaked pixel left the 0-255 range.")
         stego[..., channel] = pixels.astype(np.uint8)

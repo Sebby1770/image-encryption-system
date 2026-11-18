@@ -77,7 +77,7 @@ class Config:
     LAB_IMAGE_SIZE = int(os.getenv("IES_LAB_IMAGE_SIZE", 256))
     CLOAK_RATE_LIMIT = int(os.getenv("IES_CLOAK_RATE_LIMIT", 10))
     CLOAK_RATE_WINDOW_SECONDS = int(os.getenv("IES_CLOAK_RATE_WINDOW", 600))
-    CLOAK_MAX_PIXELS = int(os.getenv("IES_CLOAK_MAX_PIXELS", 24_000_000))
+    CLOAK_MAX_PIXELS = int(os.getenv("IES_CLOAK_MAX_PIXELS", 12_000_000))
     ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"}
     # Decoded formats we are willing to load. The extension allow-list above is
     # only a filename check; this is matched against what Pillow actually

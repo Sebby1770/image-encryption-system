@@ -103,8 +103,9 @@ def test_generated_covers_grow_to_fit() -> None:
 
 
 def test_payload_too_large_is_refused() -> None:
+    # 1 MP holds about 840 kB at 3 bits, the most the automatic choice will use.
     with pytest.raises(CloakError, match="does not fit"):
-        cloak(bytes(700_000), seed=b"big", max_pixels=1_000_000)
+        cloak(bytes(900_000), seed=b"big", max_pixels=1_000_000)
     with pytest.raises(CloakError, match="does not fit"):
         cloak(bytes(10_000), cover=_random_cover(np.random.default_rng(2), 64, 64), max_pixels=8192)
 
@@ -249,3 +250,34 @@ def test_bad_arguments_are_refused() -> None:
         cloak(b"x", cover=np.zeros((32, 32), np.uint8))
     with pytest.raises(CloakError):
         cloak(b"x", palette="neon")
+
+
+@pytest.mark.slow
+def test_cloaking_a_full_size_vault_file_stays_within_a_memory_budget() -> None:
+    # The shipped container has 1 GB for two workers; one 8 MiB upload, cloaked
+    # with the default settings, must leave plenty of room. tracemalloc sees
+    # numpy's buffers (not Pillow's, which add roughly 4 bytes per pixel).
+    import tracemalloc
+
+    from image_encryption_system.cloak import DEFAULT_MAX_PIXELS
+
+    payload = np.random.default_rng(11).bytes(8 * 1024 * 1024 + 2048)
+    tracemalloc.start()
+    try:
+        png, report = cloak(payload, seed=b"budget")
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert DEFAULT_MAX_PIXELS <= 12_000_000
+    assert report.width * report.height <= DEFAULT_MAX_PIXELS
+    assert peak < 300 * 1024 * 1024, f"peak {peak / 2**20:.0f} MiB"
+    assert uncloak(png) == payload
+
+
+def test_auto_bits_falls_back_to_three_bits_to_stay_under_the_ceiling() -> None:
+    payload = bytes(capacity(1200, 800, 2) + 1)
+    _png, report = cloak(payload, seed=b"ceiling", max_pixels=1200 * 800)
+    assert report.bits == 3
+    assert report.width * report.height <= 1200 * 800
+    with pytest.raises(CloakError, match="does not fit"):
+        cloak(payload, bits=2, seed=b"ceiling", max_pixels=1200 * 800)

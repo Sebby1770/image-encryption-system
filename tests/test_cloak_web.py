@@ -148,3 +148,41 @@ def test_cloak_page_describes_the_image(tmp_path) -> None:
 def test_dashboard_links_to_the_cloak_page(tmp_path) -> None:
     _app, alice, asset = _vault(tmp_path)
     assert f'href="/images/{asset.id}/cloak"' in alice.get("/dashboard").get_data(as_text=True)
+
+
+def test_cloaks_run_one_at_a_time(tmp_path, monkeypatch) -> None:
+    # Each cloak can take hundreds of megabytes; a second request waits its turn.
+    import threading
+    import time
+
+    from helpers import login
+
+    from image_encryption_system import cloak as cloak_module
+    from image_encryption_system import lab_routes
+
+    app, alice, asset = _vault(tmp_path)
+    second = app.test_client()
+    login(second, "alice")
+    running, peak, guard = [0], [0], threading.Lock()
+
+    def slow_cloak(*args, **kwargs):
+        with guard:
+            running[0] += 1
+            peak[0] = max(peak[0], running[0])
+        time.sleep(0.3)
+        with guard:
+            running[0] -= 1
+        return cloak_module.cloak(*args, **kwargs)
+
+    monkeypatch.setattr(lab_routes, "cloak", slow_cloak)
+    results = []
+    threads = [
+        threading.Thread(target=lambda c=c: results.append(_post_cloak(c, asset.id).status_code))
+        for c in (alice, second)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(results) == [200, 200]
+    assert peak[0] == 1

@@ -462,7 +462,10 @@ already download, and it works for end-to-end images.
 - **Covers.** A generated landscape, or a picture of the owner's that first
   passes the upload checks (allow-list, pixel ceiling, decompression-bomb
   handling); only its pixels are used, so its metadata is never carried over.
-  Covers are limited to `CLOAK_MAX_PIXELS` (24 MP).
+  Covers are limited to `CLOAK_MAX_PIXELS` (12 MP; automatic bits step up
+  to 3 rather than exceed it), each process cloaks one image at a time, and
+  requests are throttled per account, so a cloak's few hundred megabytes of
+  working memory cannot stack up.
 - **Extraction** (`ies uncloak`, and every CLI command that reads an `.ies`)
   refuses anything that is not a PNG within the pixel ceiling before decoding,
   bounds the declared length by the capacity and 64 MiB before allocating, and

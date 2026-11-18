@@ -283,7 +283,7 @@ account: vault blobs, shares, RSA keys, audit rows, and the user.
 | `IES_LAB_RATE_LIMIT` / `_WINDOW` | Cipher Lab runs per account per window (default 6 / 600 s) |
 | `IES_CLOAK_RATE_LIMIT` / `_WINDOW` | Cloaked downloads per account per window (default 10 / 600 s) |
 | `IES_LAB_IMAGE_SIZE` | Side of the square the lab works at (default 256; 32-512, powers of two) |
-| `IES_CLOAK_MAX_PIXELS` | Largest cover the cloak will draw or accept (default 24,000,000) |
+| `IES_CLOAK_MAX_PIXELS` | Largest cover the cloak will draw or accept (default 12,000,000; automatic bits step up to 3 to stay under it) |
 
 A throttle limit of `0` disables that throttle.
 

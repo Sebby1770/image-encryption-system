@@ -15,7 +15,7 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
-Band = NDArray[np.int32]
+Band = NDArray[np.signedinteger]
 
 
 def _lift(a: Band, b: Band) -> tuple[Band, Band]:
@@ -28,12 +28,18 @@ def _unlift(s: Band, d: Band) -> tuple[Band, Band]:
     return b + d, b
 
 
-def forward(channel: NDArray[np.integer]) -> tuple[Band, Band, Band, Band]:
-    """``(ll, lh, hl, hh)`` for a 2-D integer array with even dimensions."""
+def forward(
+    channel: NDArray[np.integer], *, dtype: type[np.signedinteger] = np.int32
+) -> tuple[Band, Band, Band, Band]:
+    """``(ll, lh, hl, hh)`` for a 2-D integer array with even dimensions.
+
+    ``dtype`` is the working type: ``int16`` is exact for 8-bit input (every
+    coefficient stays within +/-510) and halves the memory of ``int32``.
+    """
     x = np.asarray(channel)
     if x.ndim != 2 or x.shape[0] % 2 or x.shape[1] % 2:
         raise ValueError("The integer Haar transform needs a 2-D array with even dimensions.")
-    x = x.astype(np.int32)
+    x = x.astype(dtype)
     s, d = _lift(x[:, 0::2], x[:, 1::2])
     ll, lh = _lift(s[0::2, :], s[1::2, :])
     hl, hh = _lift(d[0::2, :], d[1::2, :])
@@ -41,7 +47,7 @@ def forward(channel: NDArray[np.integer]) -> tuple[Band, Band, Band, Band]:
 
 
 def _interleave_rows(top: Band, bottom: Band) -> Band:
-    out = np.empty((top.shape[0] * 2, top.shape[1]), dtype=np.int32)
+    out = np.empty((top.shape[0] * 2, top.shape[1]), dtype=top.dtype)
     out[0::2], out[1::2] = top, bottom
     return out
 
@@ -51,11 +57,13 @@ def inverse(
     lh: NDArray[np.integer],
     hl: NDArray[np.integer],
     hh: NDArray[np.integer],
+    *,
+    dtype: type[np.signedinteger] = np.int32,
 ) -> Band:
     """The exact inverse of :func:`forward`."""
-    s = _interleave_rows(*_unlift(ll.astype(np.int32), lh.astype(np.int32)))
-    d = _interleave_rows(*_unlift(hl.astype(np.int32), hh.astype(np.int32)))
+    s = _interleave_rows(*_unlift(ll.astype(dtype), lh.astype(dtype)))
+    d = _interleave_rows(*_unlift(hl.astype(dtype), hh.astype(dtype)))
     a, b = _unlift(s, d)
-    out = np.empty((s.shape[0], s.shape[1] * 2), dtype=np.int32)
+    out = np.empty((s.shape[0], s.shape[1] * 2), dtype=dtype)
     out[:, 0::2], out[:, 1::2] = a, b
     return out
