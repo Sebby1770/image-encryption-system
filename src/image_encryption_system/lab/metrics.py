@@ -151,12 +151,17 @@ def correlations(view: Image) -> dict[str, list[float]]:
 
 
 def pooled_correlations(view: Image) -> dict[str, float]:
-    """Pearson r per direction over the neighbour pairs of every channel."""
+    """Pearson r per direction over the neighbour pairs of every channel.
+
+    Each channel's pairs are centred on that channel's own means before they
+    are pooled: otherwise the spread between channel means (a reddish picture)
+    would read as neighbour correlation even when every channel is noise.
+    """
     pooled: dict[str, float] = {}
     for direction in ("horizontal", "vertical", "diagonal"):
         pairs = [_pairs(view[..., c])[direction] for c in range(view.shape[2])]
-        a = np.concatenate([p[0] for p in pairs])
-        b = np.concatenate([p[1] for p in pairs])
+        a = np.concatenate([p[0] - p[0].mean() for p in pairs])
+        b = np.concatenate([p[1] - p[1].mean() for p in pairs])
         pooled[direction] = _pearson(a, b)
     return pooled
 

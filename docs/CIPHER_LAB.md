@@ -102,7 +102,7 @@ time.
 | Entropy | at least 7.99 bits per byte (judged from 128 px) |
 | Local entropy | within `7.902472 ± 1.96 × 0.008693 / √(blocks)`, 30 random 1,936-pixel blocks per channel |
 | Chi-square (255 d.o.f.) | below 293.2478 |
-| Neighbour correlation | largest of horizontal, vertical, diagonal `|r|` at most `4/√pairs` |
+| Neighbour correlation | largest of horizontal, vertical, diagonal `|r|` at most `4/√pairs`, each channel centred on its own mean before pooling |
 | NPCR / UACI | NPCR ≥ N\*₀.₀₅ and UACI in the two-sided 5% interval, Wu, Noonan & Agaian (2011) |
 | Key sensitivity | the same rule, between encryptions under keys one bit apart (same nonce) |
 

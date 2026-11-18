@@ -83,6 +83,17 @@ def test_fixed_noise_passes_every_statistic() -> None:
         assert abs(value) <= bound
 
 
+def test_channels_with_different_means_do_not_fake_a_correlation() -> None:
+    # Independent noise in every channel, but the channels sit at different
+    # levels (a reddish picture, say). Pooling raw pairs would read the gap
+    # between channel means as neighbour correlation.
+    noise = _noise(128, 9) % 64
+    noise = noise + np.array([32, 96, 160], dtype=np.uint8)
+    bound = metrics.correlation_bound(noise)
+    for direction, value in metrics.pooled_correlations(noise).items():
+        assert abs(value) <= bound, (direction, value)
+
+
 def test_gradient_is_strongly_correlated() -> None:
     correlations = metrics.pooled_correlations(imaging.sample("gradient", 64))
     assert all(value > 0.9 for value in correlations.values())
